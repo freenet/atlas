@@ -22,7 +22,7 @@ The design is inspired partly by:
 * search engines (AltaVista, Google),
 * recommendation systems,
 * decentralized reputation systems,
-* and systems such as Dissenter/Gab which attached commentary to arbitrary web resources.
+* and systems that attach commentary to arbitrary web resources, such as Third Voice, Google SideWiki, Hypothes.is, Genius Web Annotator, and Dissenter/Gab.
 
 Unlike those systems, Atlas is designed from the beginning as a decentralized, composable, contract-based system running natively on Freenet.
 
