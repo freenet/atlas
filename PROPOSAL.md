@@ -28,6 +28,14 @@ Unlike those systems, Atlas is designed from the beginning as a decentralized, c
 
 ---
 
+# User Experience
+
+Open Atlas and it should feel quick, friendly, and immediately useful. Find what you're looking for. Discover things worth your time. No setup, no learning curve. Involvement is graduated: a tap on a recommendation tells you why it surfaced; a simple control lets you nudge what you see; someone who enjoys it can write or share a whole ranking recipe. None of that is required. The baseline is meant to be effortless and pleasant, with depth available for anyone who wants it.
+
+Everything in the rest of this document (descriptors, analyzers, indexes, contract families, trust policies) is plumbing. An ordinary user should never need to know any of those terms exist.
+
+---
+
 # Goals
 
 * Decentralized discovery of Freenet content and applications
@@ -229,20 +237,18 @@ Possible uses:
 
 # Atlas UI
 
-Atlas should expose all major system interactions through a manual UI.
+The default Atlas UI is intended to feel like an ordinary, modern app: browse, search, follow recommendations. Most users should never see the underlying machinery, and the system should work well for them without any configuration.
 
-Examples:
+The full surface area is available on demand, for users who want it:
 
-* browse feeds
-* search
-* submit subjects
-* annotate subjects
-* review/rate subjects
-* inspect provenance
-* select trusted analyzers/indexes
-* manage ranking preferences
+* see why a recommendation surfaced
+* nudge what is shown
+* follow or trust specific curators
+* swap or share a ranking recipe
+* submit, annotate, or review subjects
+* see where any claim about a subject came from
 
-The UI should expose the same surface area available to automated systems.
+The same capabilities are available to automated systems, so anything the UI can do can also be scripted.
 
 ---
 
