@@ -1,0 +1,1006 @@
+<!doctype html>
+<html lang="en" data-theme="light">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>Atlas — Discover on Freenet</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Outfit:wght@400;500;600;700&family=Source+Sans+3:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+<style>
+  /* ===== Themes ===== */
+  :root[data-theme="light"]{
+    --paper:#ece6d6;
+    --paper-2:#f0ebdc;
+    --paper-card:#f7f2e3;
+    --paper-edge:#dcd5bf;
+
+    --ink:#0f1726;
+    --ink-2:#2a3447;
+    --ink-mid:#5b6478;
+    --ink-faint:#8c9385;
+    --ink-faint-2:#8d8775;
+
+    --rule:#c8c0a8;
+    --rule-soft:#dad3bd;
+
+    --accent:#0066CC;          /* freenet blue */
+    --accent-deep:#004C99;
+    --accent-soft:#dde7f3;
+    --good:#1f5c3d;
+
+    --plate-river:#1a2f4a;
+    --plate-app:#234766;
+    --plate-doc:#1f5048;
+    --plate-photo:#7a4a2a;
+    --plate-feed:#7a3848;
+    --plate-audio:#2a3565;
+    --plate-collection:#5e4a28;
+    --plate-profile:#3a3e4a;
+
+    --grain-opacity:.35;
+  }
+  :root[data-theme="dark"]{
+    --paper:#0f131a;
+    --paper-2:#141923;
+    --paper-card:#181d27;
+    --paper-edge:#252b38;
+
+    --ink:#e8e4d8;
+    --ink-2:#bdc1c9;
+    --ink-mid:#8993a4;
+    --ink-faint:#5c6478;
+    --ink-faint-2:#6a6f7e;
+
+    --rule:#2a3040;
+    --rule-soft:#1f2531;
+
+    --accent:#4da6ff;          /* freenet dark-mode blue */
+    --accent-deep:#80bfff;
+    --accent-soft:#1a2940;
+    --good:#4dcc8f;
+
+    --plate-river:#1a2f4a;
+    --plate-app:#2a3a5a;
+    --plate-doc:#1f4540;
+    --plate-photo:#6a4028;
+    --plate-feed:#6a2a3a;
+    --plate-audio:#262f55;
+    --plate-collection:#544020;
+    --plate-profile:#2f3340;
+
+    --grain-opacity:.12;
+  }
+
+  *{box-sizing:border-box}
+  html,body{margin:0;padding:0;background:var(--paper);color:var(--ink);font-family:'Source Sans 3',system-ui,-apple-system,sans-serif;-webkit-font-smoothing:antialiased;font-feature-settings:'ss01'}
+  body::before{
+    content:"";position:fixed;inset:0;pointer-events:none;z-index:1;opacity:var(--grain-opacity);mix-blend-mode:multiply;
+    background-image:url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='180' height='180'><filter id='n'><feTurbulence type='fractalNoise' baseFrequency='.9' numOctaves='2' stitchTiles='stitch'/><feColorMatrix values='0 0 0 0 0.1  0 0 0 0 0.09  0 0 0 0 0.07  0 0 0 .08 0'/></filter><rect width='100%' height='100%' filter='url(%23n)'/></svg>")
+  }
+  :root[data-theme="dark"] body::before{mix-blend-mode:screen}
+  a{color:inherit;text-decoration:none}
+  button{font:inherit;color:inherit;background:none;border:0;cursor:pointer}
+
+  .display{font-family:'Outfit',system-ui,sans-serif;letter-spacing:-.01em}
+  .mono{font-family:'JetBrains Mono',ui-monospace,monospace}
+
+  /* ===== Layout ===== */
+  .app{display:grid;grid-template-columns:240px 1fr;min-height:100vh;position:relative;z-index:2}
+  .sidebar{border-right:1px solid var(--rule);padding:18px 18px;position:sticky;top:0;height:100vh;overflow-y:auto;background:var(--paper)}
+  .main{display:flex;flex-direction:column;min-width:0}
+
+  /* ===== Brand ===== */
+  .brand{display:flex;align-items:center;gap:10px;padding:2px 4px 22px;border-bottom:1px solid var(--rule);margin-bottom:18px}
+  .brand-mark{width:32px;height:32px;border:1.5px solid var(--ink);background:var(--paper);display:grid;place-items:center;font-family:'Outfit',sans-serif;font-weight:700;font-size:18px;color:var(--accent)}
+  .brand-name{font-family:'Outfit',sans-serif;font-weight:600;font-size:20px;letter-spacing:-.015em}
+  .brand-tag{font-size:10px;color:var(--ink-faint);margin-left:auto;border:1px solid var(--rule);padding:1px 6px;letter-spacing:.06em;text-transform:uppercase;font-weight:500}
+
+  /* ===== Sidebar nav ===== */
+  .nav-section{margin-top:6px}
+  .nav-label{font-size:10.5px;text-transform:uppercase;letter-spacing:.12em;color:var(--ink-faint);padding:16px 4px 8px;font-weight:600;font-family:'Outfit',sans-serif}
+  .nav a, .nav button{display:flex;align-items:center;gap:10px;padding:6px 8px;color:var(--ink-2);width:100%;text-align:left;font-size:14px;line-height:1.2;border-left:2px solid transparent;transition:color .12s,background .12s}
+  .nav a:hover,.nav button:hover{color:var(--ink);background:var(--paper-2)}
+  .nav .active{color:var(--ink);border-left-color:var(--accent);font-weight:600;background:var(--paper-2)}
+  .ico{width:15px;height:15px;display:inline-grid;place-items:center;color:var(--ink-mid);flex-shrink:0}
+  .nav .active .ico{color:var(--accent)}
+  .count{margin-left:auto;font-size:10.5px;color:var(--ink-faint);font-variant-numeric:tabular-nums;font-family:'JetBrains Mono',monospace}
+  .curator{display:flex;align-items:center;gap:9px;padding:5px 8px;color:var(--ink-2);font-size:13.5px;border-left:2px solid transparent;transition:color .12s,background .12s}
+  .curator:hover{color:var(--ink);background:var(--paper-2)}
+  .avatar{width:22px;height:22px;border:1px solid var(--ink);background:var(--paper-card);display:grid;place-items:center;font-size:10px;font-weight:700;color:var(--ink);flex-shrink:0;font-family:'Outfit',sans-serif}
+
+  /* ===== Topbar ===== */
+  .topbar{display:flex;align-items:center;gap:12px;padding:14px 32px;border-bottom:1px solid var(--rule);background:var(--paper);position:sticky;top:0;z-index:10}
+  .search{flex:1;max-width:680px;position:relative}
+  .search input{width:100%;background:var(--paper-card);border:1px solid var(--rule);padding:10px 14px 10px 36px;color:var(--ink);font-size:14px;outline:none;transition:border-color .15s;border-radius:0;font-family:'Source Sans 3',sans-serif}
+  .search input::placeholder{color:var(--ink-faint)}
+  .search input:focus{border-color:var(--accent)}
+  .search svg{position:absolute;left:12px;top:50%;transform:translateY(-50%);color:var(--ink-faint)}
+  .search kbd{position:absolute;right:10px;top:50%;transform:translateY(-50%);font-family:'JetBrains Mono',monospace;font-size:10.5px;color:var(--ink-faint);border:1px solid var(--rule);padding:1px 6px;background:var(--paper-2)}
+
+  .recipe{display:flex;align-items:center;gap:8px;padding:8px 12px;background:var(--paper-card);border:1px solid var(--rule);font-size:12.5px;color:var(--ink-2);cursor:pointer;position:relative;transition:border-color .12s}
+  .recipe:hover{border-color:var(--accent)}
+  .recipe-dot{width:6px;height:6px;border-radius:50%;background:var(--good);border:1px solid var(--ink)}
+  .recipe strong{color:var(--ink);font-weight:600}
+
+  .icon-btn{width:32px;height:32px;border:1px solid var(--rule);background:var(--paper-card);display:grid;place-items:center;color:var(--ink-2);cursor:pointer;transition:border-color .12s}
+  .icon-btn:hover{border-color:var(--accent);color:var(--ink)}
+
+  .topbar .profile{width:32px;height:32px;border:1px solid var(--ink);background:var(--accent-soft);display:grid;place-items:center;color:var(--ink);font-weight:700;font-size:11px;cursor:pointer;font-family:'Outfit',sans-serif}
+
+  /* ===== Content ===== */
+  .content{padding:30px 32px 60px;max-width:1240px;margin:0 auto;width:100%}
+
+  .masthead{border-bottom:1px solid var(--rule);padding-bottom:18px;margin-bottom:24px;display:flex;align-items:flex-end;justify-content:space-between;gap:24px}
+  .masthead-left h1{font-family:'Outfit',sans-serif;font-weight:600;font-size:32px;letter-spacing:-.025em;margin:0;color:var(--ink)}
+  .masthead-left h1 .accent{color:var(--accent);font-weight:500}
+  .masthead-meta{font-size:12.5px;color:var(--ink-mid);margin:6px 0 0;font-variant-numeric:tabular-nums;display:flex;gap:14px;font-family:'JetBrains Mono',monospace}
+  .masthead-meta span:not(:last-child)::after{content:"·";margin-left:14px;color:var(--ink-faint)}
+  .masthead-meta strong{color:var(--ink);font-weight:500}
+
+  .tabs{display:flex;gap:0;border:1px solid var(--rule);background:var(--paper-card);font-family:'Outfit',sans-serif}
+  .tab{padding:7px 14px;font-size:12.5px;color:var(--ink-mid);border-right:1px solid var(--rule);font-weight:500}
+  .tab:last-child{border-right:0}
+  .tab.active{background:var(--ink);color:var(--paper);font-weight:600}
+  .tab:hover:not(.active){background:var(--paper-2);color:var(--ink)}
+
+  .view-controls{display:flex;align-items:stretch;gap:8px}
+  .recipe-trigger{position:relative;display:grid;place-items:center;width:36px;background:var(--paper-card);border:1px solid var(--rule);color:var(--ink-mid);cursor:pointer;transition:border-color .12s,color .12s}
+  .recipe-trigger:hover{border-color:var(--accent);color:var(--accent)}
+  .recipe-trigger svg{pointer-events:none}
+
+  /* ===== Featured ===== */
+  .featured{display:grid;grid-template-columns:1.4fr 1fr 1fr;gap:14px;margin-bottom:36px}
+  .feature-card{position:relative;border:1px solid var(--rule);background:var(--paper-card);min-height:240px;display:flex;flex-direction:column;cursor:pointer;transition:border-color .15s,transform .15s;overflow:hidden}
+  .feature-card:hover{border-color:var(--accent);transform:translateY(-1px)}
+  .feature-plate{height:130px;border-bottom:1px solid var(--rule);position:relative;display:grid;place-items:center;color:#e8e4d8}
+  .feature-card.small .feature-plate{height:105px}
+  .feature-plate.river{background:var(--plate-river)}
+  .feature-plate.lex{background:var(--plate-app)}
+  .feature-plate.gallery{background:var(--plate-photo)}
+  .feature-plate::after{content:"";position:absolute;inset:0;background-image:radial-gradient(circle,rgba(255,255,255,.1) 1px,transparent 1.2px);background-size:6px 6px;opacity:.6}
+  .feature-plate svg{position:relative;z-index:1;width:48px;height:48px;stroke:currentColor;stroke-width:1.2;fill:none}
+  .feature-body{padding:14px 16px 16px;flex:1;display:flex;flex-direction:column}
+  .feature-kind{display:inline-flex;align-items:center;gap:5px;font-size:10.5px;text-transform:uppercase;letter-spacing:.12em;color:var(--ink-mid);margin-bottom:8px;font-weight:600;font-family:'Outfit',sans-serif}
+  .feature-kind::before{content:"";width:5px;height:5px;background:var(--accent)}
+  .feature-title{font-family:'Outfit',sans-serif;font-weight:600;font-size:20px;letter-spacing:-.018em;margin:0 0 6px;color:var(--ink)}
+  .feature-card.small .feature-title{font-size:17px}
+  .feature-summary{font-size:13.5px;color:var(--ink-2);line-height:1.5;margin:0 0 14px}
+  .feature-meta{display:flex;align-items:center;gap:12px;font-size:11.5px;color:var(--ink-mid);margin-top:auto;font-variant-numeric:tabular-nums;font-family:'JetBrains Mono',monospace}
+  .stars-inline{color:var(--ink);font-family:'Source Sans 3',sans-serif}
+  .why-pill{display:inline-flex;align-items:center;gap:5px;padding:3px 8px;border:1px solid var(--rule);background:var(--paper-2);color:var(--ink-2);font-size:11px;cursor:pointer;margin-left:auto;font-family:'Source Sans 3',sans-serif;transition:border-color .12s,color .12s}
+  .why-pill:hover{border-color:var(--accent);color:var(--accent)}
+  .why-pill svg{stroke:currentColor;fill:none;stroke-width:1.5}
+
+  /* ===== Sections ===== */
+  section{margin-bottom:40px}
+  .sec-head{display:flex;align-items:flex-end;justify-content:space-between;margin-bottom:14px;padding-bottom:8px;border-bottom:1px solid var(--rule)}
+  .sec-title{font-family:'Outfit',sans-serif;font-weight:600;font-size:18px;letter-spacing:-.015em;margin:0;color:var(--ink);display:flex;align-items:baseline;gap:10px}
+  .sec-title .by{font-family:'Outfit',sans-serif;font-weight:500;color:var(--ink-mid);font-size:11px;text-transform:uppercase;letter-spacing:.1em}
+  .sec-more{font-size:12px;color:var(--ink-mid);font-family:'Outfit',sans-serif;font-weight:500}
+  .sec-more:hover{color:var(--accent)}
+
+  /* chips */
+  .chips{display:flex;gap:6px;flex-wrap:wrap;margin-bottom:18px}
+  .chip{padding:4px 11px;border:1px solid var(--rule);background:var(--paper-card);font-size:11.5px;color:var(--ink-mid);cursor:pointer;text-transform:uppercase;letter-spacing:.08em;font-weight:600;font-family:'Outfit',sans-serif;transition:border-color .12s,color .12s,background .12s}
+  .chip:hover{color:var(--ink);border-color:var(--accent)}
+  .chip.active{background:var(--ink);color:var(--paper);border-color:var(--ink)}
+
+  /* ===== Card grid ===== */
+  .grid{display:grid;grid-template-columns:repeat(4,1fr);gap:14px}
+  .card{background:var(--paper-card);border:1px solid var(--rule);overflow:hidden;cursor:pointer;transition:border-color .15s,transform .15s;display:flex;flex-direction:column}
+  .card:hover{border-color:var(--accent);transform:translateY(-1px)}
+  .thumb{aspect-ratio:16/10;position:relative;display:grid;place-items:center;color:#e8e4d8;border-bottom:1px solid var(--rule)}
+  .thumb.t-river{background:var(--plate-river)}
+  .thumb.t-doc{background:var(--plate-doc)}
+  .thumb.t-photo{background:var(--plate-photo)}
+  .thumb.t-app{background:var(--plate-app)}
+  .thumb.t-feed{background:var(--plate-feed)}
+  .thumb.t-audio{background:var(--plate-audio)}
+  .thumb.t-collection{background:var(--plate-collection)}
+  .thumb.t-profile{background:var(--plate-profile)}
+  .thumb::after{content:"";position:absolute;inset:0;background-image:radial-gradient(circle,rgba(255,255,255,.1) 1px,transparent 1.2px);background-size:5px 5px;opacity:.6}
+  .thumb svg{width:34px;height:34px;color:rgba(255,255,255,.85);position:relative;z-index:1;stroke-width:1.2;fill:none}
+  .kind-chip{position:absolute;top:8px;left:8px;font-size:9.5px;text-transform:uppercase;letter-spacing:.12em;background:var(--paper);color:var(--ink);padding:2px 7px;font-weight:600;z-index:2;font-family:'Outfit',sans-serif}
+  .card-body{padding:11px 13px 13px;display:flex;flex-direction:column;gap:6px;flex:1}
+  .card-title{font-family:'Outfit',sans-serif;font-weight:600;font-size:15.5px;letter-spacing:-.012em;margin:0;line-height:1.2;color:var(--ink)}
+  .card-summary{font-size:13px;color:var(--ink-2);line-height:1.45;margin:0;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}
+  .card-meta{display:flex;align-items:center;justify-content:space-between;font-size:11px;color:var(--ink-mid);margin-top:auto;font-variant-numeric:tabular-nums;border-top:1px solid var(--rule-soft);padding-top:8px;font-family:'JetBrains Mono',monospace}
+  .stars{color:var(--ink);font-family:'Source Sans 3',sans-serif}
+  .stars .count{color:var(--ink-faint);margin-left:3px;font-family:'JetBrains Mono',monospace}
+  .src{display:inline-flex;align-items:center;gap:5px;color:var(--ink-mid)}
+  .src .dot{width:4px;height:4px;background:var(--accent)}
+
+  /* ===== Collections ===== */
+  .collections{display:grid;grid-template-columns:repeat(3,1fr);gap:14px}
+  .coll{padding:18px;border:1px solid var(--rule);background:var(--paper-card);cursor:pointer;transition:border-color .15s,transform .15s}
+  .coll:hover{border-color:var(--accent);transform:translateY(-1px)}
+  .coll-head{display:flex;align-items:center;gap:10px;margin-bottom:14px;padding-bottom:10px;border-bottom:1px solid var(--rule-soft)}
+  .coll-curator{font-size:12px;color:var(--ink-mid)}
+  .coll-curator strong{color:var(--ink);font-weight:600}
+  .coll-title{font-family:'Outfit',sans-serif;font-weight:600;font-size:18px;letter-spacing:-.015em;margin:0 0 6px;color:var(--ink)}
+  .coll-blurb{font-size:13.5px;color:var(--ink-2);line-height:1.5;margin:0 0 14px}
+  .coll-thumbs{display:flex;gap:5px}
+  .mini-thumb{width:44px;height:44px;flex:1;max-width:52px;border:1px solid var(--rule);position:relative;overflow:hidden}
+  .mini-thumb::after{content:"";position:absolute;inset:0;background-image:radial-gradient(circle,rgba(255,255,255,.1) 1px,transparent 1.2px);background-size:4px 4px;opacity:.6}
+  .mini-thumb.a{background:var(--plate-river)}
+  .mini-thumb.b{background:var(--plate-photo)}
+  .mini-thumb.c{background:var(--plate-app)}
+  .mini-thumb.d{background:var(--plate-doc)}
+  .coll-count{font-size:10.5px;color:var(--ink-faint);margin-left:auto;align-self:center;text-transform:uppercase;letter-spacing:.1em;font-family:'Outfit',sans-serif;font-weight:600}
+
+  /* ===== Detail panel ===== */
+  .detail{position:fixed;top:0;right:0;width:460px;height:100vh;background:var(--paper-card);border-left:1px solid var(--rule);box-shadow:-10px 0 30px rgba(0,0,0,.18);z-index:100;display:flex;flex-direction:column;transform:translateX(100%);transition:transform .25s cubic-bezier(.4,0,.2,1)}
+  .detail.open{transform:translateX(0)}
+  .detail-head{padding:16px 22px;display:flex;align-items:center;justify-content:space-between;border-bottom:1px solid var(--rule)}
+  .detail-eyebrow{font-size:10.5px;text-transform:uppercase;letter-spacing:.14em;color:var(--ink-faint);font-family:'Outfit',sans-serif;font-weight:600}
+  .detail-close{width:28px;height:28px;display:grid;place-items:center;color:var(--ink-mid);border:1px solid var(--rule);background:var(--paper-2)}
+  .detail-close:hover{color:var(--ink);border-color:var(--accent)}
+  .detail-body{padding:22px;overflow-y:auto;flex:1}
+  .detail-thumb{aspect-ratio:16/9;background:var(--plate-river);margin:0 0 18px;position:relative;overflow:hidden;border:1px solid var(--rule);display:grid;place-items:center;color:#e8e4d8}
+  .detail-thumb::after{content:"";position:absolute;inset:0;background-image:radial-gradient(circle,rgba(255,255,255,.1) 1px,transparent 1.2px);background-size:6px 6px;opacity:.6}
+  .detail-thumb svg{width:48px;height:48px;position:relative;z-index:1;stroke-width:1.2;fill:none}
+  .detail-kind{display:inline-block;font-size:10.5px;color:var(--ink-mid);text-transform:uppercase;letter-spacing:.14em;margin-bottom:6px;font-weight:600;font-family:'Outfit',sans-serif}
+  .detail-title{font-family:'Outfit',sans-serif;font-weight:600;font-size:26px;letter-spacing:-.025em;margin:0 0 4px;color:var(--ink);line-height:1.1}
+  .detail-sub{font-size:11.5px;color:var(--ink-mid);margin:0 0 18px;font-family:'JetBrains Mono',monospace}
+  .detail-actions{display:flex;gap:8px;margin-bottom:20px}
+  .btn{padding:9px 18px;background:var(--accent);color:#fff;font-weight:600;font-size:12.5px;flex:1;text-align:center;letter-spacing:.02em;border:1px solid var(--accent);font-family:'Outfit',sans-serif;transition:background .12s}
+  .btn:hover{background:var(--accent-deep)}
+  .btn.secondary{background:var(--paper-2);color:var(--ink);border:1px solid var(--rule);flex:0 0 auto;padding:9px 12px}
+  .btn.secondary:hover{border-color:var(--accent);color:var(--accent);background:var(--paper-2)}
+
+  .detail-desc{font-size:14px;color:var(--ink);line-height:1.6;margin:0 0 20px}
+  .detail-desc strong{font-weight:600}
+
+  .tag-row{display:flex;gap:5px;flex-wrap:wrap;margin-bottom:22px}
+  .tag{font-size:10.5px;padding:2px 8px;background:var(--paper-2);border:1px solid var(--rule);color:var(--ink-2);text-transform:lowercase;letter-spacing:.04em;font-family:'JetBrains Mono',monospace}
+
+  .why-panel{background:var(--paper-2);border:1px solid var(--rule);padding:14px 16px;margin-bottom:22px}
+  .why-head{display:flex;align-items:center;gap:8px;font-size:10.5px;text-transform:uppercase;letter-spacing:.14em;color:var(--accent);margin-bottom:12px;padding-bottom:8px;border-bottom:1px solid var(--rule-soft);font-weight:600;font-family:'Outfit',sans-serif}
+  .why-list{display:flex;flex-direction:column;gap:8px;font-size:13px;color:var(--ink-2);margin:0;padding:0;list-style:none}
+  .why-list li{display:flex;align-items:flex-start;gap:10px;line-height:1.5}
+  .why-list .pct{font-family:'JetBrains Mono',monospace;color:var(--accent);font-size:10.5px;background:var(--paper);border:1px solid var(--rule);padding:1px 6px;flex-shrink:0;margin-top:2px;font-variant-numeric:tabular-nums;font-weight:500}
+  .why-list .pct.neg{color:var(--ink-mid)}
+
+  .sub-head{font-size:10.5px;text-transform:uppercase;letter-spacing:.14em;color:var(--ink-mid);margin:24px 0 10px;display:flex;align-items:center;justify-content:space-between;padding-bottom:6px;border-bottom:1px solid var(--rule);font-weight:600;font-family:'Outfit',sans-serif}
+  .sub-head .meta{text-transform:none;letter-spacing:0;color:var(--ink-faint);font-size:11px;font-weight:400;font-family:'JetBrains Mono',monospace}
+
+  .ann-group{margin-bottom:18px}
+  .ann-group-label{font-size:10.5px;text-transform:uppercase;letter-spacing:.12em;color:var(--ink-mid);margin:14px 0 8px;font-family:'Outfit',sans-serif;font-weight:600;display:flex;align-items:baseline;gap:8px;padding-bottom:6px;border-bottom:1px solid var(--rule-soft)}
+  .ann-count{text-transform:none;letter-spacing:0;color:var(--ink-faint);font-size:11px;font-weight:400;font-family:'JetBrains Mono',monospace}
+
+  .review{display:flex;gap:10px;padding:12px 0;border-top:1px solid var(--rule-soft)}
+  .review:first-of-type{border-top:0;padding-top:0}
+  .ann-group .review:first-of-type{padding-top:4px}
+  .review .avatar{width:28px;height:28px;font-size:11px;flex-shrink:0}
+  .review-body{flex:1;min-width:0}
+  .review-head{display:flex;align-items:center;gap:8px;margin-bottom:3px}
+  .review-name{font-size:13px;font-weight:600;color:var(--ink)}
+  .review-verified{font-size:9.5px;color:var(--good);text-transform:uppercase;letter-spacing:.1em;display:inline-flex;align-items:center;gap:3px;font-weight:600;font-family:'Outfit',sans-serif}
+  .review-time{font-size:10.5px;color:var(--ink-faint);margin-left:auto;font-variant-numeric:tabular-nums;font-family:'JetBrains Mono',monospace}
+  .review-stars{color:var(--ink);font-size:11px;margin-bottom:4px;letter-spacing:.05em}
+  .review-text{font-size:13.5px;color:var(--ink-2);line-height:1.55;margin:0}
+
+  .descriptor-row{display:flex;justify-content:space-between;padding:7px 0;border-top:1px solid var(--rule-soft);font-size:11.5px}
+  .descriptor-row:first-of-type{border-top:0}
+  .descriptor-row .k{color:var(--ink-mid);text-transform:uppercase;letter-spacing:.1em;font-size:10.5px;font-weight:600;font-family:'Outfit',sans-serif}
+  .descriptor-row .v{color:var(--ink-2);font-family:'JetBrains Mono',monospace;font-size:11px}
+
+  /* ===== Recipe popover ===== */
+  .recipe-popover{position:absolute;top:calc(100% + 8px);right:0;width:340px;background:var(--paper-card);border:1px solid var(--ink);padding:16px;box-shadow:0 10px 30px rgba(0,0,0,.22);z-index:50;display:none}
+  .recipe-popover.open{display:block}
+  .recipe-popover h4{margin:0 0 4px;font-family:'Outfit',sans-serif;font-size:15px;font-weight:600;color:var(--ink)}
+  .recipe-popover .lede{margin:0 0 14px;font-size:12.5px;color:var(--ink-mid);line-height:1.5;padding-bottom:10px;border-bottom:1px solid var(--rule-soft)}
+  .recipe-option{display:flex;align-items:flex-start;gap:10px;padding:8px;cursor:pointer;border-bottom:1px solid var(--rule-soft);transition:background .12s}
+  .recipe-option:last-of-type{border-bottom:0}
+  .recipe-option:hover{background:var(--paper-2)}
+  .recipe-option.selected{background:var(--accent-soft)}
+  .recipe-radio{width:13px;height:13px;border-radius:50%;border:1.5px solid var(--ink-mid);flex-shrink:0;margin-top:3px;position:relative;background:var(--paper)}
+  .recipe-option.selected .recipe-radio{border-color:var(--accent)}
+  .recipe-option.selected .recipe-radio::after{content:"";position:absolute;inset:2px;border-radius:50%;background:var(--accent)}
+  .recipe-opt-name{font-size:13.5px;font-weight:600;display:flex;align-items:center;gap:6px;color:var(--ink);font-family:'Outfit',sans-serif}
+  .recipe-opt-name .default-tag{font-size:9px;color:var(--ink-faint);font-weight:600;text-transform:uppercase;letter-spacing:.1em;border:1px solid var(--rule);padding:0 5px}
+  .recipe-opt-desc{font-size:12px;color:var(--ink-mid);margin-top:3px;line-height:1.45;font-family:'Source Sans 3',sans-serif}
+  .recipe-footer{display:flex;align-items:center;justify-content:space-between;border-top:1px solid var(--rule);margin-top:10px;padding-top:10px;font-size:10.5px;color:var(--ink-faint);text-transform:uppercase;letter-spacing:.1em;font-family:'Outfit',sans-serif;font-weight:600}
+  .recipe-footer a{color:var(--accent);border-bottom:1px solid var(--accent)}
+
+  .scrim{position:fixed;inset:0;background:rgba(0,0,0,.35);z-index:90;opacity:0;pointer-events:none;transition:opacity .2s}
+  .scrim.open{opacity:1;pointer-events:auto}
+
+  /* footnote */
+  .colophon{margin-top:40px;padding:16px 18px;border:1px solid var(--rule);background:var(--paper-2);font-size:12.5px;color:var(--ink-mid);line-height:1.6;display:grid;grid-template-columns:auto 1fr;gap:14px;align-items:flex-start}
+  .colophon strong{color:var(--ink);font-weight:600}
+  .colophon em{color:var(--accent);font-style:normal;font-weight:500}
+  .colophon-mark{font-family:'Outfit',sans-serif;font-weight:600;font-size:18px;color:var(--accent)}
+
+  /* ===== Mobile menu button (visible only on mobile) ===== */
+  .menu-btn{display:none}
+
+  /* ===== Tablet ===== */
+  @media (max-width:1100px){
+    .featured{grid-template-columns:1fr 1fr}
+    .featured .feature-card:first-child{grid-column:1 / -1}
+    .grid{grid-template-columns:repeat(3,1fr)}
+    .collections{grid-template-columns:repeat(2,1fr)}
+  }
+
+  /* ===== Small tablet / large phone ===== */
+  @media (max-width:860px){
+    .app{grid-template-columns:1fr}
+    .sidebar{
+      position:fixed;top:0;left:0;height:100vh;width:280px;z-index:110;
+      transform:translateX(-100%);transition:transform .25s cubic-bezier(.4,0,.2,1);
+      box-shadow:10px 0 30px rgba(0,0,0,.18);
+    }
+    .sidebar.open{transform:translateX(0)}
+    .menu-btn{display:grid}
+    .topbar{padding:12px 16px;gap:8px}
+    .content{padding:24px 16px 56px}
+    .grid{grid-template-columns:repeat(2,1fr)}
+    .collections{grid-template-columns:1fr}
+    .masthead{flex-direction:column;align-items:flex-start;gap:14px}
+    .view-controls{align-self:stretch;min-width:0}
+    .tabs{flex:1;min-width:0;overflow-x:auto;scrollbar-width:none}
+    .tabs::-webkit-scrollbar{display:none}
+    .tab{flex-shrink:0}
+    .recipe-trigger{flex-shrink:0}
+    .chips{flex-wrap:nowrap;overflow-x:auto;scrollbar-width:none;margin-left:-16px;margin-right:-16px;padding:0 16px}
+    .chips::-webkit-scrollbar{display:none}
+    .chip{flex-shrink:0}
+    /* Topbar collapses: hide recipe text label, keep button compact */
+    .recipe-label{display:none}
+    .recipe{padding:7px 9px}
+    .recipe svg:last-child{display:none}
+    .detail{width:100%}
+    .recipe-popover{right:auto;left:0;width:min(340px,calc(100vw - 32px))}
+  }
+
+  @media (max-width:860px){
+    .search kbd{display:none}
+    .search input{padding-right:14px}
+  }
+
+  /* ===== Phones ===== */
+  @media (max-width:560px){
+    .featured{grid-template-columns:1fr}
+    .featured .feature-card:first-child{grid-column:auto}
+    .grid{grid-template-columns:1fr}
+    .masthead-left h1{font-size:26px}
+    .masthead-meta{flex-wrap:wrap;gap:8px 12px;font-size:11.5px}
+    .masthead-meta span:not(:last-child)::after{margin-left:12px}
+    .content{padding:20px 14px 48px}
+    .topbar{padding:10px 14px}
+    .feature-title{font-size:18px}
+    .feature-card.small{min-height:auto}
+    .detail-body{padding:18px 16px}
+    .detail-title{font-size:22px}
+    /* Recipe popover anchored to viewport on phones */
+    .recipe-popover{position:fixed;top:64px;left:14px;right:14px;width:auto}
+  }
+</style>
+</head>
+<body>
+
+<div class="app">
+
+  <!-- ===== Sidebar ===== -->
+  <aside class="sidebar">
+    <div class="brand">
+      <div class="brand-mark">A</div>
+      <div class="brand-name">Atlas</div>
+      <div class="brand-tag">v0.1</div>
+    </div>
+
+    <div class="nav-section">
+      <div class="nav-label">Discover</div>
+      <nav class="nav">
+        <a class="active"><span class="ico">
+          <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M3 12l9-9 9 9"/><path d="M5 10v10h14V10"/></svg>
+        </span>Home</a>
+        <a><span class="ico">
+          <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><circle cx="12" cy="12" r="10"/><polygon points="16.24,7.76 14.12,14.12 7.76,16.24 9.88,9.88"/></svg>
+        </span>For you</a>
+        <a><span class="ico">
+          <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><polyline points="23 6 13.5 15.5 8.5 10.5 1 18"/><polyline points="17 6 23 6 23 12"/></svg>
+        </span>Trending<span class="count">142</span></a>
+        <a><span class="ico">
+          <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>
+        </span>New this week</a>
+      </nav>
+    </div>
+
+    <div class="nav-section">
+      <div class="nav-label">Browse</div>
+      <nav class="nav">
+        <a><span class="ico">
+          <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="7"/><rect x="14" y="14" width="7" height="7"/><rect x="3" y="14" width="7" height="7"/></svg>
+        </span>Apps<span class="count">2,431</span></a>
+        <a><span class="ico">
+          <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>
+        </span>Rooms<span class="count">18,200</span></a>
+        <a><span class="ico">
+          <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/></svg>
+        </span>Documents<span class="count">9,140</span></a>
+        <a><span class="ico">
+          <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="8.5" cy="8.5" r="1.5"/><polyline points="21 15 16 10 5 21"/></svg>
+        </span>Images &amp; video</a>
+        <a><span class="ico">
+          <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M9 18V5l12-2v13"/><circle cx="6" cy="18" r="3"/><circle cx="18" cy="16" r="3"/></svg>
+        </span>Audio &amp; music</a>
+        <a><span class="ico">
+          <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><circle cx="12" cy="8" r="4"/><path d="M20 21a8 8 0 0 0-16 0"/></svg>
+        </span>People</a>
+        <a><span class="ico">
+          <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></svg>
+        </span>Collections</a>
+      </nav>
+    </div>
+
+    <div class="nav-section">
+      <div class="nav-label">Following</div>
+      <div class="nav">
+        <div class="curator"><div class="avatar">SR</div>Sandy Reed</div>
+        <div class="curator"><div class="avatar">MH</div>Mara Heath</div>
+        <div class="curator"><div class="avatar">DA</div>Dev Almanac</div>
+        <div class="curator"><div class="avatar">FN</div>Freenet Weekly</div>
+      </div>
+    </div>
+
+    <div class="nav-section">
+      <div class="nav-label">Library</div>
+      <nav class="nav">
+        <a><span class="ico">
+          <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M19 21l-7-5-7 5V5a2 2 0 0 1 2-2h10a2 2 0 0 1 2 2z"/></svg>
+        </span>Saved</a>
+        <a><span class="ico">
+          <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>
+        </span>Recent</a>
+        <a><span class="ico">
+          <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M12 20h9"/><path d="M16.5 3.5a2.12 2.12 0 0 1 3 3L7 19l-4 1 1-4z"/></svg>
+        </span>My descriptors<span class="count">12</span></a>
+      </nav>
+    </div>
+  </aside>
+
+  <!-- ===== Main ===== -->
+  <main class="main">
+    <div class="topbar">
+      <button class="icon-btn menu-btn" id="menuBtn" title="Menu">
+        <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><line x1="3" y1="6" x2="21" y2="6"/><line x1="3" y1="12" x2="21" y2="12"/><line x1="3" y1="18" x2="21" y2="18"/></svg>
+      </button>
+
+      <div class="search">
+        <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>
+        <input placeholder="Search apps, rooms, people, anything on Freenet…" />
+        <kbd>⌘ K</kbd>
+      </div>
+
+      <button class="icon-btn" id="themeToggle" title="Toggle theme">
+        <svg id="iconSun" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M4.93 19.07l1.41-1.41M17.66 6.34l1.41-1.41"/></svg>
+        <svg id="iconMoon" style="display:none" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z"/></svg>
+      </button>
+
+      <div class="profile" title="ian">IC</div>
+    </div>
+
+    <div class="content">
+
+      <!-- Masthead -->
+      <div class="masthead">
+        <div class="masthead-left">
+          <h1>Discover. <span class="accent">Today.</span></h1>
+          <div class="masthead-meta">
+            <span><strong>2,743,891</strong> subjects</span>
+            <span><strong>11</strong> analyzers</span>
+            <span>refreshed <strong>2m ago</strong></span>
+          </div>
+        </div>
+        <div class="view-controls">
+          <div class="tabs">
+            <button class="tab active">For you</button>
+            <button class="tab">Trending</button>
+            <button class="tab">New</button>
+            <button class="tab">Following</button>
+          </div>
+          <button class="recipe-trigger" id="recipeBtn" title="Each tab is a recipe — edit or swap here">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6">
+              <line x1="4" y1="6" x2="20" y2="6"/>
+              <line x1="4" y1="12" x2="20" y2="12"/>
+              <line x1="4" y1="18" x2="20" y2="18"/>
+              <circle cx="9" cy="6" r="2.2" fill="currentColor" stroke="none"/>
+              <circle cx="15" cy="12" r="2.2" fill="currentColor" stroke="none"/>
+              <circle cx="11" cy="18" r="2.2" fill="currentColor" stroke="none"/>
+            </svg>
+
+            <div class="recipe-popover" id="recipePop">
+              <h4>Recipe behind "For you"</h4>
+              <p class="lede">Each tab uses a ranking recipe. Swap, edit, or pick a community recipe.</p>
+
+              <div class="recipe-option selected">
+                <div class="recipe-radio"></div>
+                <div>
+                  <div class="recipe-opt-name">Balanced <span class="default-tag">in use</span></div>
+                  <div class="recipe-opt-desc">A mix of curator picks, what people you follow like, freshness, and your interactions.</div>
+                </div>
+              </div>
+
+              <div class="recipe-option">
+                <div class="recipe-radio"></div>
+                <div>
+                  <div class="recipe-opt-name">Curator-first</div>
+                  <div class="recipe-opt-desc">Heavily weighted toward collections from curators you trust.</div>
+                </div>
+              </div>
+
+              <div class="recipe-option">
+                <div class="recipe-radio"></div>
+                <div>
+                  <div class="recipe-opt-name">Sandy's "Weekend reading"</div>
+                  <div class="recipe-opt-desc">A community recipe by <strong>@sandy</strong>. Long-form documents and slow content.</div>
+                </div>
+              </div>
+
+              <div class="recipe-footer">
+                <span>4 analyzers · 2 indexes</span>
+                <a href="#">Customise →</a>
+              </div>
+            </div>
+          </button>
+        </div>
+      </div>
+
+      <!-- Featured -->
+      <div class="featured">
+
+        <div class="feature-card" onclick="openDetail()">
+          <div class="feature-plate river">
+            <svg viewBox="0 0 24 24"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>
+          </div>
+          <div class="feature-body">
+            <div class="feature-kind">Room · River</div>
+            <h2 class="feature-title">Freenet Builders</h2>
+            <p class="feature-summary">Active chat for people shipping decentralised apps. Daily discussion, weekly demo Fridays. 1,200 members.</p>
+            <div class="feature-meta">
+              <span class="stars-inline">★ 4.7</span>
+              <span>312 reviews</span>
+              <button class="why-pill" onclick="event.stopPropagation();alert('Why this surfaced:\n\n+73  @sandy added it to Weekend Reading\n+62  4 people you follow joined the room\n+41  topic analyzer matched your interests\n−18  diversity penalty (similar to 2 recent views)')">
+                <svg width="9" height="9" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><line x1="12" y1="16" x2="12" y2="12"/><line x1="12" y1="8" x2="12.01" y2="8"/></svg>
+                Why this?
+              </button>
+            </div>
+          </div>
+        </div>
+
+        <div class="feature-card small">
+          <div class="feature-plate lex">
+            <svg viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="7"/><rect x="14" y="14" width="7" height="7"/><rect x="3" y="14" width="7" height="7"/></svg>
+          </div>
+          <div class="feature-body">
+            <div class="feature-kind">App</div>
+            <h2 class="feature-title">Lexicon</h2>
+            <p class="feature-summary">Collaborative encyclopaedia. Forkable articles, no central authority.</p>
+            <div class="feature-meta">
+              <span class="stars-inline">★ 4.5</span>
+              <span>new this week</span>
+            </div>
+          </div>
+        </div>
+
+        <div class="feature-card small">
+          <div class="feature-plate gallery">
+            <svg viewBox="0 0 24 24"><rect x="3" y="3" width="18" height="18" rx="1"/><circle cx="8.5" cy="8.5" r="1.5"/><polyline points="21 15 16 10 5 21"/></svg>
+          </div>
+          <div class="feature-body">
+            <div class="feature-kind">Collection</div>
+            <h2 class="feature-title">Cyanotypes</h2>
+            <p class="feature-summary">Mara Heath's hand-curated archive of historical photographic processes.</p>
+            <div class="feature-meta">
+              <span>by @mara</span>
+              <span>184 items</span>
+            </div>
+          </div>
+        </div>
+
+      </div>
+
+      <!-- Trending -->
+      <section>
+        <div class="sec-head">
+          <h3 class="sec-title">Trending this week <span class="by">142 subjects</span></h3>
+          <a class="sec-more" href="#">See all →</a>
+        </div>
+
+        <div class="chips">
+          <button class="chip active">All</button>
+          <button class="chip">Apps</button>
+          <button class="chip">Rooms</button>
+          <button class="chip">Documents</button>
+          <button class="chip">Media</button>
+          <button class="chip">People</button>
+        </div>
+
+        <div class="grid">
+
+          <div class="card" onclick="openDetail()">
+            <div class="thumb t-river">
+              <span class="kind-chip">Room</span>
+              <svg viewBox="0 0 24 24" stroke="currentColor"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>
+            </div>
+            <div class="card-body">
+              <h4 class="card-title">Freenet Builders</h4>
+              <p class="card-summary">Active chat for people shipping decentralised apps. Daily talks, demo Fridays.</p>
+              <div class="card-meta">
+                <span class="stars">★ 4.7 <span class="count">(312)</span></span>
+                <span class="src"><span class="dot"></span>3 friends</span>
+              </div>
+            </div>
+          </div>
+
+          <div class="card">
+            <div class="thumb t-app">
+              <span class="kind-chip">App</span>
+              <svg viewBox="0 0 24 24" stroke="currentColor"><rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="7"/><rect x="14" y="14" width="7" height="7"/><rect x="3" y="14" width="7" height="7"/></svg>
+            </div>
+            <div class="card-body">
+              <h4 class="card-title">Lexicon</h4>
+              <p class="card-summary">Forkable, collaborative encyclopaedia. Anyone can author, anyone can fork.</p>
+              <div class="card-meta">
+                <span class="stars">★ 4.5 <span class="count">(89)</span></span>
+                <span class="src"><span class="dot"></span>@sandy</span>
+              </div>
+            </div>
+          </div>
+
+          <div class="card">
+            <div class="thumb t-doc">
+              <span class="kind-chip">Document</span>
+              <svg viewBox="0 0 24 24" stroke="currentColor"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/></svg>
+            </div>
+            <div class="card-body">
+              <h4 class="card-title">A primer on Freenet contracts</h4>
+              <p class="card-summary">Plain-English walkthrough of contracts, delegates, and how they fit together.</p>
+              <div class="card-meta">
+                <span class="stars">★ 4.8 <span class="count">(54)</span></span>
+                <span class="src"><span class="dot"></span>Dev Almanac</span>
+              </div>
+            </div>
+          </div>
+
+          <div class="card">
+            <div class="thumb t-feed">
+              <span class="kind-chip">Feed</span>
+              <svg viewBox="0 0 24 24" stroke="currentColor"><path d="M4 11a9 9 0 0 1 9 9"/><path d="M4 4a16 16 0 0 1 16 16"/><circle cx="5" cy="19" r="1"/></svg>
+            </div>
+            <div class="card-body">
+              <h4 class="card-title">Slow Mornings</h4>
+              <p class="card-summary">A daily essay feed by @holm. Short, thoughtful, never promoted.</p>
+              <div class="card-meta">
+                <span class="stars">★ 4.6 <span class="count">(201)</span></span>
+                <span class="src"><span class="dot"></span>trending</span>
+              </div>
+            </div>
+          </div>
+
+          <div class="card">
+            <div class="thumb t-photo">
+              <span class="kind-chip">Collection</span>
+              <svg viewBox="0 0 24 24" stroke="currentColor"><rect x="3" y="3" width="18" height="18" rx="1"/><circle cx="8.5" cy="8.5" r="1.5"/><polyline points="21 15 16 10 5 21"/></svg>
+            </div>
+            <div class="card-body">
+              <h4 class="card-title">Cyanotypes</h4>
+              <p class="card-summary">184 historical cyanotype photographs, hand-curated by @mara.</p>
+              <div class="card-meta">
+                <span class="stars">★ 4.9 <span class="count">(28)</span></span>
+                <span class="src"><span class="dot"></span>@mara</span>
+              </div>
+            </div>
+          </div>
+
+          <div class="card">
+            <div class="thumb t-audio">
+              <span class="kind-chip">Audio</span>
+              <svg viewBox="0 0 24 24" stroke="currentColor"><path d="M9 18V5l12-2v13"/><circle cx="6" cy="18" r="3"/><circle cx="18" cy="16" r="3"/></svg>
+            </div>
+            <div class="card-body">
+              <h4 class="card-title">Cassette Decay</h4>
+              <p class="card-summary">Tape-loop ambient album, released directly to Freenet last week.</p>
+              <div class="card-meta">
+                <span class="stars">★ 4.3 <span class="count">(17)</span></span>
+                <span class="src"><span class="dot"></span>new</span>
+              </div>
+            </div>
+          </div>
+
+          <div class="card">
+            <div class="thumb t-collection">
+              <span class="kind-chip">Collection</span>
+              <svg viewBox="0 0 24 24" stroke="currentColor"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></svg>
+            </div>
+            <div class="card-body">
+              <h4 class="card-title">Self-hostable replacements</h4>
+              <p class="card-summary">Privacy-respecting alternatives to common centralised services.</p>
+              <div class="card-meta">
+                <span class="stars">★ 4.7 <span class="count">(112)</span></span>
+                <span class="src"><span class="dot"></span>@oss-tools</span>
+              </div>
+            </div>
+          </div>
+
+          <div class="card">
+            <div class="thumb t-profile">
+              <span class="kind-chip">Person</span>
+              <svg viewBox="0 0 24 24" stroke="currentColor"><circle cx="12" cy="8" r="4"/><path d="M20 21a8 8 0 0 0-16 0"/></svg>
+            </div>
+            <div class="card-body">
+              <h4 class="card-title">Mara Heath</h4>
+              <p class="card-summary">Archivist, historian. Curates 14 collections about photography and print.</p>
+              <div class="card-meta">
+                <span class="stars">GhostKey ✓</span>
+                <span class="src"><span class="dot"></span>follows</span>
+              </div>
+            </div>
+          </div>
+
+        </div>
+      </section>
+
+      <!-- Collections -->
+      <section>
+        <div class="sec-head">
+          <h3 class="sec-title">Collections you might like <span class="by">curated</span></h3>
+          <a class="sec-more" href="#">Browse all collections →</a>
+        </div>
+        <div class="collections">
+
+          <div class="coll">
+            <div class="coll-head">
+              <div class="avatar">SR</div>
+              <div class="coll-curator">curated by <strong>@sandy</strong></div>
+              <span class="coll-count">42 items</span>
+            </div>
+            <h4 class="coll-title">Weekend reading</h4>
+            <p class="coll-blurb">Long-form essays and slow documents worth a Saturday afternoon. Updated weekly.</p>
+            <div class="coll-thumbs">
+              <div class="mini-thumb d"></div><div class="mini-thumb a"></div><div class="mini-thumb c"></div><div class="mini-thumb b"></div>
+            </div>
+          </div>
+
+          <div class="coll">
+            <div class="coll-head">
+              <div class="avatar">DA</div>
+              <div class="coll-curator">curated by <strong>@dev-almanac</strong></div>
+              <span class="coll-count">88 items</span>
+            </div>
+            <h4 class="coll-title">Apps that don't suck</h4>
+            <p class="coll-blurb">Freenet apps the Dev Almanac team actually uses. Vetted quarterly, broken ones get dropped.</p>
+            <div class="coll-thumbs">
+              <div class="mini-thumb c"></div><div class="mini-thumb a"></div><div class="mini-thumb b"></div><div class="mini-thumb d"></div>
+            </div>
+          </div>
+
+          <div class="coll">
+            <div class="coll-head">
+              <div class="avatar">MH</div>
+              <div class="coll-curator">curated by <strong>@mara</strong></div>
+              <span class="coll-count">14 collections</span>
+            </div>
+            <h4 class="coll-title">Image archives</h4>
+            <p class="coll-blurb">Photography, prints, scans. Mara's 14 curated archives gathered in one place.</p>
+            <div class="coll-thumbs">
+              <div class="mini-thumb b"></div><div class="mini-thumb a"></div><div class="mini-thumb c"></div><div class="mini-thumb d"></div>
+            </div>
+          </div>
+
+        </div>
+      </section>
+
+      <div class="colophon">
+        <span class="colophon-mark">¶</span>
+        <div>
+          <strong>Mockup note —</strong> Atlas surfaces subjects (apps, rooms, documents, media, profiles, collections) via signed descriptors from analyzers and curators. The default surface hides that machinery; depth — the <em>Why this?</em> pill, the ranking-recipe selector, the descriptor inspector — is one click away. Click any card to open the detail panel.
+        </div>
+      </div>
+
+    </div>
+  </main>
+
+</div>
+
+<!-- ===== Scrim ===== -->
+<div class="scrim" id="scrim" onclick="closeAll()"></div>
+
+<!-- ===== Detail panel ===== -->
+<aside class="detail" id="detail">
+  <div class="detail-head">
+    <span class="detail-eyebrow">Subject · river-room</span>
+    <button class="detail-close" onclick="closeDetail()">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+    </button>
+  </div>
+  <div class="detail-body">
+
+    <div class="detail-thumb">
+      <svg viewBox="0 0 24 24" stroke="currentColor" stroke-width="1.2" fill="none"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>
+    </div>
+
+    <div class="detail-kind">Room · River</div>
+    <h2 class="detail-title">Freenet Builders</h2>
+    <p class="detail-sub">freenet:river/68Ht…7wYE</p>
+
+    <div class="detail-actions">
+      <a class="btn">Open in River</a>
+      <button class="btn secondary" title="Save">
+        <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M19 21l-7-5-7 5V5a2 2 0 0 1 2-2h10a2 2 0 0 1 2 2z"/></svg>
+      </button>
+      <button class="btn secondary" title="Share">
+        <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><circle cx="18" cy="5" r="3"/><circle cx="6" cy="12" r="3"/><circle cx="18" cy="19" r="3"/><line x1="8.59" y1="13.51" x2="15.42" y2="17.49"/><line x1="15.41" y1="6.51" x2="8.59" y2="10.49"/></svg>
+      </button>
+    </div>
+
+    <p class="detail-desc">
+      Active chat for people shipping decentralised apps on Freenet. Daily discussion, weekly demo Fridays. The room skews technical but welcomes new contributors. Founded by <strong>@nacho</strong>. 1,200 members. Very active (~80 messages/day).
+    </p>
+
+    <div class="tag-row">
+      <span class="tag">freenet</span>
+      <span class="tag">development</span>
+      <span class="tag">p2p</span>
+      <span class="tag">rust</span>
+      <span class="tag">contracts</span>
+      <span class="tag">weekly-demos</span>
+    </div>
+
+    <!-- Why this -->
+    <div class="why-panel">
+      <div class="why-head">
+        <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><line x1="12" y1="16" x2="12" y2="12"/><line x1="12" y1="8" x2="12.01" y2="8"/></svg>
+        Why Atlas surfaced this
+      </div>
+      <ul class="why-list">
+        <li><span class="pct">+73</span><span><strong style="color:var(--ink)">@sandy</strong> added this to <em>Weekend reading</em> — a collection you follow.</span></li>
+        <li><span class="pct">+62</span><span>4 people you follow are members: <strong style="color:var(--ink)">@nacho</strong>, <strong style="color:var(--ink)">@mara</strong>, <strong style="color:var(--ink)">@holm</strong>, <strong style="color:var(--ink)">@dev-almanac</strong>.</span></li>
+        <li><span class="pct">+41</span><span>The Freenet topic analyzer tagged this room relevant to your recent activity (Rust, p2p, contracts).</span></li>
+        <li><span class="pct neg">−18</span><span>You've already seen 2 similar rooms this week. Diversity penalty applied.</span></li>
+      </ul>
+    </div>
+
+    <!-- Annotations (reviews + everything else) -->
+    <div class="sub-head">
+      <span>Annotations</span>
+      <span class="meta">312 reviews · 7 details · 6 sources</span>
+    </div>
+
+    <div class="ann-group">
+      <div class="ann-group-label">Reviews <span class="ann-count">showing 2 of 312</span></div>
+
+      <div class="review">
+        <div class="avatar">SR</div>
+        <div class="review-body">
+          <div class="review-head">
+            <span class="review-name">@sandy</span>
+            <span class="review-verified">
+              <svg width="9" height="9" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3"><polyline points="20 6 9 17 4 12"/></svg>
+              GhostKey
+            </span>
+            <span class="review-time">2 days ago</span>
+          </div>
+          <div class="review-stars">★★★★★</div>
+          <p class="review-text">The best room on Freenet right now if you're trying to actually ship something. Friendly, sharp, and the demo Fridays are pure gold.</p>
+        </div>
+      </div>
+
+      <div class="review">
+        <div class="avatar">MH</div>
+        <div class="review-body">
+          <div class="review-head">
+            <span class="review-name">@mara</span>
+            <span class="review-verified">
+              <svg width="9" height="9" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3"><polyline points="20 6 9 17 4 12"/></svg>
+              GhostKey
+            </span>
+            <span class="review-time">5 days ago</span>
+          </div>
+          <div class="review-stars">★★★★☆</div>
+          <p class="review-text">Mostly Rust-oriented. Could use more on the UI/design side, but the people are welcoming.</p>
+        </div>
+      </div>
+    </div>
+
+    <div class="ann-group">
+      <div class="ann-group-label">Details <span class="ann-count">7 from analyzers and curators</span></div>
+      <div class="descriptor-row"><span class="k">summary</span><span class="v">topic-summary v3 · 2d ago</span></div>
+      <div class="descriptor-row"><span class="k">screenshot</span><span class="v">river-snapshot · 1d ago</span></div>
+      <div class="descriptor-row"><span class="k">tags</span><span class="v">topic-classifier · 2d ago</span></div>
+      <div class="descriptor-row"><span class="k">embedding</span><span class="v">bge-base v1 · 7d ago</span></div>
+      <div class="descriptor-row"><span class="k">safety</span><span class="v">freenet-safety · ok</span></div>
+      <div class="descriptor-row"><span class="k">collection</span><span class="v">@sandy/weekend-reading · 4d ago</span></div>
+      <div class="descriptor-row"><span class="k">collection</span><span class="v">@dev-almanac/active-rooms · 1d ago</span></div>
+    </div>
+
+  </div>
+</aside>
+
+<script>
+  // Theme toggle (persists in localStorage, falls back to prefers-color-scheme)
+  const root = document.documentElement;
+  const sun = document.getElementById('iconSun');
+  const moon = document.getElementById('iconMoon');
+  function applyTheme(t){
+    root.setAttribute('data-theme', t);
+    sun.style.display  = t === 'light' ? 'block' : 'none';
+    moon.style.display = t === 'light' ? 'none'  : 'block';
+    try { localStorage.setItem('atlas-theme', t); } catch(e){}
+  }
+  (function initTheme(){
+    let saved=null; try{ saved = localStorage.getItem('atlas-theme'); }catch(e){}
+    if (saved) { applyTheme(saved); return; }
+    const prefersDark = window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches;
+    applyTheme(prefersDark ? 'dark' : 'light');
+  })();
+  document.getElementById('themeToggle').addEventListener('click', () => {
+    applyTheme(root.getAttribute('data-theme') === 'light' ? 'dark' : 'light');
+  });
+
+  function openDetail(){
+    document.querySelector('.sidebar').classList.remove('open');
+    document.getElementById('detail').classList.add('open');
+    document.getElementById('scrim').classList.add('open');
+  }
+  function closeDetail(){
+    document.getElementById('detail').classList.remove('open');
+    document.getElementById('scrim').classList.remove('open');
+  }
+  function openSidebar(){
+    document.getElementById('detail').classList.remove('open');
+    document.querySelector('.sidebar').classList.add('open');
+    document.getElementById('scrim').classList.add('open');
+  }
+  function closeSidebar(){
+    document.querySelector('.sidebar').classList.remove('open');
+    document.getElementById('scrim').classList.remove('open');
+  }
+  function closeAll(){
+    closeDetail();
+    closeSidebar();
+  }
+  document.getElementById('menuBtn').addEventListener('click', openSidebar);
+  // Close sidebar when a nav item is tapped (mobile)
+  document.querySelectorAll('.sidebar .nav a, .sidebar .curator').forEach(el => {
+    el.addEventListener('click', () => {
+      if (window.innerWidth <= 860) closeSidebar();
+    });
+  });
+  document.getElementById('recipeBtn').addEventListener('click', (e) => {
+    e.stopPropagation();
+    document.getElementById('recipePop').classList.toggle('open');
+  });
+  // Popover is nested inside the trigger button; swallow bubbled clicks so option taps don't toggle it shut.
+  document.getElementById('recipePop').addEventListener('click', (e) => {
+    e.stopPropagation();
+  });
+  document.addEventListener('click', (e) => {
+    const pop = document.getElementById('recipePop');
+    if (!pop.contains(e.target)) pop.classList.remove('open');
+  });
+  document.querySelectorAll('.recipe-option').forEach(opt => {
+    opt.addEventListener('click', () => {
+      document.querySelectorAll('.recipe-option').forEach(o => o.classList.remove('selected'));
+      opt.classList.add('selected');
+    });
+  });
+  document.querySelectorAll('.chip').forEach(c => {
+    c.addEventListener('click', () => {
+      document.querySelectorAll('.chip').forEach(x => x.classList.remove('active'));
+      c.classList.add('active');
+    });
+  });
+  document.querySelectorAll('.tab').forEach(t => {
+    t.addEventListener('click', () => {
+      document.querySelectorAll('.tab').forEach(x => x.classList.remove('active'));
+      t.classList.add('active');
+    });
+  });
+</script>
+
+</body>
+</html>
