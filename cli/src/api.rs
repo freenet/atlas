@@ -1,5 +1,5 @@
 //! Minimal Freenet node client over the WebSocket command API, mirroring how
-//! riverctl talks to a node with freenet-stdlib 0.6.
+//! riverctl talks to a node with freenet-stdlib 0.8.
 
 use std::sync::Arc;
 use std::time::Duration;
