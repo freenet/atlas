@@ -7,6 +7,9 @@
 //!
 //! Sources file format: one `https://...` URL per line; `#` starts a comment.
 //! River-official-room and `freenet:` sources are a planned follow-up.
+//!
+//! Env vars: `OPENAI_API_KEY` (enables LLM descriptions), `ATLAS_LLM_MODEL`
+//! (OpenAI chat model, defaults to `DEFAULT_LLM_MODEL`).
 
 use std::collections::HashSet;
 use std::fs;
@@ -21,6 +24,12 @@ use clap::Parser;
 
 const MAX_FETCH_BYTES: usize = 512 * 1024;
 const FETCH_TIMEOUT_SECS: u64 = 15;
+/// Default OpenAI chat model for `describe_llm`, overridable via the
+/// `ATLAS_LLM_MODEL` env var. Current, GA, and cheap. The call shape
+/// (`response_format: {type: json_object}` + a custom `temperature`) rules out
+/// o-series reasoning models, which reject a non-default temperature, so any
+/// override must be a chat model that supports both.
+const DEFAULT_LLM_MODEL: &str = "gpt-4.1-mini";
 
 #[derive(Parser)]
 #[command(name = "atlas-crawler", about = "Automated Atlas curator")]
@@ -104,6 +113,13 @@ fn run_once(cli: &Cli, seen_path: &Path) -> Result<()> {
     if key.is_none() {
         eprintln!("OPENAI_API_KEY not set — using title/meta fallback descriptions");
     }
+    // OpenAI model for `describe_llm`; overridable via `ATLAS_LLM_MODEL` so a
+    // future deprecation is a config change rather than a code change. See
+    // `DEFAULT_LLM_MODEL` for the call-shape constraint (no o-series models).
+    let model = std::env::var("ATLAS_LLM_MODEL")
+        .ok()
+        .filter(|m| !m.is_empty())
+        .unwrap_or_else(|| DEFAULT_LLM_MODEL.to_string());
     let client = reqwest::blocking::Client::builder()
         .timeout(Duration::from_secs(FETCH_TIMEOUT_SECS))
         .redirect(reqwest::redirect::Policy::limited(3))
@@ -136,6 +152,7 @@ fn run_once(cli: &Cli, seen_path: &Path) -> Result<()> {
                 cli,
                 &client,
                 key.as_deref(),
+                &model,
                 &gw,
                 &hub,
                 &mut seen,
@@ -154,7 +171,7 @@ fn run_once(cli: &Cli, seen_path: &Path) -> Result<()> {
             attempts += 1;
             seen.insert(line.to_string());
             append_seen(seen_path, line);
-            match index_locator(cli, &client, key.as_deref(), &gw, line, "external") {
+            match index_locator(cli, &client, key.as_deref(), &model, &gw, line, "external") {
                 Ok(true) => added += 1,
                 Ok(false) => {}
                 Err(e) => eprintln!("skip {line}: {e:#}"),
@@ -183,12 +200,13 @@ fn index_locator(
     cli: &Cli,
     client: &reqwest::blocking::Client,
     key: Option<&str>,
+    model: &str,
     gw: &str,
     loc: &str,
     kind: &str,
 ) -> Result<bool> {
     let page = get_page(cli, client, gw, loc)?;
-    index_page(cli, client, key, loc, kind, &page)
+    index_page(cli, client, key, model, loc, kind, &page)
 }
 
 /// Describe an already-fetched page and add it to the index, applying the
@@ -198,12 +216,13 @@ fn index_page(
     cli: &Cli,
     client: &reqwest::blocking::Client,
     key: Option<&str>,
+    model: &str,
     loc: &str,
     kind: &str,
     page: &Page,
 ) -> Result<bool> {
     let desc = match key {
-        Some(k) => describe_llm(client, k, loc, &page.text).unwrap_or_else(|e| {
+        Some(k) => describe_llm(client, k, model, loc, &page.text).unwrap_or_else(|e| {
             eprintln!("  llm failed ({e:#}), falling back to title/meta");
             describe_fallback(loc, &page.html)
         }),
@@ -306,6 +325,7 @@ fn crawl_hub(
     cli: &Cli,
     client: &reqwest::blocking::Client,
     key: Option<&str>,
+    model: &str,
     gw: &str,
     hub: &str,
     seen: &mut HashSet<String>,
@@ -329,7 +349,7 @@ fn crawl_hub(
         attempts += 1;
         seen.insert(hub.to_string());
         append_seen(seen_path, hub);
-        match index_page(cli, client, key, hub, "site", &page) {
+        match index_page(cli, client, key, model, hub, "site", &page) {
             Ok(true) => added += 1,
             Ok(false) => {}
             Err(e) => eprintln!("hub {hub}: self-index failed: {e:#}"),
@@ -357,7 +377,7 @@ fn crawl_hub(
         attempts += 1;
         seen.insert(loc.clone());
         append_seen(seen_path, &loc);
-        match index_locator(cli, client, key, gw, &loc, kind) {
+        match index_locator(cli, client, key, model, gw, &loc, kind) {
             Ok(true) => added += 1,
             Ok(false) => {}
             Err(e) => eprintln!("  skip {loc}: {e:#}"),
@@ -512,6 +532,7 @@ fn fetch(client: &reqwest::blocking::Client, url: &str) -> Result<String> {
 fn describe_llm(
     client: &reqwest::blocking::Client,
     key: &str,
+    model: &str,
     url: &str,
     text: &str,
 ) -> Result<Described> {
@@ -529,8 +550,12 @@ fn describe_llm(
     // char-based truncation: a byte slice can land inside a multibyte char and panic.
     let truncated: String = text.chars().take(6000).collect();
     let user = format!("URL: {url}\n\nPage text (truncated):\n{truncated}");
+    // `model` defaults to DEFAULT_LLM_MODEL and is overridable via ATLAS_LLM_MODEL.
+    // The request uses `response_format: {type: json_object}` AND a custom
+    // `temperature` (0.2), which o-series reasoning models reject, so the model
+    // must be a chat model that supports both.
     let body = serde_json::json!({
-        "model": "gpt-4o-mini",
+        "model": model,
         "temperature": 0.2,
         "response_format": {"type": "json_object"},
         "messages": [
