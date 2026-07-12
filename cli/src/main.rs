@@ -3,6 +3,7 @@
 //! signed by the online key and merged into the index by per-subject version.
 
 mod api;
+mod migration;
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -78,6 +79,18 @@ enum Cmd {
     },
     /// Print the index contract id (no network).
     Key,
+    /// Print the current index id plus every legacy (pre-rebuild) id, so a
+    /// curator can see exactly which addresses a migration spans (no network).
+    Keys,
+    /// Carry the curated index forward after a rebuild re-keyed it: GET the
+    /// state from the newest legacy address that still holds entries and PUT it
+    /// into the current address (subscribing so the node hosts it). Idempotent —
+    /// the contract merges rather than overwrites, so re-running is safe.
+    Migrate {
+        /// Probe/GET only; report what WOULD be carried forward without PUTting.
+        #[arg(long)]
+        dry_run: bool,
+    },
     /// Write the web-container params (root vk) and print its contract id
     /// (needed for the UI base_path). Reuses the root key as the UI owner.
     WebappParams {
@@ -159,6 +172,16 @@ async fn main() -> Result<()> {
             println!("{}", key.id());
             Ok(())
         }
+        Cmd::Keys => {
+            let params = params_bytes(&dir, &cli.slug)?;
+            let key = NodeClient::contract_key(CONTRACT_WASM, &params);
+            println!("current: {}", key.id());
+            for (i, k) in migration::legacy_index_keys(&params).iter().enumerate() {
+                println!("legacy[{i}]: {}", k.id());
+            }
+            Ok(())
+        }
+        Cmd::Migrate { dry_run } => migrate(&cli, &dir, *dry_run).await,
         Cmd::WebappParams { wasm, out_params } => webapp_params(&dir, wasm, out_params),
         Cmd::WebappSign {
             archive,
@@ -198,6 +221,74 @@ async fn push_state(dir: &Path, slug: &str, from: &str, to: &str) -> Result<()> 
     // Read the target back to confirm it now serves the current state.
     let after = dst.get(&key, false).await?;
     println!("target now has {} live entries", count_live(&after));
+    Ok(())
+}
+
+/// Carry the curated index forward after a rebuild re-keyed the contract.
+///
+/// The index address is `hash(wasm, params)`; a stdlib/toolchain bump that
+/// changes the WASM moves it. This GETs the state from the newest legacy
+/// (pre-rebuild) address that still holds entries and PUTs it into the current
+/// address, so the entries are not stranded. The contract merges on update, so
+/// running this twice is safe (the second run is a no-op merge).
+async fn migrate(cli: &Cli, dir: &Path, dry_run: bool) -> Result<()> {
+    let params = params_bytes(dir, &cli.slug)?;
+    let current_key = NodeClient::contract_key(CONTRACT_WASM, &params);
+    let legacy_keys = migration::legacy_index_keys(&params);
+    if legacy_keys.is_empty() {
+        bail!("no legacy code hashes registered — nothing to migrate from");
+    }
+    println!("current index: {}", current_key.id());
+
+    let mut client = NodeClient::connect(&cli.node).await?;
+    let current_state = client.get(&current_key, false).await.unwrap_or_default();
+    let current_live = count_live(&current_state);
+    println!("current index holds {current_live} live entries");
+
+    // Probe legacy addresses newest-first; pick the one holding the most live
+    // entries as the source of truth.
+    let mut best: Option<(usize, Vec<u8>, ContractInstanceId)> = None;
+    for (i, key) in legacy_keys.iter().enumerate() {
+        let state = client.get(key, false).await.unwrap_or_default();
+        let live = count_live(&state);
+        println!("legacy[{i}] {} holds {live} live entries", key.id());
+        if live > best.as_ref().map(|(n, ..)| *n).unwrap_or(0) {
+            best = Some((live, state, *key.id()));
+        }
+    }
+
+    let Some((live, state, from_id)) = best else {
+        println!("no legacy address holds any entries — nothing to carry forward");
+        return Ok(());
+    };
+    if live <= current_live {
+        println!(
+            "current index already holds >= the {live} legacy entries (from {from_id}); \
+             nothing to carry forward"
+        );
+        return Ok(());
+    }
+
+    if dry_run {
+        println!(
+            "[dry-run] would carry {live} entries from {from_id} into {}",
+            current_key.id()
+        );
+        return Ok(());
+    }
+
+    // PUT-over the (fresh) current contract; the node applies it as a merging
+    // update and, with subscribe, hosts it so cross-node GETs can find it.
+    client
+        .put(CONTRACT_WASM, params, state, true)
+        .await
+        .context("PUT carried state into the current index")?;
+    let after = client.get(&current_key, false).await.unwrap_or_default();
+    println!(
+        "migrated {live} entries from {from_id} into {}; it now holds {} live entries",
+        current_key.id(),
+        count_live(&after)
+    );
     Ok(())
 }
 
@@ -376,7 +467,7 @@ async fn show(cli: &Cli, dir: &Path, subscribe: bool) -> Result<()> {
     let state: IndexState =
         ciborium::de::from_reader(&bytes[..]).context("decoding index state")?;
     let mut entries: Vec<_> = state.live_entries().collect();
-    entries.sort_by(|a, b| b.added_at.cmp(&a.added_at));
+    entries.sort_by_key(|e| std::cmp::Reverse(e.added_at));
     println!("{} live entries:", entries.len());
     for e in entries {
         let star = if e.featured { "★ " } else { "  " };
