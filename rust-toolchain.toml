@@ -1,0 +1,9 @@
+# Pinned so the index-contract WASM is byte-reproducible across machines and CI.
+# The contract's address is the hash of its compiled WASM, so a toolchain drift
+# silently re-keys the live index (orphaning its curated entries). Pin the exact
+# toolchain, and combine with `trim-paths` (root Cargo.toml) so registry/sysroot
+# paths don't leak into the binary and break cross-machine reproducibility.
+[toolchain]
+channel = "1.96.0"
+components = ["rustfmt", "clippy"]
+targets = ["wasm32-unknown-unknown"]
