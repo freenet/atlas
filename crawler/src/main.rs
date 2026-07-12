@@ -5,8 +5,11 @@
 //! `atlasctl add`. Treats fetched page content as untrusted and never trusts
 //! on-page instructions. Fully automatic, like a search-engine crawler.
 //!
-//! Sources file format: one `https://...` URL per line; `#` starts a comment.
-//! River-official-room and `freenet:` sources are a planned follow-up.
+//! Sources file format: one entry per line; `#` starts a comment. Line types:
+//!   - a plain `https://...` (or `freenet:<id>`) URL — indexed directly;
+//!   - `hub <locator>` — a link repository; the sites it links to are indexed;
+//!   - `river-room <owner-vk>` — a River chat room; the `https://` and
+//!     `freenet:` URLs posted in its messages are indexed (Atlas issue #2).
 //!
 //! Env vars: `OPENAI_API_KEY` (enables LLM descriptions), `ATLAS_LLM_MODEL`
 //! (OpenAI chat model, defaults to `DEFAULT_LLM_MODEL`).
@@ -21,6 +24,12 @@ use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context, Result};
 use clap::Parser;
+use ed25519_dalek::VerifyingKey;
+use freenet_stdlib::client_api::{
+    ClientRequest, ContractRequest, ContractResponse, HostResponse, WebApi,
+};
+use freenet_stdlib::prelude::{ContractInstanceId, ContractKey};
+use river_core::ChatRoomStateV1;
 
 const MAX_FETCH_BYTES: usize = 512 * 1024;
 const FETCH_TIMEOUT_SECS: u64 = 15;
@@ -155,6 +164,29 @@ fn run_once(cli: &Cli, seen_path: &Path) -> Result<()> {
                 &model,
                 &gw,
                 &hub,
+                &mut seen,
+                seen_path,
+                cli.max - attempts,
+            );
+            attempts += a;
+            added += ok;
+        } else if let Some(owner_vk) = line
+            .strip_prefix("river-room ")
+            .or_else(|| line.strip_prefix("river-room:"))
+        {
+            // `river-room <owner-vk>`: a River chat room, referenced by its
+            // stable owner VerifyingKey (NOT its contract key, which River
+            // re-keys on every WASM upgrade). We derive the contract key from
+            // the owner VK, GET the room state from the local node, and index
+            // the URLs posted in its messages. See `crawl_river_room`.
+            let owner_vk = owner_vk.trim().to_string();
+            let (a, ok) = crawl_river_room(
+                cli,
+                &client,
+                key.as_deref(),
+                &model,
+                &gw,
+                &owner_vk,
                 &mut seen,
                 seen_path,
                 cli.max - attempts,
@@ -321,6 +353,7 @@ fn render_page(node_bin: &str, renderer: &Path, url: &str) -> Result<Page> {
 
 /// Crawl a hub (link-repository) page: fetch it, extract outbound site links, and
 /// index each new one (LLM-described). Returns the number added.
+#[allow(clippy::too_many_arguments)]
 fn crawl_hub(
     cli: &Cli,
     client: &reqwest::blocking::Client,
@@ -384,6 +417,258 @@ fn crawl_hub(
         }
     }
     (attempts, added)
+}
+
+/// BLAKE3 code hash of the CURRENT River room-contract WASM generation.
+///
+/// The room contract key is `BLAKE3(room_contract.wasm, params)` with
+/// `params = CBOR({ owner: VerifyingKey })`, so anchoring on the owner VK still
+/// needs the code hash of the current WASM generation to derive the *current*
+/// key. River re-keys the room contract on every WASM upgrade (a stdlib bump,
+/// a common/ change, etc.), which moves this hash. `river-core`'s `migration`
+/// registry gives every *previous* generation's hash (the legacy fallback), but
+/// deliberately excludes the current one, so we carry it here.
+///
+/// This is the crawler's analogue of River UI / riverctl bundling the current
+/// `room_contract.wasm` and hashing it at runtime — we bundle just the 32-byte
+/// hash. `river_core::migration::contract_key_for_code_hash(owner, &hash)` on
+/// this value reproduces exactly what `owner_vk_to_contract_key(owner)` computes
+/// in River (pinned there by `legacy_derivation_matches_live_key_for_current_wasm`).
+///
+/// UPDATE-ON-RE-KEY: when River re-keys, refresh this to the new generation's
+/// hash (`b3sum river/…/ui/public/contracts/room_contract.wasm`). Until then the
+/// legacy fallback keeps reading the room from the previous generation that
+/// still has live state, so ingestion degrades gracefully rather than stopping.
+/// Bumping `river-core` folds the outgoing generation into the legacy registry
+/// but never supplies the new current hash, so this constant is the one thing
+/// that must move on a re-key.
+///
+/// Current value corresponds to the stdlib-0.8 generation (River workspace
+/// 0.1.13), whose Official-room key is `43YnYUU2nUXQRvqfDVxrv33i5PCKq7wDp9okvfSZjU8s`
+/// for owner `4uNUKFzZQCnzo4K2ecZ16cMsYEEfoaRS35z6exEsbvm4` — pinned by
+/// `river_room_key_derivation_reproduces_official`.
+const CURRENT_ROOM_CONTRACT_CODE_HASH: [u8; 32] = [
+    0x74, 0xf3, 0xdf, 0xf1, 0xc3, 0xc2, 0xf4, 0xef, 0x89, 0xe4, 0xc9, 0x3e, 0xe4, 0x5d, 0xdb, 0x62,
+    0x95, 0x2d, 0xf2, 0x21, 0x61, 0x45, 0x0a, 0x90, 0x5c, 0x27, 0x84, 0xc1, 0xfa, 0xcf, 0x67, 0x40,
+];
+
+/// Parse a base58 ed25519 verifying key (a River room owner VK).
+fn parse_owner_vk(s: &str) -> Result<VerifyingKey> {
+    let bytes = bs58::decode(s)
+        .into_vec()
+        .with_context(|| "owner vk is not valid base58")?;
+    let arr: [u8; 32] = bytes
+        .as_slice()
+        .try_into()
+        .map_err(|_| anyhow!("owner vk decodes to {} bytes, expected 32", bytes.len()))?;
+    VerifyingKey::from_bytes(&arr).with_context(|| "owner vk is not a valid ed25519 point")
+}
+
+/// The room-contract keys to probe for `owner_vk`, newest generation first:
+/// the current generation (derived from [`CURRENT_ROOM_CONTRACT_CODE_HASH`])
+/// then every legacy generation from `river-core`'s registry (newest-first).
+/// This is what makes ingestion re-key-proof: after a River re-key the room
+/// state migrates to a new key, and we find it via the current-generation
+/// derivation once this crate learns the new hash, or via the legacy fallback
+/// in the meantime.
+fn room_candidate_keys(owner_vk: &VerifyingKey) -> Vec<ContractKey> {
+    let mut keys = vec![river_core::migration::contract_key_for_code_hash(
+        owner_vk,
+        &CURRENT_ROOM_CONTRACT_CODE_HASH,
+    )];
+    keys.extend(river_core::migration::legacy_contract_keys_for_owner(
+        owner_vk,
+    ));
+    keys
+}
+
+/// GET a River room's state from the local node, trying each candidate key
+/// (current then legacy) until one returns a real, owner-signed room. Returns
+/// the deserialized state with its computed actions-state rebuilt, or `None` if
+/// no candidate resolved to a live room owned by `owner_vk`.
+///
+/// Mirrors riverctl's legacy-recovery probe (`cli/src/api.rs`): `return_contract
+/// _code: true` so a legacy generation the node hasn't cached can still resolve,
+/// and an owner-signature check on the configuration to reject empty/uninitialised
+/// contracts. Read-only — never subscribes, never PUTs.
+async fn fetch_room_state(
+    node_url: &str,
+    owner_vk: &VerifyingKey,
+    candidates: &[ContractInstanceId],
+) -> Result<Option<ChatRoomStateV1>> {
+    let (ws, _) = tokio_tungstenite::connect_async(node_url)
+        .await
+        .with_context(|| format!("connecting to node {node_url}"))?;
+    let mut api = WebApi::start(ws);
+
+    for id in candidates {
+        let req = ContractRequest::Get {
+            key: *id,
+            return_contract_code: true,
+            subscribe: false,
+            blocking_subscribe: false,
+        };
+        if api.send(ClientRequest::ContractOp(req)).await.is_err() {
+            continue;
+        }
+        let resp = match tokio::time::timeout(Duration::from_secs(30), api.recv()).await {
+            Ok(Ok(r)) => r,
+            _ => continue,
+        };
+        let HostResponse::ContractResponse(ContractResponse::GetResponse { state, .. }) = resp
+        else {
+            continue;
+        };
+        let mut room_state = match ciborium::de::from_reader::<ChatRoomStateV1, _>(&state[..]) {
+            Ok(s) => s,
+            Err(_) => continue,
+        };
+        // A real room always carries an owner-signed configuration; an absent or
+        // never-initialised contract does not. This also rejects a same-key hit
+        // that isn't actually this owner's room.
+        if room_state.configuration.verify_signature(owner_vk).is_err() {
+            continue;
+        }
+        room_state.recent_messages.rebuild_actions_state();
+        return Ok(Some(room_state));
+    }
+    Ok(None)
+}
+
+/// Crawl a River room: derive its contract key from the owner VK, GET the room
+/// state from the local node, extract the `https://` / `freenet:` URLs posted in
+/// its messages, and index each new one through the same seen-set + LLM-describe
+/// path as hub links. Returns `(attempts, added)`.
+#[allow(clippy::too_many_arguments)]
+fn crawl_river_room(
+    cli: &Cli,
+    client: &reqwest::blocking::Client,
+    key: Option<&str>,
+    model: &str,
+    gw: &str,
+    owner_vk_b58: &str,
+    seen: &mut HashSet<String>,
+    seen_path: &Path,
+    budget: usize,
+) -> (usize, usize) {
+    let owner_vk = match parse_owner_vk(owner_vk_b58) {
+        Ok(vk) => vk,
+        Err(e) => {
+            eprintln!("river-room {owner_vk_b58}: bad owner vk: {e:#}");
+            return (0, 0);
+        }
+    };
+    let candidate_keys = room_candidate_keys(&owner_vk);
+    let candidate_ids: Vec<ContractInstanceId> = candidate_keys.iter().map(|k| *k.id()).collect();
+
+    // The WS GET is async; run it on a short-lived runtime and return the owned
+    // state, so the blocking-reqwest indexing below never runs inside a tokio
+    // context. block_on of a blocking client inside a runtime would panic.
+    let state = match tokio::runtime::Runtime::new() {
+        Ok(rt) => rt.block_on(fetch_room_state(&cli.node, &owner_vk, &candidate_ids)),
+        Err(e) => {
+            eprintln!("river-room {owner_vk_b58}: runtime: {e:#}");
+            return (0, 0);
+        }
+    };
+    let state = match state {
+        Ok(Some(s)) => s,
+        Ok(None) => {
+            eprintln!(
+                "river-room {owner_vk_b58}: no live room found (tried {} candidate key(s))",
+                candidate_ids.len()
+            );
+            return (0, 0);
+        }
+        Err(e) => {
+            eprintln!("river-room {owner_vk_b58}: fetch failed: {e:#}");
+            return (0, 0);
+        }
+    };
+
+    let links = extract_message_urls(&state);
+    eprintln!(
+        "river-room {owner_vk_b58}: {} candidate link(s)",
+        links.len()
+    );
+
+    let mut attempts = 0;
+    let mut added = 0;
+    for (loc, kind) in links {
+        if attempts >= budget {
+            eprintln!("river-room {owner_vk_b58}: hit attempt budget {budget}, stopping");
+            break;
+        }
+        if seen.contains(&loc) {
+            continue;
+        }
+        // Mark attempted before describe/add (same cost guard as hub links):
+        // each locator is described at most once, ever.
+        attempts += 1;
+        seen.insert(loc.clone());
+        append_seen(seen_path, &loc);
+        match index_locator(cli, client, key, model, gw, &loc, kind) {
+            Ok(true) => added += 1,
+            Ok(false) => {}
+            Err(e) => eprintln!("  skip {loc}: {e:#}"),
+        }
+    }
+    (attempts, added)
+}
+
+/// Extract outbound locators from a room's messages: the `https://` and
+/// `freenet:` URLs posted in message text. Walks the visible (non-action,
+/// non-deleted) messages, takes each one's effective (edit-aware) public text,
+/// and scans it for URLs. Private/encrypted messages yield no text and are
+/// skipped. Dedups across the whole room.
+fn extract_message_urls(state: &ChatRoomStateV1) -> Vec<(String, &'static str)> {
+    let messages = &state.recent_messages;
+    let mut out: Vec<(String, &'static str)> = Vec::new();
+    let mut seen = HashSet::new();
+    for msg in messages.display_messages() {
+        let Some(text) = messages.effective_text(msg) else {
+            continue;
+        };
+        for (loc, kind) in scan_urls(&text) {
+            if seen.insert(loc.clone()) {
+                out.push((loc, kind));
+            }
+        }
+    }
+    out
+}
+
+/// Scan freeform message text for `https://` and `freenet:` URLs. Tokenizes on
+/// whitespace and common wrapping punctuation (brackets, quotes, markdown
+/// emphasis), strips trailing sentence punctuation, and runs each candidate
+/// through [`normalize_href`] so the result is byte-identical to how hub-link
+/// extraction normalizes URLs (asset filtering, fragment stripping, `freenet:`
+/// id validation). Dedups within the text.
+fn scan_urls(text: &str) -> Vec<(String, &'static str)> {
+    let mut out: Vec<(String, &'static str)> = Vec::new();
+    let mut seen = HashSet::new();
+    // Split on whitespace and characters that commonly wrap a URL but can never
+    // be part of one. NOT `:` or `/` (they're inside `https://` / `freenet:`).
+    let is_boundary = |c: char| {
+        c.is_whitespace()
+            || matches!(
+                c,
+                '<' | '>' | '(' | ')' | '[' | ']' | '{' | '}' | '"' | '\'' | '`' | '*' | '|' | '\\'
+            )
+    };
+    for raw in text.split(is_boundary) {
+        // Strip trailing sentence punctuation a URL wouldn't end with.
+        let tok = raw.trim_end_matches(['.', ',', ';', ':', '!', '?']);
+        if tok.is_empty() {
+            continue;
+        }
+        if let Some((loc, kind)) = normalize_href(tok) {
+            if seen.insert(loc.clone()) {
+                out.push((loc, kind));
+            }
+        }
+    }
+    out
 }
 
 /// Extract outbound site locators from hub HTML: `freenet:<id>` links, gateway
@@ -864,5 +1149,84 @@ mod tests {
             gateway_http_base("wss://gw.example/x"),
             "https://gw.example"
         );
+    }
+
+    // --- River-room ingestion (Atlas issue #2) ---
+
+    /// The Freenet Official room's stable owner VerifyingKey (from the
+    /// `river-official-room` runbook; the key gkapi signs invites with).
+    const OFFICIAL_OWNER_VK: &str = "4uNUKFzZQCnzo4K2ecZ16cMsYEEfoaRS35z6exEsbvm4";
+    /// The Official room's live contract key at the current (stdlib-0.8) WASM
+    /// generation (verified live in `~/.local/share/river/rooms.json`).
+    const OFFICIAL_CURRENT_KEY: &str = "43YnYUU2nUXQRvqfDVxrv33i5PCKq7wDp9okvfSZjU8s";
+
+    /// The re-key-proofing guard: deriving the current room-contract key from
+    /// the Official room's owner VK + [`CURRENT_ROOM_CONTRACT_CODE_HASH`] must
+    /// reproduce the known live key. If River re-keys and this constant is not
+    /// refreshed, this fails — a loud, correct signal to update the hash.
+    #[test]
+    fn river_room_key_derivation_reproduces_official() {
+        let owner = parse_owner_vk(OFFICIAL_OWNER_VK).expect("official owner vk parses");
+        let key = river_core::migration::contract_key_for_code_hash(
+            &owner,
+            &CURRENT_ROOM_CONTRACT_CODE_HASH,
+        );
+        assert_eq!(
+            key.id().to_string(),
+            OFFICIAL_CURRENT_KEY,
+            "current-generation derivation must reproduce the live Official room key"
+        );
+        // And the first candidate we actually probe is that current key.
+        let candidates = room_candidate_keys(&owner);
+        assert_eq!(candidates[0].id().to_string(), OFFICIAL_CURRENT_KEY);
+        // Plus at least one legacy generation from river-core's registry.
+        assert!(
+            candidates.len() > 1,
+            "expected current + legacy candidate keys, got {}",
+            candidates.len()
+        );
+    }
+
+    #[test]
+    fn parse_owner_vk_rejects_garbage() {
+        assert!(parse_owner_vk("not base58 !!!").is_err());
+        // Valid base58 but wrong length.
+        assert!(parse_owner_vk("abc").is_err());
+    }
+
+    #[test]
+    fn scan_urls_extracts_and_normalizes() {
+        let text = format!(
+            "Check https://github.com/freenet/river and <freenet:{ID}/about> too. \
+             Dup: https://github.com/freenet/river. Markdown [link](https://example.com/p#frag)! \
+             bare freenet:{ID}",
+        );
+        let urls = scan_urls(&text);
+        assert!(
+            urls.contains(&("https://github.com/freenet/river".to_string(), "external")),
+            "got {urls:?}"
+        );
+        assert!(
+            urls.contains(&(format!("freenet:{ID}/about"), "site")),
+            "got {urls:?}"
+        );
+        // https fragment stripped, wrapping paren/`!` removed.
+        assert!(
+            urls.contains(&("https://example.com/p".to_string(), "external")),
+            "got {urls:?}"
+        );
+        assert!(
+            urls.contains(&(format!("freenet:{ID}"), "site")),
+            "got {urls:?}"
+        );
+        // Duplicate https link collapsed.
+        assert_eq!(urls.len(), 4, "expected 4 distinct urls, got {urls:?}");
+    }
+
+    #[test]
+    fn scan_urls_ignores_non_urls_and_bad_freenet_ids() {
+        let urls =
+            scan_urls("hello world, email a@b.com, ftp://x, freenet:tooShort http://insecure");
+        assert!(urls.is_empty(), "got {urls:?}");
     }
 }
