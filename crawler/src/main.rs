@@ -14,33 +14,57 @@
 //! Env vars: `OPENAI_API_KEY` (enables LLM descriptions), `ATLAS_LLM_MODEL`
 //! (OpenAI chat model, defaults to `DEFAULT_LLM_MODEL`).
 //!
+//! # Design: discovery is free, description is rationed
+//!
+//! Each run has two phases:
+//!
+//! 1. **Discovery** — poll every source and record newly-seen locators in the
+//!    pending queue. Costs one contract GET per room; no tokens, ever. Runs
+//!    even when the spend budget is exhausted.
+//! 2. **Description** — drain the pending queue under the spend caps, fetching
+//!    and LLM-describing as budget allows.
+//!
+//! The split is what makes frequent polling safe. It would be simpler to rate
+//! limit at discovery and let a held-back link be re-read next run, but that is
+//! only valid for a source we can re-read on demand. A River room keeps just its
+//! most recent messages (100 by default) and evicts oldest-first, so a link we
+//! decline to look at today may not exist tomorrow — rate limiting at discovery
+//! silently loses links instead of deferring them. Capturing first means a link
+//! is safe the moment we see it, whatever the room does next.
+//!
 //! # Cost model
 //!
-//! An LLM call is billed per *newly discovered* locator, never per poll. Polling
-//! a River room costs one contract GET; a poll that surfaces nothing new spends
-//! zero tokens. That makes a fast `--interval` cheap, which is what lets a busy
-//! room be watched closely.
+//! An LLM call is billed per *newly discovered* locator, never per poll: a poll
+//! that surfaces nothing new spends zero tokens. Five bounds apply:
 //!
-//! Four caps bound spend, so neither a spam flood nor a bug can run up a bill:
-//!   - the seen set (persisted): each locator is described at most ONCE, ever;
-//!   - `--max`: hard cap on billed attempts per run;
-//!   - `--daily-max`: hard cap on billed attempts per rolling 24h, persisted to
-//!     the spend ledger so a restart or crash-loop cannot reset it. This is the
-//!     real money ceiling — `--max` alone scales with how often we poll;
-//!   - `--per-host-max` / `--per-author-max`: per-run fairness shares, so one
-//!     domain or one spamming room member cannot monopolize a run's budget.
-//!
-//! A locator deferred by a cap is NOT marked seen, so it is reconsidered on a
-//! later run rather than silently dropped.
+//!   - the seen set (persisted): a locator is described at most ONCE, ever;
+//!   - `--max`: billed attempts per run;
+//!   - `--daily-max`: billed attempts per rolling 24h, persisted to the spend
+//!     ledger so a restart or crash-loop cannot reset it. This is the real money
+//!     ceiling — `--max` alone scales with how often we poll. If the ledger
+//!     cannot be read or written, spending stops: a cap we cannot persist is
+//!     not a cap;
+//!   - `--per-host-max`: per-run share for one publisher, bucketed so that
+//!     subdomains of one domain share it;
+//!   - `--per-author-max`: per-run share for one room member. The queue also
+//!     drains round-robin by author, so a member with a huge backlog cannot
+//!     push everyone else's links behind it.
 //!
 //! Expensive sources are rate-limited separately from cheap ones: `--hub-interval`
 //! keeps hub re-rendering (a headless browser, tens of seconds) on a slow cadence
 //! while `--interval` polls rooms frequently.
+//!
+//! # Trust
+//!
+//! Room messages and hub pages are UNTRUSTED public input. Such content is
+//! never indexed without a real LLM content-safety rating — in particular an LLM
+//! failure must not fall through to the unrated title/meta description, since
+//! that would make any OpenAI hiccup an open door to the index. Only locators
+//! listed in the operator's own sources file may use that fallback.
 
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::Read;
-use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -55,6 +79,10 @@ use freenet_stdlib::prelude::{ContractInstanceId, ContractKey};
 use river_core::ChatRoomStateV1;
 
 const MAX_FETCH_BYTES: usize = 512 * 1024;
+/// Cap on the headless renderer's JSON output. Generous next to MAX_FETCH_BYTES
+/// because it carries the rendered DOM plus extracted text, but still bounded:
+/// the page being rendered may be attacker-authored.
+const RENDER_MAX_BYTES: usize = 8 * 1024 * 1024;
 const FETCH_TIMEOUT_SECS: u64 = 15;
 /// Default OpenAI chat model for `describe_llm`, overridable via the
 /// `ATLAS_LLM_MODEL` env var. Current, GA, and cheap. The call shape
@@ -95,6 +123,10 @@ struct Cli {
     /// window (default: <key_dir>/crawler-spend.txt).
     #[arg(long)]
     spend: Option<PathBuf>,
+    /// File tracking discovered-but-not-yet-described locators
+    /// (default: <key_dir>/crawler-pending.txt).
+    #[arg(long)]
+    pending: Option<PathBuf>,
     /// Max LLM-billed attempts per run.
     #[arg(long, default_value_t = 20)]
     max: usize,
@@ -154,6 +186,11 @@ struct SpendLedger {
     path: PathBuf,
     /// Timestamps of billed attempts inside the current window.
     recent: Vec<u64>,
+    /// Set when the ledger could not be read, or when a write to it failed.
+    /// Spending stops while this is set: a cap we cannot persist is not a cap,
+    /// and continuing to spend is exactly the wrong response to losing the only
+    /// record of what has been spent.
+    broken: bool,
 }
 
 impl SpendLedger {
@@ -164,19 +201,38 @@ impl SpendLedger {
     /// to run because it is absent would be worse than recounting from zero.
     fn load(path: &Path) -> Self {
         let cutoff = now_secs().saturating_sub(SPEND_WINDOW_SECS);
-        let recent: Vec<u64> = fs::read_to_string(path)
+        let raw = fs::read_to_string(path);
+        let readable = raw.is_ok();
+        let missing = matches!(&raw, Err(e) if e.kind() == std::io::ErrorKind::NotFound);
+        let all: Vec<u64> = raw
             .map(|s| {
                 s.lines()
                     .filter_map(|l| l.trim().parse::<u64>().ok())
-                    .filter(|t| *t >= cutoff)
                     .collect()
             })
             .unwrap_or_default();
+        let recent: Vec<u64> = all.iter().copied().filter(|t| *t >= cutoff).collect();
+        let pruned = recent.len() != all.len();
         let ledger = Self {
             path: path.to_path_buf(),
             recent,
+            // A ledger we could not READ must not be treated as spendable
+            // headroom: an unreadable file is an unknown balance, not a zero
+            // one. Missing is different — a first run legitimately has none.
+            broken: !readable && !missing,
         };
-        ledger.rewrite();
+        if !readable && !missing {
+            eprintln!(
+                "warn: spend ledger {} unreadable — treating the 24h window as full",
+                path.display()
+            );
+        }
+        // Only rewrite when the read succeeded AND something actually aged out.
+        // Rewriting after a failed read would overwrite a real ledger with an
+        // empty one, silently resetting the very cap this type exists to hold.
+        if readable && pruned {
+            ledger.rewrite();
+        }
         ledger
     }
 
@@ -192,21 +248,29 @@ impl SpendLedger {
         let now = now_secs();
         self.recent.push(now);
         if let Err(e) = append_line(&self.path, &now.to_string()) {
-            eprintln!("warn: spend ledger append failed ({e:#}); cap may reset on restart");
+            // Fail CLOSED. If this attempt is not on disk, the next run
+            // recomputes headroom without it, so continuing would let a
+            // persistently-unwritable ledger authorise --max attempts per run
+            // forever (at --interval 300 that is ~5,760/day against a 200 cap).
+            eprintln!("error: spend ledger append failed ({e:#}); halting spend for this run");
+            self.broken = true;
         }
     }
 
-    /// Atomically replace the ledger file with the in-window entries.
+    /// Atomically replace the ledger file with the in-window entries. Staged
+    /// through a process-unique sibling: a shared fixed name would let two
+    /// crawler processes interleave writes into one file and publish a
+    /// corrupted ledger, and `with_extension("tmp")` could clobber an unrelated
+    /// file the operator named.
     fn rewrite(&self) {
-        let body: String = self
-            .recent
-            .iter()
-            .map(|t| format!("{t}\n"))
-            .collect::<Vec<_>>()
-            .concat();
-        let tmp = self.path.with_extension("tmp");
-        if fs::write(&tmp, &body).is_ok() {
-            let _ = fs::rename(&tmp, &self.path);
+        let body: String = self.recent.iter().map(|t| format!("{t}\n")).collect();
+        let tmp = sibling_tmp(&self.path);
+        if fs::write(&tmp, &body).is_err() || fs::rename(&tmp, &self.path).is_err() {
+            let _ = fs::remove_file(&tmp);
+            eprintln!(
+                "warn: could not rewrite spend ledger {}",
+                self.path.display()
+            );
         }
     }
 }
@@ -233,7 +297,11 @@ struct Budget<'a> {
 
 impl<'a> Budget<'a> {
     fn new(ledger: &'a mut SpendLedger, max: usize, daily_max: usize, per_host_max: usize) -> Self {
-        let headroom = daily_max.saturating_sub(ledger.spent());
+        let headroom = if ledger.broken {
+            0
+        } else {
+            daily_max.saturating_sub(ledger.spent())
+        };
         Self {
             remaining: max.min(headroom),
             per_host_max,
@@ -255,7 +323,8 @@ impl<'a> Budget<'a> {
     /// silently discard it forever, which is how a rate limit turns into data
     /// loss.)
     fn try_take(&mut self, loc: &str) -> Result<(), Denied> {
-        if self.remaining == 0 {
+        // A write failure mid-run stops further spending immediately.
+        if self.remaining == 0 || self.ledger.broken {
             return Err(Denied::Exhausted);
         }
         let host = host_bucket(loc);
@@ -278,10 +347,252 @@ fn host_bucket(loc: &str) -> String {
     if let Some(rest) = loc.strip_prefix("freenet:") {
         return format!("freenet:{}", split_freenet(rest).0);
     }
-    url::Url::parse(loc)
+    let host = url::Url::parse(loc)
         .ok()
-        .and_then(|u| u.host_str().map(|h| h.to_ascii_lowercase()))
-        .unwrap_or_else(|| loc.to_string())
+        .and_then(|u| u.host_str().map(|h| h.to_ascii_lowercase()));
+    let Some(host) = host else {
+        // A locator that does not parse gets ONE shared bucket, never a bucket
+        // of its own. Keying on the raw string would let junk like
+        // `https://x^1`, `https://x^2`, … mint unlimited buckets and drain the
+        // budget without ever making a request.
+        return "@unparsed".to_string();
+    };
+    // Group by the last two labels, so `a1.evil.com`, `a2.evil.com`, … share one
+    // bucket. Without this a single wildcard DNS record defeats the per-host
+    // share entirely. This over-groups under multi-part suffixes (`a.co.uk` and
+    // `b.co.uk` share `co.uk`), which only makes the limit stricter — the safe
+    // direction for a spend cap, and why this is preferred to carrying a
+    // public-suffix list.
+    let host = host.trim_end_matches('.');
+    let labels: Vec<&str> = host.split('.').collect();
+    if labels.len() <= 2 {
+        return host.to_string();
+    }
+    labels[labels.len() - 2..].join(".")
+}
+
+/// How many times a locator may be retried after a transient failure before we
+/// give up and stop reconsidering it.
+const MAX_ATTEMPTS: u32 = 3;
+/// Bound on pending entries attributable to one author, so a spammer's backlog
+/// cannot grow without limit.
+const MAX_PENDING_PER_AUTHOR: usize = 200;
+/// Bound on the whole pending queue.
+const MAX_PENDING_TOTAL: usize = 20_000;
+/// Author bucket for locators that came from a hub page rather than a person.
+const HUB_AUTHOR: &str = "@hub";
+/// Author bucket for locators listed directly in the operator's sources file.
+const CURATED_AUTHOR: &str = "@curated";
+
+/// A locator queued for description: `(locator, kind, author)`.
+type QueuedLocator = (String, &'static str, String);
+
+#[derive(Clone)]
+struct PendingEntry {
+    kind: &'static str,
+    /// Room member who posted it, or empty for hub/curated sources. Used to
+    /// share out drain capacity fairly.
+    author: String,
+    attempts: u32,
+}
+
+/// Locators that are known but not yet successfully indexed, persisted to disk.
+///
+/// This exists because discovery and spending have to be decoupled. "Leave it
+/// unseen and re-read it next run" is a valid retry strategy only for a source
+/// the crawler can re-read on demand — a hub page, the sources file. A River
+/// room is NOT such a source: it keeps only the most recent
+/// `max_recent_messages` (100 by default), evicts oldest-first, and drops a
+/// banned member's messages wholesale. A link held back by a rate limit can
+/// therefore be gone from the room before its retry, so deferring without
+/// recording it is a delayed silent drop, not a deferral.
+///
+/// So discovery is free and unconditional (every new locator lands here the
+/// moment it is seen, even when the spend budget is exhausted), and description
+/// is billed and rationed out of this queue afterwards. Once a locator is here
+/// it is safe regardless of what the room does next.
+struct Pending {
+    path: PathBuf,
+    /// Discovery order, oldest first — the drain order within one author.
+    entries: Vec<(String, PendingEntry)>,
+    index: HashSet<String>,
+    per_author: HashMap<String, usize>,
+    dirty: bool,
+}
+
+impl Pending {
+    fn load(path: &Path) -> Self {
+        let mut p = Self {
+            path: path.to_path_buf(),
+            entries: Vec::new(),
+            index: HashSet::new(),
+            per_author: HashMap::new(),
+            dirty: false,
+        };
+        let Ok(body) = fs::read_to_string(path) else {
+            return p;
+        };
+        for line in body.lines() {
+            // attempts \t kind \t author \t locator  (locator last: it may not
+            // contain a tab, and this keeps parsing unambiguous)
+            let mut parts = line.splitn(4, '\t');
+            let (Some(attempts), Some(kind), Some(author), Some(loc)) =
+                (parts.next(), parts.next(), parts.next(), parts.next())
+            else {
+                continue;
+            };
+            let loc = loc.trim();
+            if loc.is_empty() {
+                continue;
+            }
+            let attempts: u32 = attempts.trim().parse().unwrap_or(0);
+            let kind = if kind == "site" { "site" } else { "external" };
+            p.insert_raw(loc.to_string(), kind, author.to_string(), attempts);
+        }
+        p
+    }
+
+    fn insert_raw(&mut self, loc: String, kind: &'static str, author: String, attempts: u32) {
+        if !self.index.insert(loc.clone()) {
+            return;
+        }
+        *self.per_author.entry(author.clone()).or_insert(0) += 1;
+        self.entries.push((
+            loc,
+            PendingEntry {
+                kind,
+                author,
+                attempts,
+            },
+        ));
+    }
+
+    fn contains(&self, loc: &str) -> bool {
+        self.index.contains(loc)
+    }
+
+    fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// Capture a newly discovered locator. Returns true if it was added.
+    /// Refuses past the per-author and total bounds so a flood cannot grow the
+    /// queue without limit or crowd out an existing backlog.
+    fn add(&mut self, loc: &str, kind: &'static str, author: &str) -> bool {
+        if self.index.contains(loc) {
+            return false;
+        }
+        if self.entries.len() >= MAX_PENDING_TOTAL {
+            return false;
+        }
+        if self.per_author.get(author).copied().unwrap_or(0) >= MAX_PENDING_PER_AUTHOR {
+            return false;
+        }
+        self.insert_raw(loc.to_string(), kind, author.to_string(), 0);
+        self.dirty = true;
+        true
+    }
+
+    fn remove(&mut self, loc: &str) {
+        if !self.index.remove(loc) {
+            return;
+        }
+        if let Some(pos) = self.entries.iter().position(|(l, _)| l == loc) {
+            let (_, e) = self.entries.remove(pos);
+            if let Some(n) = self.per_author.get_mut(&e.author) {
+                *n = n.saturating_sub(1);
+            }
+        }
+        self.dirty = true;
+    }
+
+    /// Record a transient failure. Returns true once the locator has burned
+    /// `MAX_ATTEMPTS` and should be given up on (and marked seen, so it is never
+    /// reconsidered).
+    fn record_failure(&mut self, loc: &str) -> bool {
+        self.dirty = true;
+        let Some((_, e)) = self.entries.iter_mut().find(|(l, _)| l == loc) else {
+            return true;
+        };
+        e.attempts += 1;
+        if e.attempts >= MAX_ATTEMPTS {
+            self.remove(loc);
+            return true;
+        }
+        false
+    }
+
+    /// The order to spend on pending locators: round-robin across authors, and
+    /// oldest-first within each author.
+    ///
+    /// Round-robin is what makes the queue starvation-free. A drain in plain
+    /// discovery order would let one member who posted thousands of links block
+    /// everyone else's links behind them for as long as the backlog lasts;
+    /// interleaving by author means a member with two links gets them described
+    /// in the first two rounds no matter how large the spammer's backlog is.
+    fn drain_order(&self) -> Vec<QueuedLocator> {
+        let mut by_author: Vec<(String, Vec<QueuedLocator>)> = Vec::new();
+        let mut pos: HashMap<&str, usize> = HashMap::new();
+        for (loc, e) in &self.entries {
+            let idx = *pos.entry(e.author.as_str()).or_insert_with(|| {
+                by_author.push((e.author.clone(), Vec::new()));
+                by_author.len() - 1
+            });
+            by_author[idx]
+                .1
+                .push((loc.clone(), e.kind, e.author.clone()));
+        }
+        let mut out = Vec::with_capacity(self.entries.len());
+        let mut round = 0;
+        loop {
+            let mut progressed = false;
+            for (_, items) in &by_author {
+                if let Some(item) = items.get(round) {
+                    out.push(item.clone());
+                    progressed = true;
+                }
+            }
+            if !progressed {
+                break;
+            }
+            round += 1;
+        }
+        out
+    }
+
+    /// Persist the queue if it changed. Written atomically via a uniquely-named
+    /// sibling so a crash mid-write cannot truncate the backlog.
+    fn save(&mut self) {
+        if !self.dirty {
+            return;
+        }
+        let body: String = self
+            .entries
+            .iter()
+            .map(|(loc, e)| format!("{}\t{}\t{}\t{}\n", e.attempts, e.kind, e.author, loc))
+            .collect();
+        let tmp = sibling_tmp(&self.path);
+        if fs::write(&tmp, &body).is_ok() && fs::rename(&tmp, &self.path).is_ok() {
+            self.dirty = false;
+        } else {
+            let _ = fs::remove_file(&tmp);
+            eprintln!(
+                "warn: could not persist pending queue {} — discovered links may be re-described",
+                self.path.display()
+            );
+        }
+    }
+}
+
+/// A temp path alongside `path` that cannot collide with another file the user
+/// named. `with_extension("tmp")` is NOT safe here: with `--seen x.tmp` and
+/// `--spend x.txt` it would overwrite the seen file and destroy its history.
+fn sibling_tmp(path: &Path) -> PathBuf {
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "atlas".into());
+    path.with_file_name(format!(".{name}.tmp.{}", std::process::id()))
 }
 
 /// State that must survive across loop iterations of a long-running crawler.
@@ -308,10 +619,14 @@ fn main() -> Result<()> {
         .spend
         .clone()
         .unwrap_or_else(|| key_dir.join("crawler-spend.txt"));
+    let pending_path = cli
+        .pending
+        .clone()
+        .unwrap_or_else(|| key_dir.join("crawler-pending.txt"));
     let mut state = CrawlState::default();
 
     loop {
-        if let Err(e) = run_once(&cli, &seen_path, &spend_path, &mut state) {
+        if let Err(e) = run_once(&cli, &seen_path, &spend_path, &pending_path, &mut state) {
             eprintln!("crawl run error: {e:#}");
         }
         match cli.interval {
@@ -325,7 +640,13 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-fn run_once(cli: &Cli, seen_path: &Path, spend_path: &Path, state: &mut CrawlState) -> Result<()> {
+fn run_once(
+    cli: &Cli,
+    seen_path: &Path,
+    spend_path: &Path,
+    pending_path: &Path,
+    state: &mut CrawlState,
+) -> Result<()> {
     let mut seen = load_seen(seen_path);
     let sources = fs::read_to_string(&cli.sources)
         .with_context(|| format!("reading sources {}", cli.sources.display()))?;
@@ -344,7 +665,20 @@ fn run_once(cli: &Cli, seen_path: &Path, spend_path: &Path, state: &mut CrawlSta
         .unwrap_or_else(|| DEFAULT_LLM_MODEL.to_string());
     let client = reqwest::blocking::Client::builder()
         .timeout(Duration::from_secs(FETCH_TIMEOUT_SECS))
-        .redirect(reqwest::redirect::Policy::limited(3))
+        // Re-run the SSRF check on EVERY hop. `ssrf_check` only sees the URL we
+        // were given; without this a posted link can 302 to
+        // http://169.254.169.254/… and reach a local or metadata service, which
+        // defeats both the https-only rule and the whole IP blocklist in one
+        // redirect.
+        .redirect(reqwest::redirect::Policy::custom(|attempt| {
+            if attempt.previous().len() >= 3 {
+                return attempt.stop();
+            }
+            match ssrf_check(attempt.url().as_str()) {
+                Ok(()) => attempt.follow(),
+                Err(_) => attempt.stop(),
+            }
+        }))
         .user_agent("atlas-crawler/0.1")
         .build()?;
 
@@ -360,28 +694,32 @@ fn run_once(cli: &Cli, seen_path: &Path, spend_path: &Path, state: &mut CrawlSta
             cli.daily_max
         );
     }
-    let mut added = 0usize;
+    // ---- Phase 1: discovery. Free, and never gated on the spend budget. ----
+    //
+    // Capturing a locator costs nothing, and for a source with a bounded history
+    // (a River room) it is the only chance we get: the message carrying a link
+    // can be evicted before we could afford to describe it. So we always record
+    // what exists, then decide separately what we can afford to describe.
+    let mut pending = Pending::load(pending_path);
+    let mut trusted: HashSet<String> = HashSet::new();
+    let mut captured = 0usize;
     for raw in sources.lines() {
         let line = raw.trim();
         if line.is_empty() || line.starts_with('#') {
             continue;
         }
-        // `hub <url>` (or `hub: <url>`): a link repository — index the sites it
-        // links to (ONE level; linked sites are NOT recursively crawled as hubs,
-        // so work is bounded). A plain line is indexed directly.
         if let Some(hub) = line
             .strip_prefix("hub ")
             .or_else(|| line.strip_prefix("hub:"))
         {
             let hub = hub.trim().to_string();
-            // Nothing left to spend: skip WITHOUT stamping the cadence clock, so
-            // hitting the daily cap doesn't also cost this hub its next slot.
+            // A hub page is stable and re-readable, so skipping it costs nothing
+            // permanent. Don't drive the headless browser when there is no
+            // budget to describe what it finds — and skip WITHOUT stamping the
+            // cadence clock, so a capped run doesn't cost the hub its next slot.
             if budget.exhausted() {
                 continue;
             }
-            // Rendering a hub is the crawler's most expensive operation (a
-            // headless browser, tens of seconds), so it keeps its own slow
-            // cadence no matter how often the loop ticks.
             let due = state
                 .last_hub_crawl
                 .get(&hub)
@@ -390,67 +728,90 @@ fn run_once(cli: &Cli, seen_path: &Path, spend_path: &Path, state: &mut CrawlSta
                 continue;
             }
             state.last_hub_crawl.insert(hub.clone(), Instant::now());
-            added += crawl_hub(
-                cli,
-                &client,
-                key.as_deref(),
-                &model,
-                &gw,
-                &hub,
-                &mut seen,
-                seen_path,
-                &mut budget,
-            );
+            captured += crawl_hub(cli, &client, &gw, &hub, &seen, &mut pending);
         } else if let Some(owner_vk) = line
             .strip_prefix("river-room ")
             .or_else(|| line.strip_prefix("river-room:"))
         {
             // `river-room <owner-vk>`: a River chat room, referenced by its
             // stable owner VerifyingKey (NOT its contract key, which River
-            // re-keys on every WASM upgrade). We derive the contract key from
-            // the owner VK, GET the room state from the local node, and index
-            // the URLs posted in its messages. Polled every tick: the GET is
-            // cheap and only genuinely-new links cost tokens. See
-            // `crawl_river_room`.
+            // re-keys on every WASM upgrade). Polled on EVERY tick, budget or
+            // not — see `crawl_river_room` for why that is load-bearing.
             let owner_vk = owner_vk.trim().to_string();
-            added += crawl_river_room(
-                cli,
-                &client,
-                key.as_deref(),
-                &model,
-                &gw,
-                &owner_vk,
-                &mut seen,
-                seen_path,
-                &mut budget,
-            );
+            captured += crawl_river_room(cli, &owner_vk, &seen, &mut pending);
         } else {
-            if seen.contains(line) {
-                continue;
-            }
-            match budget.try_take(line) {
-                Ok(()) => {}
-                // A curated source line held back by a cap is retried next run.
-                Err(Denied::HostShare) => continue,
-                Err(Denied::Exhausted) => break,
-            }
-            // Mark seen BEFORE describe/add so a failure can't re-describe
-            // (and re-bill) the same locator on every future run: at most one LLM
-            // call per locator, ever. (To retry one, remove it from the seen file.)
-            seen.insert(line.to_string());
-            append_seen(seen_path, line);
-            match index_locator(cli, &client, key.as_deref(), &model, &gw, line, "external") {
-                Ok(true) => added += 1,
-                Ok(false) => {}
-                Err(e) => eprintln!("skip {line}: {e:#}"),
+            // A curated locator from the operator's own file.
+            trusted.insert(line.to_string());
+            if !seen.contains(line) && pending.add(line, "external", CURATED_AUTHOR) {
+                captured += 1;
             }
         }
     }
+
+    // ---- Phase 2: description. Billed, rationed, and fair. ----
+    let mut added = 0usize;
+    let mut author_used: HashMap<String, usize> = HashMap::new();
+    for (loc, kind, author) in pending.drain_order() {
+        if seen.contains(&loc) {
+            pending.remove(&loc);
+            continue;
+        }
+        let used = author_used.entry(author.clone()).or_insert(0);
+        if *used >= cli.per_author_max {
+            continue;
+        }
+        match budget.try_take(&loc) {
+            Ok(()) => {}
+            Err(Denied::HostShare) => continue,
+            Err(Denied::Exhausted) => break,
+        }
+        *used += 1;
+        let is_trusted = trusted.contains(&loc);
+        match index_locator(
+            cli,
+            &client,
+            key.as_deref(),
+            &model,
+            &gw,
+            &loc,
+            kind,
+            is_trusted,
+        ) {
+            // Indexed, or deliberately refused by the content-safety gate.
+            // Both are final: mark seen and stop tracking it.
+            Ok(indexed) => {
+                if indexed {
+                    added += 1;
+                }
+                seen.insert(loc.clone());
+                append_seen(seen_path, &loc);
+                pending.remove(&loc);
+            }
+            // Transient: a fetch timeout, a 5xx, an LLM hiccup, a failed
+            // `atlasctl add` because the node was restarting. Keep it queued and
+            // try again on a later run rather than discarding a good link (and
+            // the money already spent describing it) over a blip.
+            Err(e) => {
+                eprintln!("  skip {loc}: {e:#}");
+                if pending.record_failure(&loc) {
+                    eprintln!("  giving up on {loc} after {MAX_ATTEMPTS} attempts");
+                    seen.insert(loc.clone());
+                    append_seen(seen_path, &loc);
+                }
+            }
+        }
+    }
+    pending.save();
+
     let attempts = budget.attempts;
     let spent_now = spent_before + attempts;
     eprintln!(
-        "run complete: {added} added / {attempts} attempted (run cap {}, 24h {}/{})",
-        cli.max, spent_now, cli.daily_max
+        "run complete: {added} added / {attempts} attempted / {captured} captured \
+         ({} queued, run cap {}, 24h {}/{})",
+        pending.len(),
+        cli.max,
+        spent_now,
+        cli.daily_max
     );
     Ok(())
 }
@@ -466,6 +827,7 @@ struct Page {
 /// describe it (LLM or fallback), and add it to the index with the given kind.
 /// Returns Ok(true) if the locator was indexed, Ok(false) if it was deliberately
 /// not indexed (content-safety rating other than "ok").
+#[allow(clippy::too_many_arguments)]
 fn index_locator(
     cli: &Cli,
     client: &reqwest::blocking::Client,
@@ -474,14 +836,22 @@ fn index_locator(
     gw: &str,
     loc: &str,
     kind: &str,
+    trusted: bool,
 ) -> Result<bool> {
     let page = get_page(cli, client, gw, loc)?;
-    index_page(cli, client, key, model, loc, kind, &page)
+    index_page(cli, client, key, model, loc, kind, trusted, &page)
 }
 
 /// Describe an already-fetched page and add it to the index, applying the
 /// content-safety gate. Split out from `index_locator` so a hub crawl can index
 /// the hub itself from the page it already rendered (no second fetch).
+///
+/// `trusted` marks a locator that came from the operator's own sources file.
+/// Only a trusted locator may be indexed on the title/meta fallback, which
+/// cannot classify content. Everything discovered from a public source (a room
+/// message, a hub link) MUST carry a real LLM rating, so a failed LLM call is
+/// reported as an error for later retry rather than quietly indexed unrated.
+#[allow(clippy::too_many_arguments)]
 fn index_page(
     cli: &Cli,
     client: &reqwest::blocking::Client,
@@ -489,18 +859,35 @@ fn index_page(
     model: &str,
     loc: &str,
     kind: &str,
+    trusted: bool,
     page: &Page,
 ) -> Result<bool> {
     let desc = match key {
-        Some(k) => describe_llm(client, k, model, loc, &page.text).unwrap_or_else(|e| {
-            eprintln!("  llm failed ({e:#}), falling back to title/meta");
-            describe_fallback(loc, &page.html)
-        }),
-        None => describe_fallback(loc, &page.html),
+        // An LLM failure on untrusted content must NOT fall back to the
+        // unrated title/meta description: the fallback hardcodes an "ok"
+        // rating, so doing that turns any OpenAI hiccup (a 429 an attacker can
+        // induce by flooding links, a content-policy 400 on exactly the
+        // material the gate exists to catch) into an open door to the index.
+        Some(k) => match describe_llm(client, k, model, loc, &page.text) {
+            Ok(d) => d,
+            Err(e) if trusted => {
+                eprintln!("  llm failed ({e:#}), falling back to title/meta");
+                describe_fallback(loc, &page.html)
+            }
+            Err(e) => {
+                return Err(e).context("llm description failed; not indexing unrated content")
+            }
+        },
+        // No classifier configured at all. Curated sources are the operator's
+        // own choice; untrusted discoveries are not indexed at all rather than
+        // published unrated.
+        None if trusted => describe_fallback(loc, &page.html),
+        None => {
+            eprintln!("  no OPENAI_API_KEY — not indexing unrated untrusted content: {loc}");
+            return Ok(false);
+        }
     };
-    // Content-safety gate: never present nsfw/illegal material on Atlas. The
-    // locator stays marked-seen (caller did that before describe), so it is not
-    // re-fetched or re-billed on later runs.
+    // Content-safety gate: never present nsfw/illegal material on Atlas.
     match desc.rating.as_str() {
         "ok" => {}
         "illegal" => {
@@ -555,11 +942,34 @@ fn get_page(cli: &Cli, client: &reqwest::blocking::Client, gw: &str, loc: &str) 
 /// Drive the headless render helper for one URL, returning the rendered app
 /// frame's HTML and visible text. The page content is untrusted data.
 fn render_page(node_bin: &str, renderer: &Path, url: &str) -> Result<Page> {
-    let out = Command::new(node_bin)
+    // Bound the child's output. The renderer serializes the page's full DOM,
+    // and a hostile contract can inflate that without limit, so reading it
+    // unbounded would let one link OOM the crawler. MAX_FETCH_BYTES guards only
+    // the static path.
+    let mut child = Command::new(node_bin)
         .arg(renderer)
         .arg(url)
-        .output()
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
         .with_context(|| format!("running renderer {}", renderer.display()))?;
+    let mut buf = Vec::new();
+    if let Some(so) = child.stdout.take() {
+        // +1 so an output that exactly fills the cap is still detectable as
+        // over-long rather than silently truncated into invalid JSON.
+        so.take(RENDER_MAX_BYTES as u64 + 1).read_to_end(&mut buf)?;
+    }
+    let status = child.wait()?;
+    if buf.len() > RENDER_MAX_BYTES {
+        let _ = child.kill();
+        bail!("renderer output exceeded {RENDER_MAX_BYTES} bytes");
+    }
+    let out = std::process::Output {
+        status,
+        stdout: buf,
+        stderr: Vec::new(),
+    };
     if !out.status.success() {
         bail!(
             "renderer exited {}: {}",
@@ -589,25 +999,21 @@ fn render_page(node_bin: &str, renderer: &Path, url: &str) -> Result<Page> {
     Ok(Page { html, text })
 }
 
-/// Crawl a hub (link-repository) page: fetch it, extract outbound site links, and
-/// index each new one (LLM-described). Returns the number added.
-#[allow(clippy::too_many_arguments)]
+/// Poll a hub (link-repository) page and CAPTURE its outbound site links into
+/// the pending queue. Discovery only, like [`crawl_river_room`] — nothing is
+/// described or billed here.
+///
+/// Unlike a room, a hub page is stable and re-readable, so there is no urgency
+/// to capture it when we have no budget to act on it; the caller skips the
+/// (expensive) render in that case.
 fn crawl_hub(
     cli: &Cli,
     client: &reqwest::blocking::Client,
-    key: Option<&str>,
-    model: &str,
     gw: &str,
     hub: &str,
-    seen: &mut HashSet<String>,
-    seen_path: &Path,
-    budget: &mut Budget,
+    seen: &HashSet<String>,
+    pending: &mut Pending,
 ) -> usize {
-    // Rendering the hub is expensive and only pays off if we can still index
-    // something, so don't drive the browser once spending is done for this run.
-    if budget.exhausted() {
-        return 0;
-    }
     let page = match get_page(cli, client, gw, hub) {
         Ok(p) => p,
         Err(e) => {
@@ -615,54 +1021,28 @@ fn crawl_hub(
             return 0;
         }
     };
-    let mut added = 0;
-
-    // A hub (link repository) is itself a resource worth listing, so index it
-    // too — not just the sites it links to. Reuse the page already rendered for
-    // link extraction (no second fetch). Marked-seen so it's indexed once.
-    if !seen.contains(hub) && budget.try_take(hub).is_ok() {
-        seen.insert(hub.to_string());
-        append_seen(seen_path, hub);
-        match index_page(cli, client, key, model, hub, "site", &page) {
-            Ok(true) => added += 1,
-            Ok(false) => {}
-            Err(e) => eprintln!("hub {hub}: self-index failed: {e:#}"),
-        }
+    let mut captured = 0;
+    // A hub is itself a resource worth listing, so capture it too.
+    if !seen.contains(hub) && pending.add(hub, "site", HUB_AUTHOR) {
+        captured += 1;
     }
-
     let links = extract_locators(&page.html);
-    eprintln!("hub {hub}: {} candidate link(s)", links.len());
     let hub_id = freenet_id(hub);
     for (loc, kind) in links {
-        // Skip the hub itself, anything already seen, and links back into the
-        // hub's own contract (in-app navigation, assets) — only outbound sites.
-        if loc == hub || seen.contains(&loc) {
+        // Skip the hub itself and links back into the hub's own contract
+        // (in-app navigation, assets) — only outbound sites.
+        if loc == hub || seen.contains(&loc) || pending.contains(&loc) {
             continue;
         }
         if hub_id.is_some() && freenet_id(&loc) == hub_id {
             continue;
         }
-        match budget.try_take(&loc) {
-            Ok(()) => {}
-            // Over this host's share for the run: leave it unseen so a later run
-            // reconsiders it.
-            Err(Denied::HostShare) => continue,
-            Err(Denied::Exhausted) => {
-                eprintln!("hub {hub}: out of budget, stopping");
-                break;
-            }
-        }
-        // Mark seen before describe/add (same cost guard as direct sources):
-        // each linked locator is described at most once, ever.
-        seen.insert(loc.clone());
-        append_seen(seen_path, &loc);
-        match index_locator(cli, client, key, model, gw, &loc, kind) {
-            Ok(true) => added += 1,
-            Ok(false) => {}
-            Err(e) => eprintln!("  skip {loc}: {e:#}"),
+        if pending.add(&loc, kind, HUB_AUTHOR) {
+            captured += 1;
         }
     }
-    added
+    eprintln!("hub {hub}: {captured} newly captured");
+    captured
 }
 
 /// BLAKE3 code hash of the CURRENT River room-contract WASM generation.
@@ -761,10 +1141,18 @@ async fn fetch_room_state(
             Ok(Ok(r)) => r,
             _ => continue,
         };
-        let HostResponse::ContractResponse(ContractResponse::GetResponse { state, .. }) = resp
+        let HostResponse::ContractResponse(ContractResponse::GetResponse { key, state, .. }) = resp
         else {
             continue;
         };
+        // Responses are correlated to requests only by arrival order on this
+        // one socket, so a late reply (the 30s timeout above fires, then the
+        // response lands) would otherwise be read as the NEXT candidate's
+        // answer — silently inverting the current-before-legacy preference, or
+        // reporting "no live room" for a room that exists.
+        if key.id() != id {
+            continue;
+        }
         let mut room_state = match ciborium::de::from_reader::<ChatRoomStateV1, _>(&state[..]) {
             Ok(s) => s,
             Err(_) => continue,
@@ -781,25 +1169,22 @@ async fn fetch_room_state(
     Ok(None)
 }
 
-/// Crawl a River room: derive its contract key from the owner VK, GET the room
-/// state from the local node, extract the `https://` / `freenet:` URLs posted in
-/// its messages, and index each new one through the same seen-set + LLM-describe
-/// path as hub links. Returns `(attempts, added)`.
-#[allow(clippy::too_many_arguments)]
+/// Poll a River room and CAPTURE the `https://` / `freenet:` URLs posted in its
+/// messages into the pending queue. Discovery only — nothing is fetched,
+/// described, or billed here; that happens later when the pending queue is
+/// drained under the spend caps.
+///
+/// This runs on every tick regardless of remaining budget, and that is the
+/// point. A room keeps only its most recent messages (100 by default) and
+/// evicts oldest-first, so a link we decline to *look at* today may simply not
+/// exist tomorrow. Capturing is free (one contract GET), so there is no reason
+/// to skip it, and skipping it is how links get lost.
 fn crawl_river_room(
     cli: &Cli,
-    client: &reqwest::blocking::Client,
-    key: Option<&str>,
-    model: &str,
-    gw: &str,
     owner_vk_b58: &str,
-    seen: &mut HashSet<String>,
-    seen_path: &Path,
-    budget: &mut Budget,
+    seen: &HashSet<String>,
+    pending: &mut Pending,
 ) -> usize {
-    if budget.exhausted() {
-        return 0;
-    }
     let owner_vk = match parse_owner_vk(owner_vk_b58) {
         Ok(vk) => vk,
         Err(e) => {
@@ -835,52 +1220,21 @@ fn crawl_river_room(
         }
     };
 
-    let links = extract_message_urls(&state);
-    // Only links we have never described cost anything; a poll that finds
-    // nothing new is free, which is what makes frequent polling affordable.
-    let fresh = links
-        .iter()
-        .filter(|(loc, _, _)| !seen.contains(loc))
-        .count();
-    eprintln!(
-        "river-room {owner_vk_b58}: {} candidate link(s), {fresh} new",
-        links.len()
-    );
-
-    let mut added = 0;
-    // Per-author share for this crawl: one member posting a wall of links can
-    // use at most `--per-author-max` of the run's budget, so a spammer cannot
-    // crowd out everyone else's links (or the daily cap).
-    let mut author_used: HashMap<String, usize> = HashMap::new();
-    for (loc, kind, author) in links {
-        if seen.contains(&loc) {
+    let links = extract_message_urls(&state, &owner_vk);
+    let mut captured = 0;
+    for (loc, kind, author) in &links {
+        if seen.contains(loc) || pending.contains(loc) {
             continue;
         }
-        let used = author_used.entry(author.clone()).or_insert(0);
-        if *used >= cli.per_author_max {
-            // Deferred, not dropped: left unseen so later runs reconsider it.
-            continue;
-        }
-        match budget.try_take(&loc) {
-            Ok(()) => {}
-            Err(Denied::HostShare) => continue,
-            Err(Denied::Exhausted) => {
-                eprintln!("river-room {owner_vk_b58}: out of budget, stopping");
-                break;
-            }
-        }
-        *used += 1;
-        // Mark seen before describe/add (same cost guard as hub links):
-        // each locator is described at most once, ever.
-        seen.insert(loc.clone());
-        append_seen(seen_path, &loc);
-        match index_locator(cli, client, key, model, gw, &loc, kind) {
-            Ok(true) => added += 1,
-            Ok(false) => {}
-            Err(e) => eprintln!("  skip {loc}: {e:#}"),
+        if pending.add(loc, kind, author) {
+            captured += 1;
         }
     }
-    added
+    eprintln!(
+        "river-room {owner_vk_b58}: {} candidate link(s), {captured} newly captured",
+        links.len()
+    );
+    captured
 }
 
 /// Extract outbound locators from a room's messages: the `https://` and
@@ -894,11 +1248,32 @@ fn crawl_river_room(
 /// canonical order (oldest first, by `(time, id)`), so on a duplicate URL the
 /// EARLIEST poster is the one charged — re-posting someone else's link cannot
 /// be used to burn a third party's share.
-fn extract_message_urls(state: &ChatRoomStateV1) -> Vec<(String, &'static str, String)> {
+fn extract_message_urls(
+    state: &ChatRoomStateV1,
+    owner_vk: &VerifyingKey,
+) -> Vec<(String, &'static str, String)> {
     let messages = &state.recent_messages;
+    let members = state.members.members_by_member_id();
+    let owner_id = river_core::room_state::member::MemberId::from(owner_vk);
     let mut out: Vec<(String, &'static str, String)> = Vec::new();
     let mut seen = HashSet::new();
     for msg in messages.display_messages() {
+        // Authenticate every message against its author's key. We already
+        // decline to trust the served state for the room configuration; the
+        // message log deserves the same treatment, and doubly so because
+        // `author` is the key for the per-author spend share — an unverified
+        // author field is a rate limit anyone can attribute to anyone.
+        let author_vk = if msg.message.author == owner_id {
+            Some(*owner_vk)
+        } else {
+            members.get(&msg.message.author).map(|m| m.member.member_vk)
+        };
+        let Some(author_vk) = author_vk else {
+            continue;
+        };
+        if msg.validate(&author_vk).is_err() {
+            continue;
+        }
         let Some(text) = messages.effective_text(msg) else {
             continue;
         };
@@ -969,7 +1344,16 @@ fn extract_locators(html: &str) -> Vec<(String, &'static str)> {
     out
 }
 
+/// Longest locator we will consider. Bounds both the index entry and, more
+/// importantly, what gets interpolated into the LLM prompt: hub `href` values
+/// are limited only by the 512 KB page cap, so a single giant href could
+/// otherwise blow up one request into tens of thousands of tokens.
+const MAX_LOCATOR_LEN: usize = 512;
+
 fn normalize_href(href: &str) -> Option<(String, &'static str)> {
+    if href.len() > MAX_LOCATOR_LEN {
+        return None;
+    }
     let is_b58 = |c: char| matches!(c, '1'..='9' | 'A'..='H' | 'J'..='N' | 'P'..='Z' | 'a'..='k' | 'm'..='z');
     // Gateway web URL (absolute or relative path) -> freenet:<id><path>
     if let Some(pos) = href.find("/v1/contract/web/") {
@@ -1064,18 +1448,45 @@ fn ssrf_check(url: &str) -> Result<()> {
     {
         bail!("local host blocked");
     }
-    if let Ok(ip) = host.parse::<IpAddr>() {
-        let blocked = match ip {
-            IpAddr::V4(v4) => {
-                v4.is_private() || v4.is_loopback() || v4.is_link_local() || v4.is_unspecified()
-            }
-            IpAddr::V6(v6) => v6.is_loopback() || v6.is_unspecified(),
-        };
-        if blocked {
-            bail!("private/loopback ip blocked");
-        }
+    // Match on the PARSED host, not the serialized string. `host_str()` renders
+    // an IPv6 literal with its brackets ("[::1]"), which `IpAddr::from_str`
+    // rejects — so re-parsing the string silently skipped every IPv6 check and
+    // let `https://[::1]/` straight through.
+    let blocked = match parsed.host() {
+        Some(url::Host::Ipv4(v4)) => blocked_v4(v4),
+        Some(url::Host::Ipv6(v6)) => blocked_v6(v6),
+        _ => false,
+    };
+    if blocked {
+        bail!("private/loopback ip blocked");
     }
     Ok(())
+}
+
+fn blocked_v4(v4: std::net::Ipv4Addr) -> bool {
+    v4.is_private()
+        || v4.is_loopback()
+        || v4.is_link_local()
+        || v4.is_unspecified()
+        || v4.is_broadcast()
+        || v4.is_documentation()
+        // 100.64.0.0/10 carrier-grade NAT
+        || (v4.octets()[0] == 100 && (64..128).contains(&v4.octets()[1]))
+}
+
+fn blocked_v6(v6: std::net::Ipv6Addr) -> bool {
+    // An IPv4-mapped address (::ffff:127.0.0.1) reaches an IPv4 target, so it
+    // has to be judged by the IPv4 rules rather than the v6 ones.
+    if let Some(v4) = v6.to_ipv4_mapped() {
+        return blocked_v4(v4);
+    }
+    let seg = v6.segments();
+    v6.is_loopback()
+        || v6.is_unspecified()
+        // fe80::/10 link-local (includes the v6 metadata path)
+        || (seg[0] & 0xffc0) == 0xfe80
+        // fc00::/7 unique-local
+        || (seg[0] & 0xfe00) == 0xfc00
 }
 
 fn fetch(client: &reqwest::blocking::Client, url: &str) -> Result<String> {
@@ -1203,14 +1614,32 @@ fn add_entry(cli: &Cli, loc: &str, kind: &str, d: &Described) -> Result<()> {
     if let Some(kd) = &cli.key_dir {
         cmd.args(["--key-dir", &kd.to_string_lossy()]);
     }
-    cmd.args(["add", "--kind", kind, "--title", &d.title]);
+    // `--flag=value` form, NOT `["--flag", value]`. These values derive from
+    // page content, so a prompt injection can produce a title beginning with
+    // "-". clap will not accept a hyphen-leading token as an option's value, so
+    // the two-token form makes `atlasctl add` fail on such a title — and the
+    // locator would then be dropped. The single-token form is unambiguous.
+    cmd.arg("add");
+    cmd.arg(format!("--kind={kind}"));
+    cmd.arg(format!("--title={}", d.title));
     if !d.snippet.is_empty() {
-        cmd.args(["--snippet", &d.snippet]);
+        cmd.arg(format!("--snippet={}", d.snippet));
     }
     if !d.tags.is_empty() {
-        cmd.args(["--tags", &d.tags.join(",")]);
+        // Tags are re-split on ',' by atlasctl, so a comma inside one tag would
+        // inflate the tag count past the contract's limit and get the whole
+        // entry rejected. Strip separators rather than rely on the far end.
+        let tags: Vec<String> = d
+            .tags
+            .iter()
+            .map(|t| t.replace(',', " ").trim().to_string())
+            .filter(|t| !t.is_empty())
+            .collect();
+        if !tags.is_empty() {
+            cmd.arg(format!("--tags={}", tags.join(",")));
+        }
     }
-    cmd.args(["--locator", loc]);
+    cmd.arg(format!("--locator={loc}"));
     let out = cmd.output().with_context(|| "running atlasctl")?;
     if !out.status.success() {
         bail!(
@@ -1258,7 +1687,13 @@ fn append_line(path: &Path, line: &str) -> Result<()> {
 // --- tiny HTML helpers (no full parser; best-effort for fallback descriptions) ---
 
 fn extract_tag(html: &str, open: &str, close: &str) -> Option<String> {
-    let lower = html.to_lowercase();
+    // MUST be to_ascii_lowercase: `to_lowercase` is Unicode-aware and NOT
+    // length-preserving (U+0130 'İ' is 2 bytes and lowercases to 3), so offsets
+    // found in the lowercased copy would not line up with `html` and slicing it
+    // would return the wrong bytes or panic on a char boundary. HTML tag and
+    // attribute names are ASCII, so nothing is lost. Same for the two helpers
+    // below.
+    let lower = html.to_ascii_lowercase();
     let start = lower.find(open)? + open.len();
     let end = lower[start..].find(close)? + start;
     let val = html[start..end].trim();
@@ -1271,8 +1706,8 @@ fn extract_tag(html: &str, open: &str, close: &str) -> Option<String> {
 
 fn extract_meta(html: &str, name: &str) -> Option<String> {
     // crude: find a <meta ... name/property="name" ... content="...">
-    let lower = html.to_lowercase();
-    let needle = format!("\"{}\"", name.to_lowercase());
+    let lower = html.to_ascii_lowercase();
+    let needle = format!("\"{}\"", name.to_ascii_lowercase());
     let mut idx = 0;
     while let Some(pos) = lower[idx..].find(&needle) {
         let abs = idx + pos;
@@ -1294,7 +1729,7 @@ fn extract_meta(html: &str, name: &str) -> Option<String> {
 }
 
 fn extract_attr(tag: &str, attr: &str) -> Option<String> {
-    let lower = tag.to_lowercase();
+    let lower = tag.to_ascii_lowercase();
     let key = format!("{attr}=\"");
     let start = lower.find(&key)? + key.len();
     let end = tag[start..].find('"')? + start;
@@ -1338,12 +1773,20 @@ fn visible_text(html: &str) -> String {
     decode_entities(&out.split_whitespace().collect::<Vec<_>>().join(" "))
 }
 
+/// Truncate to at most `max` BYTES, cutting on a char boundary.
+///
+/// The bound must be in bytes because that is what the index contract enforces;
+/// counting chars instead would let 200 emoji (800 bytes) sail past a 200-byte
+/// limit and get the whole entry rejected on submission.
 fn trim_len(s: &str, max: usize) -> String {
     if s.len() <= max {
-        s.to_string()
-    } else {
-        s.chars().take(max).collect()
+        return s.to_string();
     }
+    let mut end = max;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    s[..end].to_string()
 }
 
 #[cfg(test)]
@@ -1664,5 +2107,234 @@ mod tests {
         let f = TmpFile::new("missing");
         let ledger = SpendLedger::load(f.path());
         assert_eq!(ledger.spent(), 0);
+        assert!(!ledger.broken);
+    }
+
+    /// An unreadable ledger must NOT be silently reset to zero and rewritten:
+    /// that would erase the record of a saturated window and re-authorise a
+    /// full `--daily-max`.
+    #[test]
+    fn unreadable_ledger_fails_closed_and_is_not_erased() {
+        let f = TmpFile::new("corrupt");
+        // Invalid UTF-8 makes read_to_string fail.
+        fs::write(f.path(), [0xff, 0xfe, 0x32, 0x30, 0x30]).unwrap();
+        let mut ledger = SpendLedger::load(f.path());
+        assert!(ledger.broken, "unreadable ledger must be marked broken");
+        // The file must still be there, not truncated to empty.
+        assert!(
+            !fs::read(f.path()).unwrap().is_empty(),
+            "ledger file must not be erased when it cannot be read"
+        );
+        // And no spending is authorised while it is broken.
+        let mut b = Budget::new(&mut ledger, 20, 200, 3);
+        assert!(matches!(
+            b.try_take("https://example.com/"),
+            Err(Denied::Exhausted)
+        ));
+    }
+
+    /// A ledger write failure must stop spending for the rest of the run.
+    /// Otherwise an unwritable ledger authorises `--max` attempts every run
+    /// forever, since each run recomputes headroom from an empty file.
+    #[test]
+    fn ledger_write_failure_halts_spending() {
+        // A path inside a non-existent, non-creatable directory: appends fail.
+        let bad = PathBuf::from("/proc/atlas-crawler-nonexistent/spend.txt");
+        let mut ledger = SpendLedger::load(&bad);
+        let mut b = Budget::new(&mut ledger, 20, 200, 99);
+        // First take goes through but its append fails, tripping `broken`.
+        let _ = b.try_take("https://a.example/");
+        assert!(b.ledger.broken, "failed append must mark the ledger broken");
+        assert!(matches!(
+            b.try_take("https://b.example/"),
+            Err(Denied::Exhausted)
+        ));
+    }
+
+    #[test]
+    fn subdomains_share_one_rate_limit_bucket() {
+        // A wildcard DNS record must not mint unlimited buckets.
+        assert_eq!(
+            host_bucket("https://a1.evil.example/"),
+            host_bucket("https://a2.evil.example/")
+        );
+        assert_eq!(
+            host_bucket("https://deep.nested.evil.example/x"),
+            host_bucket("https://evil.example/y")
+        );
+        // Trailing dot is the same host.
+        assert_eq!(
+            host_bucket("https://evil.example./"),
+            host_bucket("https://evil.example/")
+        );
+        // Genuinely different sites stay separate.
+        assert_ne!(
+            host_bucket("https://a.example/"),
+            host_bucket("https://b.example/")
+        );
+    }
+
+    #[test]
+    fn unparseable_locators_share_one_bucket() {
+        // Junk that survives tokenizing but fails URL parsing must not each get
+        // its own bucket, or the budget can be drained with strings alone.
+        let a = host_bucket("https://x^1");
+        let b = host_bucket("https://x^2");
+        assert_eq!(a, b, "unparseable locators must share a bucket");
+        assert_eq!(a, "@unparsed");
+    }
+
+    /// Regression: `to_lowercase` is not length-preserving, so byte offsets
+    /// taken from a lowercased copy and applied to the original panic on a char
+    /// boundary. Any room member could crash the daemon with such a page.
+    #[test]
+    fn html_helpers_survive_length_changing_unicode() {
+        // 'İ' (U+0130) is 2 bytes and lowercases to 3.
+        let html = "İ<title>日本</title>";
+        assert_eq!(
+            extract_tag(html, "<title>", "</title>").as_deref(),
+            Some("日本")
+        );
+        let meta = "İİİ<meta name=\"description\" content=\"café\">";
+        assert_eq!(extract_meta(meta, "description").as_deref(), Some("café"));
+        // 'K' (U+212A KELVIN) is 3 bytes and lowercases to 1 — shrinks instead.
+        let kelvin = "KKKK<title>ok</title>";
+        assert_eq!(
+            extract_tag(kelvin, "<title>", "</title>").as_deref(),
+            Some("ok")
+        );
+    }
+
+    #[test]
+    fn ssrf_blocks_ipv6_literals_and_mapped_addresses() {
+        // These all previously passed: host_str() renders IPv6 with brackets,
+        // which IpAddr::from_str rejects, so the whole v6 branch was dead.
+        for url in [
+            "https://[::1]/",
+            "https://[::]/",
+            "https://[fe80::1]/",
+            "https://[fd00::1]/",
+            "https://[::ffff:127.0.0.1]/",
+            "https://[::ffff:169.254.169.254]/",
+        ] {
+            assert!(ssrf_check(url).is_err(), "should be blocked: {url}");
+        }
+        // v4 forms still blocked, including alternate encodings the url crate
+        // normalizes, and public addresses still allowed.
+        for url in [
+            "https://127.0.0.1/",
+            "https://169.254.169.254/",
+            "https://10.0.0.1/",
+            "https://2130706433/",
+        ] {
+            assert!(ssrf_check(url).is_err(), "should be blocked: {url}");
+        }
+        assert!(ssrf_check("https://example.com/").is_ok());
+        assert!(ssrf_check("http://example.com/").is_err(), "https only");
+    }
+
+    #[test]
+    fn overlong_locators_are_rejected() {
+        let long = format!("https://example.com/{}", "a".repeat(MAX_LOCATOR_LEN));
+        assert!(normalize_href(&long).is_none());
+        assert!(normalize_href("https://example.com/ok").is_some());
+    }
+
+    #[test]
+    fn trim_len_bounds_bytes_on_a_char_boundary() {
+        // 200 emoji = 800 bytes; a char-based cap would let it through and the
+        // index contract would reject the entry.
+        let emoji = "😀".repeat(200);
+        let out = trim_len(&emoji, 200);
+        assert!(out.len() <= 200, "got {} bytes", out.len());
+        assert!(!out.is_empty());
+        // Unchanged when already short enough.
+        assert_eq!(trim_len("hello", 200), "hello");
+    }
+
+    // --- pending queue ---
+
+    #[test]
+    fn pending_round_robin_does_not_let_a_spammer_block_others() {
+        let f = TmpFile::new("pending-rr");
+        let mut p = Pending::load(f.path());
+        // A spammer posts 100 links BEFORE anyone else posts theirs.
+        for i in 0..100 {
+            p.add(&format!("https://spam.example/{i}"), "external", "SPAMMER");
+        }
+        p.add("https://good.example/a", "external", "ALICE");
+        p.add("https://good.example/b", "external", "BOB");
+
+        let order = p.drain_order();
+        // Alice's and Bob's links must come up in the first few slots, not
+        // after 100 spam entries.
+        let alice = order
+            .iter()
+            .position(|(l, _, _)| l.ends_with("/a"))
+            .unwrap();
+        let bob = order
+            .iter()
+            .position(|(l, _, _)| l.ends_with("/b"))
+            .unwrap();
+        assert!(alice < 5, "alice starved at position {alice}");
+        assert!(bob < 5, "bob starved at position {bob}");
+    }
+
+    #[test]
+    fn pending_survives_a_restart() {
+        let f = TmpFile::new("pending-persist");
+        {
+            let mut p = Pending::load(f.path());
+            p.add("https://a.example/1", "external", "ALICE");
+            p.add(&format!("freenet:{ID}/x"), "site", "BOB");
+            p.save();
+        }
+        let p = Pending::load(f.path());
+        assert_eq!(p.len(), 2);
+        assert!(p.contains("https://a.example/1"));
+        let entry = p
+            .drain_order()
+            .into_iter()
+            .find(|(l, _, _)| l.starts_with("freenet:"))
+            .unwrap();
+        assert_eq!(entry.1, "site", "kind must round-trip");
+        assert_eq!(entry.2, "BOB", "author must round-trip");
+    }
+
+    #[test]
+    fn pending_gives_up_after_max_attempts() {
+        let f = TmpFile::new("pending-attempts");
+        let mut p = Pending::load(f.path());
+        p.add("https://flaky.example/1", "external", "ALICE");
+        for _ in 0..MAX_ATTEMPTS - 1 {
+            assert!(!p.record_failure("https://flaky.example/1"));
+        }
+        assert!(
+            p.record_failure("https://flaky.example/1"),
+            "must give up on the final attempt"
+        );
+        assert!(!p.contains("https://flaky.example/1"));
+    }
+
+    #[test]
+    fn pending_bounds_one_authors_backlog() {
+        let f = TmpFile::new("pending-bound");
+        let mut p = Pending::load(f.path());
+        for i in 0..MAX_PENDING_PER_AUTHOR + 50 {
+            p.add(&format!("https://s.example/{i}"), "external", "SPAMMER");
+        }
+        assert_eq!(p.len(), MAX_PENDING_PER_AUTHOR);
+        // A different author is unaffected by the spammer hitting their bound.
+        assert!(p.add("https://good.example/", "external", "ALICE"));
+    }
+
+    #[test]
+    fn sibling_tmp_cannot_alias_another_configured_file() {
+        // The old `with_extension("tmp")` turned `--spend s.txt` into `s.tmp`,
+        // which could be the operator's `--seen` file.
+        let spend = Path::new("/tmp/atlas/s.txt");
+        let tmp = sibling_tmp(spend);
+        assert_ne!(tmp, PathBuf::from("/tmp/atlas/s.tmp"));
+        assert_eq!(tmp.parent(), spend.parent());
     }
 }
