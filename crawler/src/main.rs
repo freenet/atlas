@@ -455,6 +455,7 @@ impl Pending {
         };
         let mut dropped = 0usize;
         let mut rewritten = 0usize;
+        let mut merged = 0usize;
         for line in body.lines() {
             if let Some(n) = line.strip_prefix("#cursor\t") {
                 p.cursor = n.trim().parse().unwrap_or(0);
@@ -494,7 +495,13 @@ impl Pending {
             if canon != loc {
                 rewritten += 1;
             }
-            p.insert_raw(canon, kind, author.to_string(), attempts);
+            // A rewrite can make two file lines collide on one locator. That
+            // silently discards the second entry — including its author's queue
+            // slot and its retry count — so it is counted and reported like any
+            // other loss rather than absorbed by the dedup.
+            if !p.insert_raw(canon, kind, author.to_string(), attempts) {
+                merged += 1;
+            }
         }
         // The bounds are enforced on load as well as on insert. Otherwise an
         // oversized file (a hand-edit, or a later lowering of the constants)
@@ -514,16 +521,28 @@ impl Pending {
         if over > 0 {
             eprintln!("warn: pending file held {over} entr(ies) over the {MAX_PENDING_TOTAL} limit — trimmed on load");
         }
+        if merged > 0 {
+            eprintln!(
+                "warn: {merged} queued locator(s) collided after normalization and were merged"
+            );
+        }
         p.refused_author = 0;
         p.refused_total = 0;
         p.evicted = 0;
-        p.dirty = dropped > 0 || over > 0 || rewritten > 0;
+        p.dirty = dropped > 0 || over > 0 || rewritten > 0 || merged > 0;
         p
     }
 
-    fn insert_raw(&mut self, loc: String, kind: &'static str, author: String, attempts: u32) {
+    /// Returns false if an entry with this locator was already present.
+    fn insert_raw(
+        &mut self,
+        loc: String,
+        kind: &'static str,
+        author: String,
+        attempts: u32,
+    ) -> bool {
         if !self.index.insert(loc.clone()) {
-            return;
+            return false;
         }
         *self.per_author.entry(author.clone()).or_insert(0) += 1;
         self.entries.push((
@@ -534,6 +553,7 @@ impl Pending {
                 attempts,
             },
         ));
+        true
     }
 
     fn contains(&self, loc: &str) -> bool {
@@ -1301,11 +1321,16 @@ fn crawl_hub(
         }
     };
     let mut captured = 0;
-    // A hub is itself a resource worth listing, so capture it too — normalized,
-    // so it round-trips like everything else in the queue.
-    let hub_loc = normalize_href(hub).map(|(l, _)| l);
-    let hub_loc = hub_loc.as_deref().unwrap_or(hub);
-    if !seen.contains(hub_loc) && pending.add(hub_loc, "site", HUB_AUTHOR) {
+    // Normalized ONCE, at the top, and used for all three of: the queued
+    // locator, the self-comparison, and the contract-id filter below. Using the
+    // raw operator line for the latter two meant a hub written in gateway form
+    // (`http://gw/v1/contract/web/<id>/`) yielded `freenet_id(hub) == None`, so
+    // the same-contract filter was disabled and every one of the hub's own
+    // in-app links was captured as if it were an outbound site.
+    let hub_canon = normalize_href(hub).map(|(l, _)| l);
+    let hub = hub_canon.as_deref().unwrap_or(hub);
+    // A hub is itself a resource worth listing, so capture it too.
+    if !seen.contains(hub) && pending.add(hub, "site", HUB_AUTHOR) {
         captured += 1;
     }
     let links = extract_locators(&page.html);
@@ -1673,6 +1698,16 @@ fn normalize_href(href: &str) -> Option<(String, &'static str)> {
     // href is what let a `/v1/contract/web/…` sitting in a query or fragment be
     // mined into a locator that had nothing to do with the link as written.
     let path_part = href.split(['?', '#']).next().unwrap_or(href);
+    // Checked again on the path alone, because the locator is built from the
+    // path and truncating the query can MANUFACTURE a dot segment that was not
+    // one in the full href: `freenet:<id>/a/..?z` has the last segment `..?z`,
+    // which is not `..`, but the emitted locator is `freenet:<id>/a/..`. That
+    // locator resolves to the contract root, so an unbounded family of distinct
+    // strings (`/a/..`, `/b/..`, …) all name the same page — index spam that
+    // the seen-set cannot collapse — and it fails to re-validate on reload.
+    if has_dot_segment(path_part) {
+        return None;
+    }
     // A `#…` on a freenet locator is the app's own client-side ROUTE, not a
     // document anchor — the Delta hub is itself configured as
     // `freenet:<id>/#AmcVD92D3U/2/links`. So it is carried into the locator, or
@@ -1688,6 +1723,28 @@ fn normalize_href(href: &str) -> Option<(String, &'static str)> {
         }
     };
     let is_b58 = |c: char| matches!(c, '1'..='9' | 'A'..='H' | 'J'..='N' | 'P'..='Z' | 'a'..='k' | 'm'..='z');
+    // An already-canonical `freenet:` locator is matched FIRST, before the
+    // gateway prefix. Order matters for idempotence: the gateway branch takes
+    // the FIRST `/v1/contract/web/` it finds anywhere in the path, so a locator
+    // whose own in-contract path contains that prefix —
+    // `freenet:<id1>/v1/contract/web/<id2>/p`, which is a legal path inside
+    // id1 — would re-normalize to `freenet:<id2>/p` and silently retarget at a
+    // different, attacker-chosen contract on the next pass. Matching the
+    // `freenet:` form first makes normalization a fixed point.
+    if let Some(rest) = path_part.strip_prefix("freenet:") {
+        let id_end = rest.find(|c: char| !is_b58(c)).unwrap_or(rest.len());
+        if matches!(id_end, 43 | 44) {
+            let path = &rest[id_end..];
+            if is_asset_path(path) {
+                return None;
+            }
+            return Some((
+                frag(&format!("freenet:{}{}", &rest[..id_end], path)),
+                "site",
+            ));
+        }
+        return None;
+    }
     // Gateway web URL (absolute or relative path) -> freenet:<id><path>
     if let Some(pos) = path_part.find("/v1/contract/web/") {
         let after = &path_part[pos + "/v1/contract/web/".len()..];
@@ -1699,20 +1756,6 @@ fn normalize_href(href: &str) -> Option<(String, &'static str)> {
             }
             return Some((
                 frag(&format!("freenet:{}{}", &after[..id_end], path)),
-                "site",
-            ));
-        }
-        return None;
-    }
-    if let Some(rest) = path_part.strip_prefix("freenet:") {
-        let id_end = rest.find(|c: char| !is_b58(c)).unwrap_or(rest.len());
-        if matches!(id_end, 43 | 44) {
-            let path = &rest[id_end..];
-            if is_asset_path(path) {
-                return None;
-            }
-            return Some((
-                frag(&format!("freenet:{}{}", &rest[..id_end], path)),
                 "site",
             ));
         }
@@ -1749,21 +1792,50 @@ fn normalize_href(href: &str) -> Option<(String, &'static str)> {
 /// for special schemes (`http`/`https`), so `…/<id>\..\..\v1/secret` collapses
 /// to `/v1/secret` at fetch time exactly as the `/` form does.
 fn has_dot_segment(path: &str) -> bool {
-    let decoded = percent_decode_ascii(path);
+    let decoded = percent_decode_fully(path.as_bytes());
     decoded
         .split(|b| *b == b'/' || *b == b'\\')
         .any(|seg| seg == b"." || seg == b"..")
 }
 
-/// Decode `%XX` escapes (either case) for comparison purposes only. Invalid
-/// escapes are left as-is; this is a guard, not a general-purpose decoder.
+/// Decode `%XX` escapes REPEATEDLY, until decoding changes nothing.
 ///
-/// Works on bytes end to end and never slices the `&str`. Indexing a `&str` by
+/// Decoding once is not enough, and no fixed number of passes is either,
+/// because the number of decodes is a property of the CONSUMER CHAIN rather
+/// than of this guard. The chain that broke a single-decode guard: the crawler
+/// asks the node for a page, the node decodes the path once and echoes it into
+/// the shell's iframe URL, and the browser then issues that as a second request
+/// which the node decodes again. So `%252e%252e%252f` survives one decode as
+/// the harmless-looking `%2e%2e%2f` and only becomes `../` on the second.
+///
+/// Rather than count the decodes for each consumer — which is how the previous
+/// four versions of this guard were each wrong — decode to a fixed point. That
+/// is at least as strong as any finite chain, so it stays correct even if a
+/// consumer adds a hop later.
+///
+/// Terminates: every pass that changes anything replaces a three-byte escape
+/// with one byte, so the length strictly decreases; the loop is additionally
+/// bounded by the input length as a belt.
+fn percent_decode_fully(input: &[u8]) -> Vec<u8> {
+    let mut cur = percent_decode_once(input);
+    for _ in 0..input.len() {
+        let next = percent_decode_once(&cur);
+        if next == cur {
+            break;
+        }
+        cur = next;
+    }
+    cur
+}
+
+/// One pass of `%XX` decoding (either case). Invalid escapes are left as-is;
+/// this is a guard, not a general-purpose decoder.
+///
+/// Works on bytes end to end and never slices a `&str`. Indexing a `&str` by
 /// the byte offsets of a `%XX` triple panics when the `%` is followed by a
 /// multi-byte character — `%aé` puts the end of the triple inside `é` — and the
 /// input here is raw attacker-supplied href text, so that is a remote crash.
-fn percent_decode_ascii(s: &str) -> Vec<u8> {
-    let b = s.as_bytes();
+fn percent_decode_once(b: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(b.len());
     let mut i = 0;
     while i < b.len() {
@@ -1778,6 +1850,11 @@ fn percent_decode_ascii(s: &str) -> Vec<u8> {
         i += 1;
     }
     out
+}
+
+#[cfg(test)]
+fn percent_decode_ascii(s: &str) -> Vec<u8> {
+    percent_decode_once(s.as_bytes())
 }
 
 fn hex_val(c: u8) -> Option<u8> {
@@ -3017,6 +3094,74 @@ mod tests {
     }
 
     #[test]
+    fn double_encoded_traversal_is_rejected() {
+        // Decoding ONCE is not enough. The renderer path decodes twice — the
+        // node decodes the path and echoes it into the shell's iframe URL, and
+        // the browser issues that as a second request which the node decodes
+        // again — so `%252e%252e%252f` looks harmless after one decode
+        // (`%2e%2e%2f`) and only becomes `../` on the second. Decoding to a
+        // FIXED POINT is what makes this independent of the consumer's hop
+        // count, so a future extra hop cannot reopen it.
+        assert!(normalize_href(&format!(
+            "freenet:{ID}/%252e%252e%252f%252e%252e%252fhome%252fian%252fnotes%252etxt"
+        ))
+        .is_none());
+        assert!(normalize_href(&format!("freenet:{ID}/%252e%252e/%252e%252e/x")).is_none());
+        // Triple-encoded, for the same reason — no fixed pass count is right.
+        assert!(normalize_href(&format!("freenet:{ID}/%25252e%25252e%25252fetc")).is_none());
+        assert!(has_dot_segment("/a/%252e%252e/b"));
+        assert!(has_dot_segment("/a/%25252e%25252e/b"));
+        // The fetch-time backstop refuses them too.
+        for escape in [
+            "/%252e%252e%252f%252e%252e%252fetc%252fpasswd",
+            "/%252e%252e/%252e%252e/x",
+        ] {
+            assert!(
+                gateway_url("http://127.0.0.1:7509", ID, escape).is_err(),
+                "must refuse {escape}"
+            );
+        }
+        // Still not over-rejecting: a legitimate encoded slash in a query is
+        // extremely common (`?redirect=https%3A%2F%2Fx`) and must survive.
+        assert!(
+            normalize_href("https://example.com/go?redirect=https%3A%2F%2Fx.example").is_some()
+        );
+        assert!(normalize_href("https://gitlab.com/api/v4/projects/group%2Fsub%2Fproj").is_some());
+        assert!(normalize_href("https://github.com/freenet/freenet-core/compare/v1..v2").is_some());
+    }
+
+    #[test]
+    fn normalizing_a_locator_twice_changes_nothing() {
+        // `Pending::load` rewrites each stored locator to its canonical form, so
+        // a non-idempotent normalization silently mutates the queue on every
+        // restart. Two ways it used to: truncating a query could MANUFACTURE a
+        // dot segment (`/a/..?z` -> `/a/..`), and the gateway branch took the
+        // first `/v1/contract/web/` anywhere in the path, so a locator whose own
+        // path contained that prefix was retargeted at a different contract.
+        let id2 = "2222222222222222222222222222222222222222222";
+        for input in [
+            format!("freenet:{ID}/a/..?z"),
+            format!("freenet:{ID}/a/.."),
+            format!("freenet:{ID}/v1/contract/web/{id2}/p"),
+            format!("https://gw.example/v1/contract/web/{ID}/v1/contract/web/{id2}/p"),
+            format!("freenet:{ID}/#route/1"),
+            format!("freenet:{ID}/a?q=1#r"),
+            format!("https://gw.example/v1/contract/web/{ID}/x#r"),
+            "https://example.com/a?b=c#d".to_string(),
+            format!("freenet:{ID}"),
+        ] {
+            let Some((canon, kind)) = normalize_href(&input) else {
+                continue;
+            };
+            assert_eq!(
+                normalize_href(&canon),
+                Some((canon.clone(), kind)),
+                "normalize is not idempotent for {input}: {canon} changed again"
+            );
+        }
+    }
+
+    #[test]
     fn a_locator_that_merely_normalizes_differently_is_kept() {
         // Re-validation must not become a second way to lose links. A curated
         // sources line carrying a `#fragment` normalizes to a different string;
@@ -3096,9 +3241,13 @@ mod tests {
         // A truncated escape at the very end is left alone, not read past.
         assert_eq!(percent_decode_ascii("a%2"), b"a%2");
         assert_eq!(percent_decode_ascii("a%"), b"a%");
-        // Double-encoding decodes one level only, so `%252e` is not a dot
-        // segment — correct, since the url crate does not collapse it either.
-        assert!(!has_dot_segment("/a/%252e%252e/b"));
+        // Double-encoding IS a dot segment here. This assertion used to be
+        // inverted, on the reasoning that one decode is all that happens and
+        // the url crate does not collapse `%252e` either. That reasoning held
+        // for the static fetch and was wrong for the renderer, which reaches
+        // the node twice and so decodes twice. See
+        // `double_encoded_traversal_is_rejected`.
+        assert!(has_dot_segment("/a/%252e%252e/b"));
     }
 
     #[test]
