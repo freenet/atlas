@@ -13,14 +13,37 @@
 //!
 //! Env vars: `OPENAI_API_KEY` (enables LLM descriptions), `ATLAS_LLM_MODEL`
 //! (OpenAI chat model, defaults to `DEFAULT_LLM_MODEL`).
+//!
+//! # Cost model
+//!
+//! An LLM call is billed per *newly discovered* locator, never per poll. Polling
+//! a River room costs one contract GET; a poll that surfaces nothing new spends
+//! zero tokens. That makes a fast `--interval` cheap, which is what lets a busy
+//! room be watched closely.
+//!
+//! Four caps bound spend, so neither a spam flood nor a bug can run up a bill:
+//!   - the seen set (persisted): each locator is described at most ONCE, ever;
+//!   - `--max`: hard cap on billed attempts per run;
+//!   - `--daily-max`: hard cap on billed attempts per rolling 24h, persisted to
+//!     the spend ledger so a restart or crash-loop cannot reset it. This is the
+//!     real money ceiling — `--max` alone scales with how often we poll;
+//!   - `--per-host-max` / `--per-author-max`: per-run fairness shares, so one
+//!     domain or one spamming room member cannot monopolize a run's budget.
+//!
+//! A locator deferred by a cap is NOT marked seen, so it is reconsidered on a
+//! later run rather than silently dropped.
+//!
+//! Expensive sources are rate-limited separately from cheap ones: `--hub-interval`
+//! keeps hub re-rendering (a headless browser, tens of seconds) on a slow cadence
+//! while `--interval` polls rooms frequently.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::Read;
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::time::Duration;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, bail, Context, Result};
 use clap::Parser;
@@ -68,12 +91,37 @@ struct Cli {
     /// File tracking already-added locators (default: <key_dir>/crawler-seen.txt).
     #[arg(long)]
     seen: Option<PathBuf>,
-    /// Max new entries to add per run.
+    /// File tracking recent LLM-billed attempts, for the rolling `--daily-max`
+    /// window (default: <key_dir>/crawler-spend.txt).
+    #[arg(long)]
+    spend: Option<PathBuf>,
+    /// Max LLM-billed attempts per run.
     #[arg(long, default_value_t = 20)]
     max: usize,
-    /// If set, loop every N seconds instead of running once.
+    /// Max LLM-billed attempts per rolling 24h, across all runs. Persisted, so a
+    /// restart or crash-loop cannot reset it. This is the hard spend ceiling: it
+    /// bounds cost independently of how often `--interval` fires, which `--max`
+    /// on its own does not.
+    #[arg(long, default_value_t = 200)]
+    daily_max: usize,
+    /// Max LLM-billed attempts per run for any one host (https) or contract id
+    /// (freenet:). Stops a flood of one domain's URLs consuming a whole run.
+    #[arg(long, default_value_t = 3)]
+    per_host_max: usize,
+    /// Max LLM-billed attempts per run for any one room member's messages. Stops
+    /// a single spamming account consuming a whole run.
+    #[arg(long, default_value_t = 3)]
+    per_author_max: usize,
+    /// If set, loop every N seconds instead of running once. Cheap sources
+    /// (River rooms) are polled every tick, so this can be small; expensive hub
+    /// re-rendering is rate-limited separately by `--hub-interval`.
     #[arg(long)]
     interval: Option<u64>,
+    /// Minimum seconds between crawls of any one `hub` source. Rendering a hub
+    /// drives a headless browser for tens of seconds, so it stays on a slow
+    /// cadence even when `--interval` is short.
+    #[arg(long, default_value_t = 3600)]
+    hub_interval: u64,
 }
 
 struct Described {
@@ -86,6 +134,166 @@ struct Described {
     rating: String,
 }
 
+/// Width of the `--daily-max` rolling window.
+const SPEND_WINDOW_SECS: u64 = 24 * 60 * 60;
+
+fn now_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// Persisted rolling-window ledger of LLM-billed attempts.
+///
+/// Kept on disk (one unix timestamp per line) rather than in memory so that the
+/// `--daily-max` ceiling survives a restart. That matters: an in-memory counter
+/// would be reset by a crash-loop, turning the cap into no cap at all precisely
+/// when something is going wrong.
+struct SpendLedger {
+    path: PathBuf,
+    /// Timestamps of billed attempts inside the current window.
+    recent: Vec<u64>,
+}
+
+impl SpendLedger {
+    /// Load the ledger, dropping entries that have aged out of the window, and
+    /// rewrite the file with only what remains (so it stays bounded by
+    /// `--daily-max` lines rather than growing forever). A missing or unreadable
+    /// ledger starts empty: this is a spend cap, not an audit log, and refusing
+    /// to run because it is absent would be worse than recounting from zero.
+    fn load(path: &Path) -> Self {
+        let cutoff = now_secs().saturating_sub(SPEND_WINDOW_SECS);
+        let recent: Vec<u64> = fs::read_to_string(path)
+            .map(|s| {
+                s.lines()
+                    .filter_map(|l| l.trim().parse::<u64>().ok())
+                    .filter(|t| *t >= cutoff)
+                    .collect()
+            })
+            .unwrap_or_default();
+        let ledger = Self {
+            path: path.to_path_buf(),
+            recent,
+        };
+        ledger.rewrite();
+        ledger
+    }
+
+    fn spent(&self) -> usize {
+        self.recent.len()
+    }
+
+    /// Record one billed attempt. Called when an attempt is *reserved*, before
+    /// the fetch that precedes the LLM call — so a fetch failure counts as spend
+    /// even though no tokens were burned. Over-counting is the safe direction
+    /// for a spend cap; under-counting is not.
+    fn record(&mut self) {
+        let now = now_secs();
+        self.recent.push(now);
+        if let Err(e) = append_line(&self.path, &now.to_string()) {
+            eprintln!("warn: spend ledger append failed ({e:#}); cap may reset on restart");
+        }
+    }
+
+    /// Atomically replace the ledger file with the in-window entries.
+    fn rewrite(&self) {
+        let body: String = self
+            .recent
+            .iter()
+            .map(|t| format!("{t}\n"))
+            .collect::<Vec<_>>()
+            .concat();
+        let tmp = self.path.with_extension("tmp");
+        if fs::write(&tmp, &body).is_ok() {
+            let _ = fs::rename(&tmp, &self.path);
+        }
+    }
+}
+
+/// Why a locator did not get an LLM-billed attempt this run.
+enum Denied {
+    /// `--max` or `--daily-max` is exhausted: stop this run's spending entirely.
+    Exhausted,
+    /// A per-host share is used up: skip this locator, keep going.
+    HostShare,
+}
+
+/// Per-run cost accounting. Owns every cap that bounds LLM spend so the caps
+/// cannot drift apart across the source types.
+struct Budget<'a> {
+    /// Billed attempts still allowed this run: `min(--max, window headroom)`.
+    remaining: usize,
+    per_host_max: usize,
+    host_used: HashMap<String, usize>,
+    ledger: &'a mut SpendLedger,
+    /// Billed attempts taken this run.
+    attempts: usize,
+}
+
+impl<'a> Budget<'a> {
+    fn new(ledger: &'a mut SpendLedger, max: usize, daily_max: usize, per_host_max: usize) -> Self {
+        let headroom = daily_max.saturating_sub(ledger.spent());
+        Self {
+            remaining: max.min(headroom),
+            per_host_max,
+            host_used: HashMap::new(),
+            ledger,
+            attempts: 0,
+        }
+    }
+
+    fn exhausted(&self) -> bool {
+        self.remaining == 0
+    }
+
+    /// Reserve one billed attempt for `loc`, charging it to the rolling ledger
+    /// and to `loc`'s host share.
+    ///
+    /// On `Err` the caller MUST NOT mark the locator seen — a locator held back
+    /// by a cap is deferred to a later run, not dropped. (Marking it seen would
+    /// silently discard it forever, which is how a rate limit turns into data
+    /// loss.)
+    fn try_take(&mut self, loc: &str) -> Result<(), Denied> {
+        if self.remaining == 0 {
+            return Err(Denied::Exhausted);
+        }
+        let host = host_bucket(loc);
+        let used = self.host_used.entry(host).or_insert(0);
+        if *used >= self.per_host_max {
+            return Err(Denied::HostShare);
+        }
+        *used += 1;
+        self.remaining -= 1;
+        self.attempts += 1;
+        self.ledger.record();
+        Ok(())
+    }
+}
+
+/// The rate-limiting bucket for a locator: the host for `https://`, or the
+/// contract id for `freenet:`. Everything a single publisher controls shares one
+/// bucket, so posting many distinct paths on one site does not multiply spend.
+fn host_bucket(loc: &str) -> String {
+    if let Some(rest) = loc.strip_prefix("freenet:") {
+        return format!("freenet:{}", split_freenet(rest).0);
+    }
+    url::Url::parse(loc)
+        .ok()
+        .and_then(|u| u.host_str().map(|h| h.to_ascii_lowercase()))
+        .unwrap_or_else(|| loc.to_string())
+}
+
+/// State that must survive across loop iterations of a long-running crawler.
+#[derive(Default)]
+struct CrawlState {
+    /// When each hub source was last crawled, so `--hub-interval` can hold
+    /// expensive hub renders to a slow cadence while `--interval` polls cheap
+    /// sources frequently. In memory only: a restart re-crawls each hub once,
+    /// which is bounded and harmless.
+    last_hub_crawl: HashMap<String, Instant>,
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
     let key_dir = cli.key_dir.clone().unwrap_or_else(|| {
@@ -96,9 +304,14 @@ fn main() -> Result<()> {
         .seen
         .clone()
         .unwrap_or_else(|| key_dir.join("crawler-seen.txt"));
+    let spend_path = cli
+        .spend
+        .clone()
+        .unwrap_or_else(|| key_dir.join("crawler-spend.txt"));
+    let mut state = CrawlState::default();
 
     loop {
-        if let Err(e) = run_once(&cli, &seen_path) {
+        if let Err(e) = run_once(&cli, &seen_path, &spend_path, &mut state) {
             eprintln!("crawl run error: {e:#}");
         }
         match cli.interval {
@@ -112,7 +325,7 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-fn run_once(cli: &Cli, seen_path: &Path) -> Result<()> {
+fn run_once(cli: &Cli, seen_path: &Path, spend_path: &Path, state: &mut CrawlState) -> Result<()> {
     let mut seen = load_seen(seen_path);
     let sources = fs::read_to_string(&cli.sources)
         .with_context(|| format!("reading sources {}", cli.sources.display()))?;
@@ -136,18 +349,22 @@ fn run_once(cli: &Cli, seen_path: &Path) -> Result<()> {
         .build()?;
 
     let gw = gateway_http_base(&cli.node);
-    // `attempts` = locators we fetch and may send to the LLM this run. `cli.max`
-    // is a HARD per-run cap on it: the cost ceiling, independent of successes.
-    let mut attempts = 0usize;
+    // Every LLM-billed attempt this run goes through `budget`, which enforces the
+    // per-run cap, the persisted rolling-24h cap, and the per-host share.
+    let mut ledger = SpendLedger::load(spend_path);
+    let spent_before = ledger.spent();
+    let mut budget = Budget::new(&mut ledger, cli.max, cli.daily_max, cli.per_host_max);
+    if budget.exhausted() {
+        eprintln!(
+            "daily cap reached ({spent_before}/{} in last 24h) — polling only, no new descriptions",
+            cli.daily_max
+        );
+    }
     let mut added = 0usize;
     for raw in sources.lines() {
         let line = raw.trim();
         if line.is_empty() || line.starts_with('#') {
             continue;
-        }
-        if attempts >= cli.max {
-            eprintln!("reached --max {} attempts, stopping", cli.max);
-            break;
         }
         // `hub <url>` (or `hub: <url>`): a link repository — index the sites it
         // links to (ONE level; linked sites are NOT recursively crawled as hubs,
@@ -157,7 +374,23 @@ fn run_once(cli: &Cli, seen_path: &Path) -> Result<()> {
             .or_else(|| line.strip_prefix("hub:"))
         {
             let hub = hub.trim().to_string();
-            let (a, ok) = crawl_hub(
+            // Nothing left to spend: skip WITHOUT stamping the cadence clock, so
+            // hitting the daily cap doesn't also cost this hub its next slot.
+            if budget.exhausted() {
+                continue;
+            }
+            // Rendering a hub is the crawler's most expensive operation (a
+            // headless browser, tens of seconds), so it keeps its own slow
+            // cadence no matter how often the loop ticks.
+            let due = state
+                .last_hub_crawl
+                .get(&hub)
+                .is_none_or(|t| t.elapsed().as_secs() >= cli.hub_interval);
+            if !due {
+                continue;
+            }
+            state.last_hub_crawl.insert(hub.clone(), Instant::now());
+            added += crawl_hub(
                 cli,
                 &client,
                 key.as_deref(),
@@ -166,10 +399,8 @@ fn run_once(cli: &Cli, seen_path: &Path) -> Result<()> {
                 &hub,
                 &mut seen,
                 seen_path,
-                cli.max - attempts,
+                &mut budget,
             );
-            attempts += a;
-            added += ok;
         } else if let Some(owner_vk) = line
             .strip_prefix("river-room ")
             .or_else(|| line.strip_prefix("river-room:"))
@@ -178,9 +409,11 @@ fn run_once(cli: &Cli, seen_path: &Path) -> Result<()> {
             // stable owner VerifyingKey (NOT its contract key, which River
             // re-keys on every WASM upgrade). We derive the contract key from
             // the owner VK, GET the room state from the local node, and index
-            // the URLs posted in its messages. See `crawl_river_room`.
+            // the URLs posted in its messages. Polled every tick: the GET is
+            // cheap and only genuinely-new links cost tokens. See
+            // `crawl_river_room`.
             let owner_vk = owner_vk.trim().to_string();
-            let (a, ok) = crawl_river_room(
+            added += crawl_river_room(
                 cli,
                 &client,
                 key.as_deref(),
@@ -189,18 +422,21 @@ fn run_once(cli: &Cli, seen_path: &Path) -> Result<()> {
                 &owner_vk,
                 &mut seen,
                 seen_path,
-                cli.max - attempts,
+                &mut budget,
             );
-            attempts += a;
-            added += ok;
         } else {
             if seen.contains(line) {
                 continue;
             }
-            // Mark attempted BEFORE describe/add so a failure can't re-describe
+            match budget.try_take(line) {
+                Ok(()) => {}
+                // A curated source line held back by a cap is retried next run.
+                Err(Denied::HostShare) => continue,
+                Err(Denied::Exhausted) => break,
+            }
+            // Mark seen BEFORE describe/add so a failure can't re-describe
             // (and re-bill) the same locator on every future run: at most one LLM
             // call per locator, ever. (To retry one, remove it from the seen file.)
-            attempts += 1;
             seen.insert(line.to_string());
             append_seen(seen_path, line);
             match index_locator(cli, &client, key.as_deref(), &model, &gw, line, "external") {
@@ -210,9 +446,11 @@ fn run_once(cli: &Cli, seen_path: &Path) -> Result<()> {
             }
         }
     }
+    let attempts = budget.attempts;
+    let spent_now = spent_before + attempts;
     eprintln!(
-        "run complete: {added} added / {attempts} attempted (cap {})",
-        cli.max
+        "run complete: {added} added / {attempts} attempted (run cap {}, 24h {}/{})",
+        cli.max, spent_now, cli.daily_max
     );
     Ok(())
 }
@@ -363,23 +601,26 @@ fn crawl_hub(
     hub: &str,
     seen: &mut HashSet<String>,
     seen_path: &Path,
-    budget: usize,
-) -> (usize, usize) {
+    budget: &mut Budget,
+) -> usize {
+    // Rendering the hub is expensive and only pays off if we can still index
+    // something, so don't drive the browser once spending is done for this run.
+    if budget.exhausted() {
+        return 0;
+    }
     let page = match get_page(cli, client, gw, hub) {
         Ok(p) => p,
         Err(e) => {
             eprintln!("hub {hub}: fetch failed: {e:#}");
-            return (0, 0);
+            return 0;
         }
     };
-    let mut attempts = 0;
     let mut added = 0;
 
     // A hub (link repository) is itself a resource worth listing, so index it
     // too — not just the sites it links to. Reuse the page already rendered for
     // link extraction (no second fetch). Marked-seen so it's indexed once.
-    if !seen.contains(hub) && attempts < budget {
-        attempts += 1;
+    if !seen.contains(hub) && budget.try_take(hub).is_ok() {
         seen.insert(hub.to_string());
         append_seen(seen_path, hub);
         match index_page(cli, client, key, model, hub, "site", &page) {
@@ -393,10 +634,6 @@ fn crawl_hub(
     eprintln!("hub {hub}: {} candidate link(s)", links.len());
     let hub_id = freenet_id(hub);
     for (loc, kind) in links {
-        if attempts >= budget {
-            eprintln!("hub {hub}: hit attempt budget {budget}, stopping");
-            break;
-        }
         // Skip the hub itself, anything already seen, and links back into the
         // hub's own contract (in-app navigation, assets) — only outbound sites.
         if loc == hub || seen.contains(&loc) {
@@ -405,9 +642,18 @@ fn crawl_hub(
         if hub_id.is_some() && freenet_id(&loc) == hub_id {
             continue;
         }
-        // Mark attempted before describe/add (same cost guard as direct sources):
+        match budget.try_take(&loc) {
+            Ok(()) => {}
+            // Over this host's share for the run: leave it unseen so a later run
+            // reconsiders it.
+            Err(Denied::HostShare) => continue,
+            Err(Denied::Exhausted) => {
+                eprintln!("hub {hub}: out of budget, stopping");
+                break;
+            }
+        }
+        // Mark seen before describe/add (same cost guard as direct sources):
         // each linked locator is described at most once, ever.
-        attempts += 1;
         seen.insert(loc.clone());
         append_seen(seen_path, &loc);
         match index_locator(cli, client, key, model, gw, &loc, kind) {
@@ -416,7 +662,7 @@ fn crawl_hub(
             Err(e) => eprintln!("  skip {loc}: {e:#}"),
         }
     }
-    (attempts, added)
+    added
 }
 
 /// BLAKE3 code hash of the CURRENT River room-contract WASM generation.
@@ -549,13 +795,16 @@ fn crawl_river_room(
     owner_vk_b58: &str,
     seen: &mut HashSet<String>,
     seen_path: &Path,
-    budget: usize,
-) -> (usize, usize) {
+    budget: &mut Budget,
+) -> usize {
+    if budget.exhausted() {
+        return 0;
+    }
     let owner_vk = match parse_owner_vk(owner_vk_b58) {
         Ok(vk) => vk,
         Err(e) => {
             eprintln!("river-room {owner_vk_b58}: bad owner vk: {e:#}");
-            return (0, 0);
+            return 0;
         }
     };
     let candidate_keys = room_candidate_keys(&owner_vk);
@@ -568,7 +817,7 @@ fn crawl_river_room(
         Ok(rt) => rt.block_on(fetch_room_state(&cli.node, &owner_vk, &candidate_ids)),
         Err(e) => {
             eprintln!("river-room {owner_vk_b58}: runtime: {e:#}");
-            return (0, 0);
+            return 0;
         }
     };
     let state = match state {
@@ -578,33 +827,51 @@ fn crawl_river_room(
                 "river-room {owner_vk_b58}: no live room found (tried {} candidate key(s))",
                 candidate_ids.len()
             );
-            return (0, 0);
+            return 0;
         }
         Err(e) => {
             eprintln!("river-room {owner_vk_b58}: fetch failed: {e:#}");
-            return (0, 0);
+            return 0;
         }
     };
 
     let links = extract_message_urls(&state);
+    // Only links we have never described cost anything; a poll that finds
+    // nothing new is free, which is what makes frequent polling affordable.
+    let fresh = links
+        .iter()
+        .filter(|(loc, _, _)| !seen.contains(loc))
+        .count();
     eprintln!(
-        "river-room {owner_vk_b58}: {} candidate link(s)",
+        "river-room {owner_vk_b58}: {} candidate link(s), {fresh} new",
         links.len()
     );
 
-    let mut attempts = 0;
     let mut added = 0;
-    for (loc, kind) in links {
-        if attempts >= budget {
-            eprintln!("river-room {owner_vk_b58}: hit attempt budget {budget}, stopping");
-            break;
-        }
+    // Per-author share for this crawl: one member posting a wall of links can
+    // use at most `--per-author-max` of the run's budget, so a spammer cannot
+    // crowd out everyone else's links (or the daily cap).
+    let mut author_used: HashMap<String, usize> = HashMap::new();
+    for (loc, kind, author) in links {
         if seen.contains(&loc) {
             continue;
         }
-        // Mark attempted before describe/add (same cost guard as hub links):
+        let used = author_used.entry(author.clone()).or_insert(0);
+        if *used >= cli.per_author_max {
+            // Deferred, not dropped: left unseen so later runs reconsider it.
+            continue;
+        }
+        match budget.try_take(&loc) {
+            Ok(()) => {}
+            Err(Denied::HostShare) => continue,
+            Err(Denied::Exhausted) => {
+                eprintln!("river-room {owner_vk_b58}: out of budget, stopping");
+                break;
+            }
+        }
+        *used += 1;
+        // Mark seen before describe/add (same cost guard as hub links):
         // each locator is described at most once, ever.
-        attempts += 1;
         seen.insert(loc.clone());
         append_seen(seen_path, &loc);
         match index_locator(cli, client, key, model, gw, &loc, kind) {
@@ -613,7 +880,7 @@ fn crawl_river_room(
             Err(e) => eprintln!("  skip {loc}: {e:#}"),
         }
     }
-    (attempts, added)
+    added
 }
 
 /// Extract outbound locators from a room's messages: the `https://` and
@@ -621,17 +888,24 @@ fn crawl_river_room(
 /// non-deleted) messages, takes each one's effective (edit-aware) public text,
 /// and scans it for URLs. Private/encrypted messages yield no text and are
 /// skipped. Dedups across the whole room.
-fn extract_message_urls(state: &ChatRoomStateV1) -> Vec<(String, &'static str)> {
+///
+/// Each result carries the id of the member who posted it, so spend can be
+/// rationed per author (`--per-author-max`). Messages iterate in the room's
+/// canonical order (oldest first, by `(time, id)`), so on a duplicate URL the
+/// EARLIEST poster is the one charged — re-posting someone else's link cannot
+/// be used to burn a third party's share.
+fn extract_message_urls(state: &ChatRoomStateV1) -> Vec<(String, &'static str, String)> {
     let messages = &state.recent_messages;
-    let mut out: Vec<(String, &'static str)> = Vec::new();
+    let mut out: Vec<(String, &'static str, String)> = Vec::new();
     let mut seen = HashSet::new();
     for msg in messages.display_messages() {
         let Some(text) = messages.effective_text(msg) else {
             continue;
         };
+        let author = msg.message.author.to_string();
         for (loc, kind) in scan_urls(&text) {
             if seen.insert(loc.clone()) {
-                out.push((loc, kind));
+                out.push((loc, kind, author.clone()));
             }
         }
     }
@@ -960,13 +1234,25 @@ fn load_seen(path: &Path) -> HashSet<String> {
 }
 
 fn append_seen(path: &Path, url: &str) {
+    let _ = append_line(path, url);
+}
+
+/// Append one line to a file, creating it (and its parent) if needed.
+///
+/// Returns the error rather than swallowing it, because the spend ledger has to
+/// know when a write failed: a ledger that silently stops recording is a spend
+/// cap that silently stops capping.
+fn append_line(path: &Path, line: &str) -> Result<()> {
     use std::io::Write;
     if let Some(parent) = path.parent() {
-        let _ = fs::create_dir_all(parent);
+        fs::create_dir_all(parent)?;
     }
-    if let Ok(mut f) = fs::OpenOptions::new().create(true).append(true).open(path) {
-        let _ = writeln!(f, "{url}");
-    }
+    let mut f = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)?;
+    writeln!(f, "{line}")?;
+    Ok(())
 }
 
 // --- tiny HTML helpers (no full parser; best-effort for fallback descriptions) ---
@@ -1034,7 +1320,7 @@ fn visible_text(html: &str) -> String {
         // `html.get` returns None on a non-boundary or out-of-range, so no panic.
         let starts = |needle: &str| {
             html.get(i..i + needle.len())
-                .map_or(false, |s| s.eq_ignore_ascii_case(needle))
+                .is_some_and(|s| s.eq_ignore_ascii_case(needle))
         };
         if starts("<script") || starts("<style") {
             in_script = true;
@@ -1228,5 +1514,155 @@ mod tests {
         let urls =
             scan_urls("hello world, email a@b.com, ftp://x, freenet:tooShort http://insecure");
         assert!(urls.is_empty(), "got {urls:?}");
+    }
+
+    // --- spend caps ---
+
+    /// A scratch path unique to one test, cleaned up on drop.
+    struct TmpFile(PathBuf);
+
+    impl TmpFile {
+        fn new(tag: &str) -> Self {
+            let p = std::env::temp_dir().join(format!(
+                "atlas-crawler-test-{tag}-{}-{:?}",
+                std::process::id(),
+                std::thread::current().id()
+            ));
+            let _ = fs::remove_file(&p);
+            Self(p)
+        }
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TmpFile {
+        fn drop(&mut self) {
+            let _ = fs::remove_file(&self.0);
+            let _ = fs::remove_file(self.0.with_extension("tmp"));
+        }
+    }
+
+    #[test]
+    fn host_bucket_groups_by_publisher() {
+        // Many paths on one domain share one bucket…
+        assert_eq!(
+            host_bucket("https://spam.example/1"),
+            host_bucket("https://spam.example/2")
+        );
+        // …case-insensitively, and independent of path/query.
+        assert_eq!(
+            host_bucket("https://SPAM.example/a?b=c"),
+            host_bucket("https://spam.example/z")
+        );
+        // Distinct domains do not.
+        assert_ne!(
+            host_bucket("https://a.example/"),
+            host_bucket("https://b.example/")
+        );
+        // freenet: locators bucket by contract id, not by in-contract path.
+        assert_eq!(
+            host_bucket(&format!("freenet:{ID}/one")),
+            host_bucket(&format!("freenet:{ID}/two"))
+        );
+        assert_eq!(
+            host_bucket(&format!("freenet:{ID}")),
+            format!("freenet:{ID}")
+        );
+    }
+
+    #[test]
+    fn per_host_cap_defers_a_flood_without_burning_the_run_budget() {
+        let f = TmpFile::new("hostcap");
+        let mut ledger = SpendLedger::load(f.path());
+        // Run cap 20, host share 3.
+        let mut b = Budget::new(&mut ledger, 20, 1000, 3);
+        for i in 0..3 {
+            assert!(
+                b.try_take(&format!("https://spam.example/{i}")).is_ok(),
+                "first {} should be allowed",
+                i + 1
+            );
+        }
+        // Fourth from the same host is refused…
+        assert!(matches!(
+            b.try_take("https://spam.example/4"),
+            Err(Denied::HostShare)
+        ));
+        // …and crucially did NOT consume the run budget, so other publishers
+        // still get served: a flood rations itself rather than starving the run.
+        assert_eq!(b.attempts, 3);
+        assert_eq!(b.remaining, 17);
+        assert!(b.try_take("https://other.example/1").is_ok());
+    }
+
+    #[test]
+    fn run_cap_reports_exhausted() {
+        let f = TmpFile::new("runcap");
+        let mut ledger = SpendLedger::load(f.path());
+        let mut b = Budget::new(&mut ledger, 2, 1000, 99);
+        assert!(b.try_take("https://a.example/1").is_ok());
+        assert!(b.try_take("https://b.example/1").is_ok());
+        assert!(matches!(
+            b.try_take("https://c.example/1"),
+            Err(Denied::Exhausted)
+        ));
+        assert!(b.exhausted());
+    }
+
+    /// The load-bearing protection: the 24h cap must hold ACROSS runs, so a fast
+    /// `--interval` cannot multiply spend the way the per-run `--max` alone
+    /// would. Simulates repeated runs against one persisted ledger.
+    #[test]
+    fn daily_cap_binds_across_runs_and_survives_restart() {
+        let f = TmpFile::new("daily");
+        let daily_max = 5;
+        let mut taken = 0;
+        // Ten "runs", each willing to spend 20 — the daily cap must stop them at 5.
+        for run in 0..10 {
+            let mut ledger = SpendLedger::load(f.path()); // fresh load == restart
+            let mut b = Budget::new(&mut ledger, 20, daily_max, 99);
+            let mut i = 0;
+            while b
+                .try_take(&format!("https://host{run}-{i}.example/"))
+                .is_ok()
+            {
+                taken += 1;
+                i += 1;
+            }
+        }
+        assert_eq!(
+            taken, daily_max,
+            "daily cap must bound total spend across runs, got {taken}"
+        );
+        // And a fresh load still sees the window as full.
+        assert_eq!(SpendLedger::load(f.path()).spent(), daily_max);
+    }
+
+    #[test]
+    fn ledger_prunes_entries_older_than_the_window() {
+        let f = TmpFile::new("prune");
+        let now = now_secs();
+        // Two stale entries (just outside the window) and one live one.
+        let body = format!(
+            "{}\n{}\n{}\n",
+            now - SPEND_WINDOW_SECS - 60,
+            now - SPEND_WINDOW_SECS - 1,
+            now - 10
+        );
+        fs::write(f.path(), body).unwrap();
+        let ledger = SpendLedger::load(f.path());
+        assert_eq!(ledger.spent(), 1, "stale entries must age out");
+        // load() rewrites the file, so the pruning is persisted (the ledger stays
+        // bounded instead of growing without limit).
+        let on_disk = fs::read_to_string(f.path()).unwrap();
+        assert_eq!(on_disk.lines().count(), 1, "got {on_disk:?}");
+    }
+
+    #[test]
+    fn missing_ledger_starts_empty_rather_than_blocking() {
+        let f = TmpFile::new("missing");
+        let ledger = SpendLedger::load(f.path());
+        assert_eq!(ledger.spent(), 0);
     }
 }
