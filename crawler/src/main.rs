@@ -385,6 +385,11 @@ const MAX_ATTEMPTS: u32 = 3;
 const MAX_PENDING_PER_AUTHOR: usize = 200;
 /// Bound on the whole pending queue.
 const MAX_PENDING_TOTAL: usize = 20_000;
+/// Reservation for locators listed in the operator's own sources file. Larger
+/// than one member's share, but finite: an unbounded exemption combined with
+/// being un-evictable would let a huge sources file fill the queue and shut out
+/// every other source.
+const MAX_PENDING_CURATED: usize = MAX_PENDING_TOTAL / 4;
 /// Author bucket for locators that came from a hub page rather than a person.
 const HUB_AUTHOR: &str = "@hub";
 /// Author bucket for locators listed directly in the operator's sources file.
@@ -429,6 +434,7 @@ struct Pending {
     dirty: bool,
     refused_author: usize,
     refused_total: usize,
+    evicted: usize,
 }
 
 impl Pending {
@@ -442,6 +448,7 @@ impl Pending {
             dirty: false,
             refused_author: 0,
             refused_total: 0,
+            evicted: 0,
         };
         let Ok(body) = fs::read_to_string(path) else {
             return p;
@@ -467,6 +474,18 @@ impl Pending {
             let kind = if kind == "site" { "site" } else { "external" };
             p.insert_raw(loc.to_string(), kind, author.to_string(), attempts);
         }
+        // The bounds are enforced on load as well as on insert. Otherwise an
+        // oversized file (a hand-edit, or a later lowering of the constants)
+        // would be carried whole, and since `add` evicts exactly one entry per
+        // insertion the queue would never trim back down.
+        while p.entries.len() > MAX_PENDING_TOTAL {
+            if !p.evict_one() {
+                break;
+            }
+        }
+        p.refused_author = 0;
+        p.refused_total = 0;
+        p.evicted = 0;
         p
     }
 
@@ -501,10 +520,16 @@ impl Pending {
             return false;
         }
         // One author's own quota. Refusing here only ever costs that author, so
-        // it cannot be used against anyone else.
-        if author != CURATED_AUTHOR
-            && self.per_author.get(author).copied().unwrap_or(0) >= MAX_PENDING_PER_AUTHOR
-        {
+        // it cannot be used against anyone else. Curated locators get a larger
+        // reservation rather than an unbounded exemption: an exemption would let
+        // a huge sources file fill the queue and, since curated entries were
+        // also un-evictable, re-create the absorbing state from the other side.
+        let own_cap = if author == CURATED_AUTHOR {
+            MAX_PENDING_CURATED
+        } else {
+            MAX_PENDING_PER_AUTHOR
+        };
+        if self.per_author.get(author).copied().unwrap_or(0) >= own_cap {
             self.refused_author += 1;
             return false;
         }
@@ -523,15 +548,30 @@ impl Pending {
     }
 
     /// Drop the newest entry belonging to whichever author holds the largest
-    /// backlog, so pressure falls on the biggest contributor to the overflow
-    /// and never on a curated locator.
+    /// backlog, so pressure falls on the biggest contributor to the overflow.
+    ///
+    /// The NEWEST entry is the right victim, not the oldest: a recently-posted
+    /// link is the one still present in the room, so if it is evicted the next
+    /// poll simply re-captures it. The oldest queued entry is the one most
+    /// likely to have already aged out of the room's history, making its
+    /// eviction permanent.
+    ///
+    /// Curated entries are the last resort rather than exempt — being
+    /// un-evictable is what would turn a full queue back into an absorbing
+    /// state — but they are only touched when nothing else remains.
     fn evict_one(&mut self) -> bool {
         let worst = self
             .per_author
             .iter()
-            .filter(|(a, _)| a.as_str() != CURATED_AUTHOR)
+            .filter(|(a, n)| a.as_str() != CURATED_AUTHOR && **n > 0)
             .max_by_key(|(_, n)| **n)
-            .map(|(a, _)| a.clone());
+            .map(|(a, _)| a.clone())
+            .or_else(|| {
+                self.per_author
+                    .iter()
+                    .find(|(_, n)| **n > 0)
+                    .map(|(a, _)| a.clone())
+            });
         let Some(worst) = worst else {
             return false;
         };
@@ -539,7 +579,7 @@ impl Pending {
             return false;
         };
         let (loc, _) = self.entries[pos].clone();
-        eprintln!("pending queue full — evicting {loc} (author {worst} has the largest backlog)");
+        self.evicted += 1;
         self.remove(&loc);
         true
     }
@@ -623,7 +663,12 @@ impl Pending {
     /// along and every author eventually leads.
     fn advance_cursor(&mut self, n: usize) {
         if n > 0 {
-            self.cursor = self.cursor.wrapping_add(n);
+            // +1 so the offset always MOVES relative to the bucket list. When a
+            // run happens to serve every author, advancing by exactly the bucket
+            // count leaves `cursor % len` unchanged, which freezes the rotation:
+            // nobody starves (everyone gets a first-round slot) but the
+            // second-and-later slots would go to the same authors forever.
+            self.cursor = self.cursor.wrapping_add(n).wrapping_add(1);
             self.dirty = true;
         }
     }
@@ -631,6 +676,12 @@ impl Pending {
     /// Report anything the queue turned away this run. A silent refusal is the
     /// same silent drop this type exists to prevent, so it must be visible.
     fn report_refusals(&self) {
+        if self.evicted > 0 {
+            eprintln!(
+                "warn: pending queue at its {MAX_PENDING_TOTAL}-entry limit — evicted {} entr(ies) from the largest backlogs to make room",
+                self.evicted
+            );
+        }
         if self.refused_author > 0 {
             eprintln!(
                 "warn: {} link(s) refused — an author is at their {MAX_PENDING_PER_AUTHOR}-entry queue limit",
@@ -1064,18 +1115,21 @@ fn render_page(node_bin: &str, renderer: &Path, url: &str) -> Result<Page> {
     // Bound the child's output: the renderer serializes the page's full DOM and
     // a hostile contract can inflate that without limit.
     //
-    // stderr goes to null, NOT to a pipe. A piped stream nobody drains is a
+    // stderr is INHERITED, never piped. A piped stream nobody drains is a
     // deadlock: chromium is noisy on stderr, and once it fills the ~64 KiB pipe
     // buffer the child blocks on write, stdout never reaches EOF, and the read
     // below never returns — hanging the daemon on exactly the hostile input the
-    // size cap exists to defend against. `Command::output()` avoided this by
-    // draining both streams concurrently.
+    // size cap exists to defend against. (`Command::output()` avoided this by
+    // draining both streams concurrently.) Inheriting keeps that closed, since
+    // it is not a pipe this process owns, while still surfacing the failures
+    // that never reach stdout — a bad --renderer path, a missing module, a node
+    // syntax error — which discarding stderr entirely would leave undiagnosable.
     let mut child = Command::new(node_bin)
         .arg(renderer)
         .arg(url)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
+        .stderr(std::process::Stdio::inherit())
         .spawn()
         .with_context(|| format!("running renderer {}", renderer.display()))?;
     let mut buf = Vec::new();
@@ -1096,8 +1150,8 @@ fn render_page(node_bin: &str, renderer: &Path, url: &str) -> Result<Page> {
     }
     let status = child.wait()?;
     if !status.success() {
-        // stderr is discarded (see above), so the renderer reports failures as
-        // JSON on stdout; the exit status is all we have here.
+        // render.js reports its own errors as JSON on stdout; node's own
+        // failures go to the inherited stderr above.
         bail!("renderer exited {status}");
     }
     let v: serde_json::Value =
@@ -1493,12 +1547,12 @@ fn normalize_href(href: &str) -> Option<(String, &'static str)> {
     if href.chars().any(|c| c.is_control()) {
         return None;
     }
-    // `..` in a `freenet:` path escapes the contract's own web root when the URL
-    // is normalized at fetch time, turning a posted link into an arbitrary GET
+    // A `..` path SEGMENT escapes the contract's own web root when the URL is
+    // normalized at fetch time, turning a posted link into an arbitrary GET
     // against the local node whose response body is then sent to the LLM. The
     // gateway path is not an SSRF target only because it is *our* node — that
     // holds only while the path stays inside the contract.
-    if href.split(['?', '#']).next().unwrap_or(href).contains("..") {
+    if has_dot_segment(href.split(['?', '#']).next().unwrap_or(href)) {
         return None;
     }
     let is_b58 = |c: char| matches!(c, '1'..='9' | 'A'..='H' | 'J'..='N' | 'P'..='Z' | 'a'..='k' | 'm'..='z');
@@ -1533,6 +1587,40 @@ fn normalize_href(href: &str) -> Option<(String, &'static str)> {
         ));
     }
     None
+}
+
+/// True if any path SEGMENT is `.` or `..` once percent-decoded.
+///
+/// Both halves matter. A substring test for ".." is too weak — `%2e%2e` is a
+/// dot segment to the WHATWG URL parser, so it normalizes past the web root
+/// exactly like a literal `..` — and too strong, since a legitimate path may
+/// contain a double dot without being a traversal (`/docs/1.2..1.3/`), which a
+/// substring test would silently refuse to index.
+fn has_dot_segment(path: &str) -> bool {
+    path.split('/').any(|seg| {
+        let decoded = percent_decode_ascii(seg);
+        decoded == "." || decoded == ".."
+    })
+}
+
+/// Decode `%XX` escapes, lowercased, for comparison purposes only. Invalid
+/// escapes are left as-is; this is a guard, not a general-purpose decoder.
+fn percent_decode_ascii(s: &str) -> String {
+    let b = s.as_bytes();
+    let mut out = String::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'%' && i + 2 < b.len() {
+            if let Ok(v) = u8::from_str_radix(&s[i + 1..i + 3], 16) {
+                out.push(v as char);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(b[i] as char);
+        i += 1;
+    }
+    out
 }
 
 /// True if a path points at a static asset (script/style/font/image/etc.) rather
@@ -2563,6 +2651,55 @@ mod tests {
         assert!(p.len() <= MAX_PENDING_TOTAL);
     }
 
+    /// A queue filled entirely by curated entries must still admit new links —
+    /// otherwise being un-evictable re-creates the absorbing state from the
+    /// other side.
+    #[test]
+    fn a_curated_only_full_queue_is_not_absorbing() {
+        let f = TmpFile::new("pending-curated-full");
+        let mut p = Pending::load(f.path());
+        for i in 0..MAX_PENDING_CURATED {
+            p.add(
+                &format!("https://c{i}.example/"),
+                "external",
+                CURATED_AUTHOR,
+            );
+        }
+        // Curated is capped by its reservation, not unbounded.
+        assert_eq!(p.len(), MAX_PENDING_CURATED);
+        assert!(p.len() < MAX_PENDING_TOTAL);
+        assert!(
+            p.add("https://room.example/", "external", "ALICE"),
+            "a curated backlog must not shut out room links"
+        );
+    }
+
+    /// When a run serves every author, advancing by exactly the bucket count
+    /// leaves the rotation fixed, so later-round slots go to the same authors
+    /// forever.
+    #[test]
+    fn cursor_moves_even_when_every_author_is_served() {
+        let f = TmpFile::new("pending-cursor-freeze");
+        let mut p = Pending::load(f.path());
+        let authors = 4;
+        for a in 0..authors {
+            for i in 0..3 {
+                p.add(
+                    &format!("https://h{a}-{i}.example/"),
+                    "external",
+                    &format!("AUTHOR{a}"),
+                );
+            }
+        }
+        let first = p.drain_order()[0].2.clone();
+        p.advance_cursor(authors); // every author served
+        let second = p.drain_order()[0].2.clone();
+        assert_ne!(
+            first, second,
+            "rotation must move even when all {authors} authors were served"
+        );
+    }
+
     #[test]
     fn curated_locators_bypass_the_per_author_bound() {
         let f = TmpFile::new("pending-curated");
@@ -2591,6 +2728,17 @@ mod tests {
         // …including when the traversal hides behind a query or fragment.
         assert!(normalize_href(&format!("freenet:{ID}/a/../../x?q=1")).is_none());
         assert!(normalize_href("https://example.com/a/../../etc/passwd").is_none());
+        // …and when it is percent-encoded. Verified against the url crate:
+        // `%2e%2e` normalizes to a `..` segment, so a literal-substring guard
+        // let this straight through to an arbitrary GET on the local node.
+        assert!(normalize_href(&format!("freenet:{ID}/%2e%2e/%2e%2e/v1/secret")).is_none());
+        assert!(normalize_href(&format!("freenet:{ID}/%2E%2E/v1/x")).is_none());
+        assert!(normalize_href(&format!("freenet:{ID}/%2e/x")).is_none());
+        // A double dot that is not its own segment is legitimate and must NOT
+        // be dropped — the url crate leaves it intact.
+        assert!(normalize_href(&format!("freenet:{ID}/docs/1.2..1.3/")).is_some());
+        assert!(normalize_href("https://example.com/v/1.2..1.3/notes").is_some());
+        assert!(normalize_href("https://example.com/a..b").is_some());
         // Ordinary locators still pass.
         assert!(normalize_href(&format!("freenet:{ID}/about")).is_some());
         assert!(normalize_href("https://example.com/a/b").is_some());
