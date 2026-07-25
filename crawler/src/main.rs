@@ -332,10 +332,16 @@ impl<'a> Budget<'a> {
         if *used >= self.per_host_max {
             return Err(Denied::HostShare);
         }
+        // Record BEFORE committing. If the append fails, the attempt is not on
+        // disk, so counting it in memory would leak one billed attempt per run
+        // past the cap for as long as the ledger stays unwritable.
+        self.ledger.record();
+        if self.ledger.broken {
+            return Err(Denied::Exhausted);
+        }
         *used += 1;
         self.remaining -= 1;
         self.attempts += 1;
-        self.ledger.record();
         Ok(())
     }
 }
@@ -417,7 +423,12 @@ struct Pending {
     entries: Vec<(String, PendingEntry)>,
     index: HashSet<String>,
     per_author: HashMap<String, usize>,
+    /// Rotating start offset for [`Pending::drain_order`], persisted so fairness
+    /// holds ACROSS runs and not merely within one.
+    cursor: usize,
     dirty: bool,
+    refused_author: usize,
+    refused_total: usize,
 }
 
 impl Pending {
@@ -427,12 +438,19 @@ impl Pending {
             entries: Vec::new(),
             index: HashSet::new(),
             per_author: HashMap::new(),
+            cursor: 0,
             dirty: false,
+            refused_author: 0,
+            refused_total: 0,
         };
         let Ok(body) = fs::read_to_string(path) else {
             return p;
         };
         for line in body.lines() {
+            if let Some(n) = line.strip_prefix("#cursor\t") {
+                p.cursor = n.trim().parse().unwrap_or(0);
+                continue;
+            }
             // attempts \t kind \t author \t locator  (locator last: it may not
             // contain a tab, and this keeps parsing unambiguous)
             let mut parts = line.splitn(4, '\t');
@@ -482,14 +500,47 @@ impl Pending {
         if self.index.contains(loc) {
             return false;
         }
-        if self.entries.len() >= MAX_PENDING_TOTAL {
+        // One author's own quota. Refusing here only ever costs that author, so
+        // it cannot be used against anyone else.
+        if author != CURATED_AUTHOR
+            && self.per_author.get(author).copied().unwrap_or(0) >= MAX_PENDING_PER_AUTHOR
+        {
+            self.refused_author += 1;
             return false;
         }
-        if self.per_author.get(author).copied().unwrap_or(0) >= MAX_PENDING_PER_AUTHOR {
+        // The global bound EVICTS rather than refuses. Refusing would make a
+        // full queue an absorbing state: entries only leave by being described,
+        // which is capped at --daily-max, so a queue filled by sybils would shut
+        // out every source — including the operator's own — for months, silently.
+        // Evicting the largest backlog instead means a flood costs the flooder.
+        if self.entries.len() >= MAX_PENDING_TOTAL && !self.evict_one() {
+            self.refused_total += 1;
             return false;
         }
         self.insert_raw(loc.to_string(), kind, author.to_string(), 0);
         self.dirty = true;
+        true
+    }
+
+    /// Drop the newest entry belonging to whichever author holds the largest
+    /// backlog, so pressure falls on the biggest contributor to the overflow
+    /// and never on a curated locator.
+    fn evict_one(&mut self) -> bool {
+        let worst = self
+            .per_author
+            .iter()
+            .filter(|(a, _)| a.as_str() != CURATED_AUTHOR)
+            .max_by_key(|(_, n)| **n)
+            .map(|(a, _)| a.clone());
+        let Some(worst) = worst else {
+            return false;
+        };
+        let Some(pos) = self.entries.iter().rposition(|(_, e)| e.author == worst) else {
+            return false;
+        };
+        let (loc, _) = self.entries[pos].clone();
+        eprintln!("pending queue full — evicting {loc} (author {worst} has the largest backlog)");
+        self.remove(&loc);
         true
     }
 
@@ -510,10 +561,10 @@ impl Pending {
     /// `MAX_ATTEMPTS` and should be given up on (and marked seen, so it is never
     /// reconsidered).
     fn record_failure(&mut self, loc: &str) -> bool {
-        self.dirty = true;
         let Some((_, e)) = self.entries.iter_mut().find(|(l, _)| l == loc) else {
             return true;
         };
+        self.dirty = true;
         e.attempts += 1;
         if e.attempts >= MAX_ATTEMPTS {
             self.remove(loc);
@@ -542,6 +593,14 @@ impl Pending {
                 .1
                 .push((loc.clone(), e.kind, e.author.clone()));
         }
+        // Rotate which author leads. Without this the bucket order is stable
+        // across runs (it follows discovery order, which is persisted), so with
+        // more authors holding backlog than the run cap allows, the same leading
+        // authors would win every run and the tail would never be served at all.
+        if !by_author.is_empty() {
+            let offset = self.cursor % by_author.len();
+            by_author.rotate_left(offset);
+        }
         let mut out = Vec::with_capacity(self.entries.len());
         let mut round = 0;
         loop {
@@ -560,16 +619,44 @@ impl Pending {
         out
     }
 
+    /// Move the rotation on by `n` authors, so the next run starts further
+    /// along and every author eventually leads.
+    fn advance_cursor(&mut self, n: usize) {
+        if n > 0 {
+            self.cursor = self.cursor.wrapping_add(n);
+            self.dirty = true;
+        }
+    }
+
+    /// Report anything the queue turned away this run. A silent refusal is the
+    /// same silent drop this type exists to prevent, so it must be visible.
+    fn report_refusals(&self) {
+        if self.refused_author > 0 {
+            eprintln!(
+                "warn: {} link(s) refused — an author is at their {MAX_PENDING_PER_AUTHOR}-entry queue limit",
+                self.refused_author
+            );
+        }
+        if self.refused_total > 0 {
+            eprintln!(
+                "warn: {} link(s) refused — pending queue is at its {MAX_PENDING_TOTAL}-entry limit",
+                self.refused_total
+            );
+        }
+    }
+
     /// Persist the queue if it changed. Written atomically via a uniquely-named
     /// sibling so a crash mid-write cannot truncate the backlog.
     fn save(&mut self) {
         if !self.dirty {
             return;
         }
-        let body: String = self
-            .entries
-            .iter()
-            .map(|(loc, e)| format!("{}\t{}\t{}\t{}\n", e.attempts, e.kind, e.author, loc))
+        let body: String = std::iter::once(format!("#cursor\t{}\n", self.cursor))
+            .chain(
+                self.entries
+                    .iter()
+                    .map(|(loc, e)| format!("{}\t{}\t{}\t{}\n", e.attempts, e.kind, e.author, loc)),
+            )
             .collect();
         let tmp = sibling_tmp(&self.path);
         if fs::write(&tmp, &body).is_ok() && fs::rename(&tmp, &self.path).is_ok() {
@@ -654,7 +741,10 @@ fn run_once(
         .ok()
         .filter(|k| !k.is_empty());
     if key.is_none() {
-        eprintln!("OPENAI_API_KEY not set — using title/meta fallback descriptions");
+        eprintln!(
+            "OPENAI_API_KEY not set — only curated sources will be indexed \
+             (untrusted discoveries stay queued rather than being described unrated)"
+        );
     }
     // OpenAI model for `describe_llm`; overridable via `ATLAS_LLM_MODEL` so a
     // future deprecation is a config change rather than a code change. See
@@ -687,10 +777,18 @@ fn run_once(
     // per-run cap, the persisted rolling-24h cap, and the per-host share.
     let mut ledger = SpendLedger::load(spend_path);
     let spent_before = ledger.spent();
+    let ledger_broken = ledger.broken;
     let mut budget = Budget::new(&mut ledger, cli.max, cli.daily_max, cli.per_host_max);
     if budget.exhausted() {
+        let why = if ledger_broken {
+            "spend ledger unusable"
+        } else if cli.max == 0 {
+            "--max is 0"
+        } else {
+            "daily cap reached"
+        };
         eprintln!(
-            "daily cap reached ({spent_before}/{} in last 24h) — polling only, no new descriptions",
+            "{why} ({spent_before}/{} in last 24h) — discovering only, no new descriptions",
             cli.daily_max
         );
     }
@@ -742,18 +840,37 @@ fn run_once(
         } else {
             // A curated locator from the operator's own file.
             trusted.insert(line.to_string());
-            if !seen.contains(line) && pending.add(line, "external", CURATED_AUTHOR) {
+            // A curated line may be `freenet:<id>` as well as https.
+            let kind = normalize_href(line).map(|(_, k)| k).unwrap_or("external");
+            if !seen.contains(line) && pending.add(line, kind, CURATED_AUTHOR) {
                 captured += 1;
             }
         }
     }
 
+    // Persist captures BEFORE spending a single token on them. Phase 2 runs for
+    // minutes (network fetches, LLM round-trips, subprocess calls); a SIGTERM
+    // from a restart anywhere in that window would otherwise discard everything
+    // just discovered — and if the room evicted those messages meanwhile, they
+    // are gone for good. "Safe the moment we see it" has to mean written down
+    // the moment we see it.
+    pending.save();
+
     // ---- Phase 2: description. Billed, rationed, and fair. ----
     let mut added = 0usize;
     let mut author_used: HashMap<String, usize> = HashMap::new();
+    let mut authors_served: HashSet<String> = HashSet::new();
     for (loc, kind, author) in pending.drain_order() {
         if seen.contains(&loc) {
             pending.remove(&loc);
+            continue;
+        }
+        let is_trusted = trusted.contains(&loc);
+        // "We have no classifier" is a configuration state, not a judgement
+        // about this link. Charging budget and marking it seen would burn the
+        // whole untrusted backlog permanently the first time the key is absent,
+        // and it would never be reconsidered once one is configured.
+        if key.is_none() && !is_trusted {
             continue;
         }
         let used = author_used.entry(author.clone()).or_insert(0);
@@ -766,7 +883,7 @@ fn run_once(
             Err(Denied::Exhausted) => break,
         }
         *used += 1;
-        let is_trusted = trusted.contains(&loc);
+        authors_served.insert(author.clone());
         match index_locator(
             cli,
             &client,
@@ -801,6 +918,8 @@ fn run_once(
             }
         }
     }
+    pending.advance_cursor(authors_served.len());
+    pending.report_refusals();
     pending.save();
 
     let attempts = budget.attempts;
@@ -942,43 +1061,47 @@ fn get_page(cli: &Cli, client: &reqwest::blocking::Client, gw: &str, loc: &str) 
 /// Drive the headless render helper for one URL, returning the rendered app
 /// frame's HTML and visible text. The page content is untrusted data.
 fn render_page(node_bin: &str, renderer: &Path, url: &str) -> Result<Page> {
-    // Bound the child's output. The renderer serializes the page's full DOM,
-    // and a hostile contract can inflate that without limit, so reading it
-    // unbounded would let one link OOM the crawler. MAX_FETCH_BYTES guards only
-    // the static path.
+    // Bound the child's output: the renderer serializes the page's full DOM and
+    // a hostile contract can inflate that without limit.
+    //
+    // stderr goes to null, NOT to a pipe. A piped stream nobody drains is a
+    // deadlock: chromium is noisy on stderr, and once it fills the ~64 KiB pipe
+    // buffer the child blocks on write, stdout never reaches EOF, and the read
+    // below never returns — hanging the daemon on exactly the hostile input the
+    // size cap exists to defend against. `Command::output()` avoided this by
+    // draining both streams concurrently.
     let mut child = Command::new(node_bin)
         .arg(renderer)
         .arg(url)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
         .spawn()
         .with_context(|| format!("running renderer {}", renderer.display()))?;
     let mut buf = Vec::new();
-    if let Some(so) = child.stdout.take() {
+    let read = match child.stdout.take() {
         // +1 so an output that exactly fills the cap is still detectable as
         // over-long rather than silently truncated into invalid JSON.
-        so.take(RENDER_MAX_BYTES as u64 + 1).read_to_end(&mut buf)?;
-    }
-    let status = child.wait()?;
-    if buf.len() > RENDER_MAX_BYTES {
+        Some(so) => so.take(RENDER_MAX_BYTES as u64 + 1).read_to_end(&mut buf),
+        None => Ok(0),
+    };
+    // Kill BEFORE waiting. On the over-cap path the child is still writing into
+    // a pipe we have stopped reading, so waiting first would block forever; and
+    // on a read error we must not leave a chromium process behind.
+    if read.is_err() || buf.len() > RENDER_MAX_BYTES {
         let _ = child.kill();
+        let _ = child.wait();
+        read?;
         bail!("renderer output exceeded {RENDER_MAX_BYTES} bytes");
     }
-    let out = std::process::Output {
-        status,
-        stdout: buf,
-        stderr: Vec::new(),
-    };
-    if !out.status.success() {
-        bail!(
-            "renderer exited {}: {}",
-            out.status,
-            String::from_utf8_lossy(&out.stderr).trim()
-        );
+    let status = child.wait()?;
+    if !status.success() {
+        // stderr is discarded (see above), so the renderer reports failures as
+        // JSON on stdout; the exit status is all we have here.
+        bail!("renderer exited {status}");
     }
     let v: serde_json::Value =
-        serde_json::from_slice(&out.stdout).with_context(|| "renderer output not json")?;
+        serde_json::from_slice(&buf).with_context(|| "renderer output not json")?;
     if !v["ok"].as_bool().unwrap_or(false) {
         bail!(
             "renderer error: {}",
@@ -1163,6 +1286,16 @@ async fn fetch_room_state(
         if room_state.configuration.verify_signature(owner_vk).is_err() {
             continue;
         }
+        // Sort locally rather than trusting the order the state arrived in.
+        // Per-author attribution and the queue's discovery order both depend on
+        // this ordering, so it should be a local guarantee, not an assumption
+        // about a remote peer. Matches the contract's own comparator.
+        room_state.recent_messages.messages.sort_by(|a, b| {
+            a.message
+                .time
+                .cmp(&b.message.time)
+                .then_with(|| a.id().cmp(&b.id()))
+        });
         room_state.recent_messages.rebuild_actions_state();
         return Ok(Some(room_state));
     }
@@ -1352,6 +1485,20 @@ const MAX_LOCATOR_LEN: usize = 512;
 
 fn normalize_href(href: &str) -> Option<(String, &'static str)> {
     if href.len() > MAX_LOCATOR_LEN {
+        return None;
+    }
+    // Control characters (a newline in a hub's href, say) would inject an extra
+    // row into the tab-separated pending file, letting an attacker mint author
+    // buckets and set the retry counter. They cannot appear in a real locator.
+    if href.chars().any(|c| c.is_control()) {
+        return None;
+    }
+    // `..` in a `freenet:` path escapes the contract's own web root when the URL
+    // is normalized at fetch time, turning a posted link into an arbitrary GET
+    // against the local node whose response body is then sent to the LLM. The
+    // gateway path is not an SSRF target only because it is *our* node — that
+    // holds only while the path stays inside the contract.
+    if href.split(['?', '#']).next().unwrap_or(href).contains("..") {
         return None;
     }
     let is_b58 = |c: char| matches!(c, '1'..='9' | 'A'..='H' | 'J'..='N' | 'P'..='Z' | 'a'..='k' | 'm'..='z');
@@ -1563,24 +1710,32 @@ fn describe_llm(
         .unwrap_or_default();
     // Default to "nsfw" (not indexed) if the model omits/garbles the rating, so a
     // missing classification fails safe rather than indexing unrated content.
+    // An explicit rating is a judgement we act on permanently. An absent or
+    // unrecognised one means we did NOT get a judgement — treat that as a
+    // failure to retry, not as "rated unsafe", or a model-side response change
+    // would silently discard every link it saw.
     let rating = match parsed["rating"]
         .as_str()
         .unwrap_or("")
         .trim()
-        .to_lowercase()
+        .to_ascii_lowercase()
         .as_str()
     {
         "ok" => "ok",
         "illegal" => "illegal",
-        _ => "nsfw",
+        "nsfw" => "nsfw",
+        other => bail!("llm returned an unrecognised rating {other:?}"),
     }
     .to_string();
     if title.is_empty() {
         bail!("llm returned empty title");
     }
     Ok(Described {
-        title,
-        snippet,
+        // Bound these the same way the fallback is bounded: the index contract
+        // enforces byte limits and rejects the whole entry if they are exceeded,
+        // and an over-long title is exactly what a prompt injection produces.
+        title: trim_len(&title, 200),
+        snippet: trim_len(&snippet, 480),
         tags,
         rating,
     })
@@ -1663,7 +1818,13 @@ fn load_seen(path: &Path) -> HashSet<String> {
 }
 
 fn append_seen(path: &Path, url: &str) {
-    let _ = append_line(path, url);
+    // Not swallowed: the seen file is what stops a locator being described
+    // again. If it cannot be written, the locator is dropped from the pending
+    // queue anyway (that removal IS persisted), so it will be re-discovered and
+    // re-billed on every future run.
+    if let Err(e) = append_line(path, url) {
+        eprintln!("error: could not record {url} as seen ({e:#}) — it may be described again");
+    }
 }
 
 /// Append one line to a file, creating it (and its parent) if needed.
@@ -2326,6 +2487,113 @@ mod tests {
         assert_eq!(p.len(), MAX_PENDING_PER_AUTHOR);
         // A different author is unaffected by the spammer hitting their bound.
         assert!(p.add("https://good.example/", "external", "ALICE"));
+    }
+
+    /// Round-robin within one run is not enough: bucket order follows discovery
+    /// order, which is persisted, so without a rotating cursor the same leading
+    /// authors win every run and the tail is never served at all.
+    #[test]
+    fn drain_rotation_serves_the_tail_across_runs() {
+        let f = TmpFile::new("pending-rotate");
+        let authors = 10;
+        {
+            let mut p = Pending::load(f.path());
+            for a in 0..authors {
+                for i in 0..3 {
+                    p.add(
+                        &format!("https://h{a}-{i}.example/"),
+                        "external",
+                        &format!("AUTHOR{a}"),
+                    );
+                }
+            }
+            p.save();
+        }
+        // Each "run" can only afford 3 authors' worth of leading slots.
+        let budget_per_run = 3;
+        let mut ever_served: HashSet<String> = HashSet::new();
+        for _ in 0..5 {
+            let mut p = Pending::load(f.path());
+            let order = p.drain_order();
+            let mut served = HashSet::new();
+            for (_, _, author) in order.into_iter().take(budget_per_run) {
+                served.insert(author.clone());
+                ever_served.insert(author);
+            }
+            p.advance_cursor(served.len());
+            p.save();
+        }
+        assert_eq!(
+            ever_served.len(),
+            authors,
+            "every author must eventually lead; only served {:?}",
+            ever_served.len()
+        );
+    }
+
+    /// A full queue must not become an absorbing state that refuses everyone,
+    /// including the operator's own curated sources.
+    #[test]
+    fn full_queue_evicts_the_largest_backlog_instead_of_locking_out() {
+        let f = TmpFile::new("pending-evict");
+        let mut p = Pending::load(f.path());
+        // Fill the queue right up to the global bound with sybil backlog.
+        let per = MAX_PENDING_PER_AUTHOR;
+        let authors = MAX_PENDING_TOTAL / per;
+        for a in 0..authors {
+            for i in 0..per {
+                p.add(
+                    &format!("https://s{a}-{i}.example/"),
+                    "external",
+                    &format!("SYBIL{a}"),
+                );
+            }
+        }
+        assert_eq!(p.len(), MAX_PENDING_TOTAL);
+        // A brand-new author still gets in…
+        assert!(
+            p.add("https://fresh.example/", "external", "ALICE"),
+            "a full queue must not lock out new links"
+        );
+        // …and so does the operator's own curated source.
+        assert!(
+            p.add("https://curated.example/", "external", CURATED_AUTHOR),
+            "curated sources must never be refused"
+        );
+        assert!(p.len() <= MAX_PENDING_TOTAL);
+    }
+
+    #[test]
+    fn curated_locators_bypass_the_per_author_bound() {
+        let f = TmpFile::new("pending-curated");
+        let mut p = Pending::load(f.path());
+        for i in 0..MAX_PENDING_PER_AUTHOR + 10 {
+            assert!(
+                p.add(
+                    &format!("https://c{i}.example/"),
+                    "external",
+                    CURATED_AUTHOR
+                ),
+                "curated entry {i} refused"
+            );
+        }
+    }
+
+    #[test]
+    fn hostile_locators_are_rejected_before_they_reach_the_queue() {
+        // A newline would inject a second row into the tab-separated pending
+        // file, minting an arbitrary author bucket and retry count.
+        assert!(normalize_href("https://evil.example/\n0\tsite\tVICTIM\thttps://x/").is_none());
+        assert!(normalize_href("https://evil.example/\r\nx").is_none());
+        // `..` escapes the contract web root at fetch time, turning a posted
+        // link into an arbitrary GET against the local node.
+        assert!(normalize_href(&format!("freenet:{ID}/../../../v1/secret")).is_none());
+        // …including when the traversal hides behind a query or fragment.
+        assert!(normalize_href(&format!("freenet:{ID}/a/../../x?q=1")).is_none());
+        assert!(normalize_href("https://example.com/a/../../etc/passwd").is_none());
+        // Ordinary locators still pass.
+        assert!(normalize_href(&format!("freenet:{ID}/about")).is_some());
+        assert!(normalize_href("https://example.com/a/b").is_some());
     }
 
     #[test]
