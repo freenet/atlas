@@ -1597,30 +1597,42 @@ fn normalize_href(href: &str) -> Option<(String, &'static str)> {
 /// contain a double dot without being a traversal (`/docs/1.2..1.3/`), which a
 /// substring test would silently refuse to index.
 fn has_dot_segment(path: &str) -> bool {
-    path.split('/').any(|seg| {
-        let decoded = percent_decode_ascii(seg);
-        decoded == "." || decoded == ".."
-    })
+    path.split('/')
+        .any(|seg| matches!(percent_decode_ascii(seg).as_slice(), b"." | b".."))
 }
 
-/// Decode `%XX` escapes, lowercased, for comparison purposes only. Invalid
+/// Decode `%XX` escapes (either case) for comparison purposes only. Invalid
 /// escapes are left as-is; this is a guard, not a general-purpose decoder.
-fn percent_decode_ascii(s: &str) -> String {
+///
+/// Works on bytes end to end and never slices the `&str`. Indexing a `&str` by
+/// the byte offsets of a `%XX` triple panics when the `%` is followed by a
+/// multi-byte character — `%aé` puts the end of the triple inside `é` — and the
+/// input here is raw attacker-supplied href text, so that is a remote crash.
+fn percent_decode_ascii(s: &str) -> Vec<u8> {
     let b = s.as_bytes();
-    let mut out = String::with_capacity(b.len());
+    let mut out = Vec::with_capacity(b.len());
     let mut i = 0;
     while i < b.len() {
         if b[i] == b'%' && i + 2 < b.len() {
-            if let Ok(v) = u8::from_str_radix(&s[i + 1..i + 3], 16) {
-                out.push(v as char);
+            if let (Some(hi), Some(lo)) = (hex_val(b[i + 1]), hex_val(b[i + 2])) {
+                out.push(hi * 16 + lo);
                 i += 3;
                 continue;
             }
         }
-        out.push(b[i] as char);
+        out.push(b[i]);
         i += 1;
     }
     out
+}
+
+fn hex_val(c: u8) -> Option<u8> {
+    match c {
+        b'0'..=b'9' => Some(c - b'0'),
+        b'a'..=b'f' => Some(c - b'a' + 10),
+        b'A'..=b'F' => Some(c - b'A' + 10),
+        _ => None,
+    }
 }
 
 /// True if a path points at a static asset (script/style/font/image/etc.) rather
@@ -2742,6 +2754,41 @@ mod tests {
         // Ordinary locators still pass.
         assert!(normalize_href(&format!("freenet:{ID}/about")).is_some());
         assert!(normalize_href("https://example.com/a/b").is_some());
+    }
+
+    #[test]
+    fn percent_decoding_a_hostile_locator_does_not_panic() {
+        // The decoder reads a `%XX` triple by byte offset. Slicing the `&str`
+        // there panics whenever the `%` is followed by a multi-byte character,
+        // because the end of the triple lands inside it — one chat message
+        // containing `%aé` would have killed the daemon. Every one of these is
+        // a string the room can post, so none may panic.
+        for hostile in [
+            "%aé",
+            "%é",
+            "é%a",
+            "%2é",
+            "%",
+            "%2",
+            "%%",
+            "%zz",
+            "%2z",
+            "…%a…",
+            "https://example.com/%aé/x",
+        ] {
+            let _ = has_dot_segment(hostile);
+            let _ = normalize_href(hostile);
+            let _ = normalize_href(&format!("freenet:{ID}/{hostile}"));
+        }
+        // The decoder still decodes, having stopped slicing to do it.
+        assert_eq!(percent_decode_ascii("%2e%2E"), b"..");
+        assert_eq!(percent_decode_ascii("%zz"), b"%zz");
+        // A truncated escape at the very end is left alone, not read past.
+        assert_eq!(percent_decode_ascii("a%2"), b"a%2");
+        assert_eq!(percent_decode_ascii("a%"), b"a%");
+        // Double-encoding decodes one level only, so `%252e` is not a dot
+        // segment — correct, since the url crate does not collapse it either.
+        assert!(!has_dot_segment("/a/%252e%252e/b"));
     }
 
     #[test]
