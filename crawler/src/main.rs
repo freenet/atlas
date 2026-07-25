@@ -453,6 +453,7 @@ impl Pending {
         let Ok(body) = fs::read_to_string(path) else {
             return p;
         };
+        let mut dropped = 0usize;
         for line in body.lines() {
             if let Some(n) = line.strip_prefix("#cursor\t") {
                 p.cursor = n.trim().parse().unwrap_or(0);
@@ -461,7 +462,7 @@ impl Pending {
             // attempts \t kind \t author \t locator  (locator last: it may not
             // contain a tab, and this keeps parsing unambiguous)
             let mut parts = line.splitn(4, '\t');
-            let (Some(attempts), Some(kind), Some(author), Some(loc)) =
+            let (Some(attempts), Some(_kind), Some(author), Some(loc)) =
                 (parts.next(), parts.next(), parts.next(), parts.next())
             else {
                 continue;
@@ -471,21 +472,46 @@ impl Pending {
                 continue;
             }
             let attempts: u32 = attempts.trim().parse().unwrap_or(0);
-            let kind = if kind == "site" { "site" } else { "external" };
+            // Re-validate on the way in, and take `kind` from the re-validation
+            // rather than from the file. The queue is persistent and entries
+            // never expire, so a locator captured by an EARLIER build — under
+            // whatever guards that build happened to have — would otherwise be
+            // fetched by this one without ever being re-checked. A guard that
+            // runs only at capture time is not a guard for a durable queue.
+            // Anything that no longer round-trips through `normalize_href` is
+            // dropped rather than carried.
+            let Some((canon, kind)) = normalize_href(loc) else {
+                dropped += 1;
+                continue;
+            };
+            if canon != loc {
+                dropped += 1;
+                continue;
+            }
             p.insert_raw(loc.to_string(), kind, author.to_string(), attempts);
         }
         // The bounds are enforced on load as well as on insert. Otherwise an
         // oversized file (a hand-edit, or a later lowering of the constants)
         // would be carried whole, and since `add` evicts exactly one entry per
         // insertion the queue would never trim back down.
+        let over = p.entries.len().saturating_sub(MAX_PENDING_TOTAL);
         while p.entries.len() > MAX_PENDING_TOTAL {
             if !p.evict_one() {
                 break;
             }
         }
+        // Dropping entries on load is still dropping links, so say so. Silence
+        // here would be the same silent loss the queue exists to prevent.
+        if dropped > 0 {
+            eprintln!("warn: dropped {dropped} queued locator(s) that no longer validate");
+        }
+        if over > 0 {
+            eprintln!("warn: pending file held {over} entr(ies) over the {MAX_PENDING_TOTAL} limit — trimmed on load");
+        }
         p.refused_author = 0;
         p.refused_total = 0;
         p.evicted = 0;
+        p.dirty = dropped > 0 || over > 0;
         p
     }
 
@@ -659,18 +685,33 @@ impl Pending {
         out
     }
 
-    /// Move the rotation on by `n` authors, so the next run starts further
-    /// along and every author eventually leads.
+    /// Move the rotation on by `n` served authors, so the next run starts at the
+    /// first author this run did NOT reach and every author eventually leads.
+    ///
+    /// Advancing by exactly `n` is what makes that true: `drain_order` rotates
+    /// left by `cursor % buckets`, so a run that serves `n` authors starting at
+    /// `offset` leaves `offset + n` as the first unserved one. Adding an extra
+    /// +1 unconditionally would step straight over that author — and since a
+    /// budget-limited run typically stops one short, `n == buckets - 1` is the
+    /// common case, where `+1` makes the offset land back where it started and
+    /// starves that author every single run.
+    ///
+    /// The one case that does need the extra step is `n == buckets` (the run
+    /// served everyone): there `offset + n` is `offset` again, which freezes the
+    /// rotation. Nobody starves, but the second-and-later slots go to the same
+    /// authors forever, so nudge past it.
     fn advance_cursor(&mut self, n: usize) {
-        if n > 0 {
-            // +1 so the offset always MOVES relative to the bucket list. When a
-            // run happens to serve every author, advancing by exactly the bucket
-            // count leaves `cursor % len` unchanged, which freezes the rotation:
-            // nobody starves (everyone gets a first-round slot) but the
-            // second-and-later slots would go to the same authors forever.
-            self.cursor = self.cursor.wrapping_add(n).wrapping_add(1);
-            self.dirty = true;
+        if n == 0 {
+            return;
         }
+        let buckets = self.per_author.values().filter(|n| **n > 0).count();
+        let step = if buckets > 0 && n.is_multiple_of(buckets) {
+            n + 1
+        } else {
+            n
+        };
+        self.cursor = self.cursor.wrapping_add(step);
+        self.dirty = true;
     }
 
     /// Report anything the queue turned away this run. A silent refusal is the
@@ -1073,6 +1114,30 @@ fn index_page(
     Ok(true)
 }
 
+/// Build a gateway URL for a contract-relative path, refusing it if the PARSED
+/// result escapes that contract's web root.
+///
+/// This is the backstop, and the only check that sees what will actually be
+/// fetched. Every guard applied to the locator *string* is a prediction of what
+/// the URL parser will do with it, and two separate holes came from that
+/// prediction being wrong: `%2e%2e` (a dot segment to the parser, not to a
+/// substring test) and a `..` sitting in a query the guard did not read. The
+/// locator-level guard stays, because refusing early keeps junk out of the
+/// queue and the index, but correctness rests here — parse first, then compare
+/// the path the node will actually receive.
+fn gateway_url(gw: &str, id: &str, rest: &str) -> Result<String> {
+    let raw = format!("{gw}/v1/contract/web/{id}{rest}");
+    let parsed = url::Url::parse(&raw).with_context(|| format!("bad gateway url: {raw}"))?;
+    let root = format!("/v1/contract/web/{id}");
+    if parsed.path() != root && !parsed.path().starts_with(&format!("{root}/")) {
+        anyhow::bail!(
+            "refusing to fetch: {} escapes the contract web root {root}",
+            parsed.path()
+        );
+    }
+    Ok(raw)
+}
+
 /// Get a target's content for analysis. `https` targets are SSRF-checked and
 /// fetched statically. `freenet:` targets are loaded from our own local gateway:
 /// if a renderer is configured we drive a headless browser (so client-side
@@ -1086,7 +1151,7 @@ fn get_page(cli: &Cli, client: &reqwest::blocking::Client, gw: &str, loc: &str) 
             // Render the gateway "shell" URL (no __sandbox query): the shell
             // creates the sandboxed app iframe, which the renderer reads back.
             let path = if path.is_empty() { "/" } else { path };
-            let shell_url = format!("{gw}/v1/contract/web/{id}{path}");
+            let shell_url = gateway_url(gw, id, path)?;
             match render_page(&cli.node_bin, renderer, &shell_url) {
                 Ok(p) => return Ok(p),
                 Err(e) => {
@@ -1097,7 +1162,7 @@ fn get_page(cli: &Cli, client: &reqwest::blocking::Client, gw: &str, loc: &str) 
         let sep = if path.contains('?') { '&' } else { '?' };
         let html = fetch(
             client,
-            &format!("{gw}/v1/contract/web/{id}{path}{sep}__sandbox=1"),
+            &gateway_url(gw, id, &format!("{path}{sep}__sandbox=1"))?,
         )?;
         let text = visible_text(&html);
         Ok(Page { html, text })
@@ -1552,31 +1617,64 @@ fn normalize_href(href: &str) -> Option<(String, &'static str)> {
     // against the local node whose response body is then sent to the LLM. The
     // gateway path is not an SSRF target only because it is *our* node — that
     // holds only while the path stays inside the contract.
-    if has_dot_segment(href.split(['?', '#']).next().unwrap_or(href)) {
+    //
+    // Checked across the WHOLE href, query and fragment included. Guarding only
+    // the part before `?`/`#` was a hole, because the gateway branch below used
+    // to search the whole href for its prefix: the guard saw
+    // `https://ok.example/` while the locator was mined out of
+    // `?u=/v1/contract/web/<id>/../../../../v1/secret` further along, so a
+    // traversing locator was built from a string the guard had already passed.
+    // A `..` inside a query is not worth indexing anyway, so rejecting the
+    // whole href costs nothing and removes the mismatch rather than patching it.
+    if has_dot_segment(href) {
         return None;
     }
+    // The gateway prefix is looked for in the PATH only. Searching the whole
+    // href is what let a `/v1/contract/web/…` sitting in a query or fragment be
+    // mined into a locator that had nothing to do with the link as written.
+    let path_part = href.split(['?', '#']).next().unwrap_or(href);
+    // A `#…` on a freenet locator is the app's own client-side ROUTE, not a
+    // document anchor — the Delta hub is itself configured as
+    // `freenet:<id>/#AmcVD92D3U/2/links`. So it is carried into the locator, or
+    // every page of an SPA would collapse onto its root and be indexed once.
+    // It is only ever appended to a path found above; it is never searched for
+    // a gateway prefix, which is the distinction that closes the hole.
+    let fragment = href.split_once('#').map(|(_, f)| f).unwrap_or("");
+    let frag = |p: &str| {
+        if fragment.is_empty() {
+            p.to_string()
+        } else {
+            format!("{p}#{fragment}")
+        }
+    };
     let is_b58 = |c: char| matches!(c, '1'..='9' | 'A'..='H' | 'J'..='N' | 'P'..='Z' | 'a'..='k' | 'm'..='z');
     // Gateway web URL (absolute or relative path) -> freenet:<id><path>
-    if let Some(pos) = href.find("/v1/contract/web/") {
-        let after = &href[pos + "/v1/contract/web/".len()..];
+    if let Some(pos) = path_part.find("/v1/contract/web/") {
+        let after = &path_part[pos + "/v1/contract/web/".len()..];
         let id_end = after.find(|c: char| !is_b58(c)).unwrap_or(after.len());
         if matches!(id_end, 43 | 44) {
-            let path = after[id_end..].split('?').next().unwrap_or("");
+            let path = &after[id_end..];
             if is_asset_path(path) {
                 return None;
             }
-            return Some((format!("freenet:{}{}", &after[..id_end], path), "site"));
+            return Some((
+                frag(&format!("freenet:{}{}", &after[..id_end], path)),
+                "site",
+            ));
         }
         return None;
     }
-    if let Some(rest) = href.strip_prefix("freenet:") {
+    if let Some(rest) = path_part.strip_prefix("freenet:") {
         let id_end = rest.find(|c: char| !is_b58(c)).unwrap_or(rest.len());
         if matches!(id_end, 43 | 44) {
-            let path = rest[id_end..].split('?').next().unwrap_or("");
+            let path = &rest[id_end..];
             if is_asset_path(path) {
                 return None;
             }
-            return Some((format!("freenet:{}{}", &rest[..id_end], path), "site"));
+            return Some((
+                frag(&format!("freenet:{}{}", &rest[..id_end], path)),
+                "site",
+            ));
         }
         return None;
     }
@@ -1596,8 +1694,12 @@ fn normalize_href(href: &str) -> Option<(String, &'static str)> {
 /// exactly like a literal `..` — and too strong, since a legitimate path may
 /// contain a double dot without being a traversal (`/docs/1.2..1.3/`), which a
 /// substring test would silently refuse to index.
+/// `\` counts as a separator alongside `/`: the WHATWG parser treats it as one
+/// for special schemes (`http`/`https`), so `…/<id>\..\..\v1/secret` collapses
+/// to `/v1/secret` at fetch time exactly as the `/` form does. Splitting on `/`
+/// alone saw one long segment and passed it.
 fn has_dot_segment(path: &str) -> bool {
-    path.split('/')
+    path.split(['/', '\\'])
         .any(|seg| matches!(percent_decode_ascii(seg).as_slice(), b"." | b".."))
 }
 
@@ -2754,6 +2856,123 @@ mod tests {
         // Ordinary locators still pass.
         assert!(normalize_href(&format!("freenet:{ID}/about")).is_some());
         assert!(normalize_href("https://example.com/a/b").is_some());
+    }
+
+    #[test]
+    fn traversal_hidden_in_a_query_or_fragment_is_rejected() {
+        // The guard used to read only the part before `?`/`#` while the gateway
+        // branch searched the WHOLE href for `/v1/contract/web/`. So the guard
+        // saw `https://ok.example/`, passed it, and the locator was then mined
+        // out of the query — yielding `freenet:<id>/../../../../v1/secret`,
+        // which the URL parser collapses to `/v1/secret` on our own node. The
+        // response body would have gone to the LLM and into the public index.
+        let atk = format!("/v1/contract/web/{ID}/../../../../v1/secret");
+        assert!(normalize_href(&format!("https://ok.example/?u={atk}")).is_none());
+        assert!(normalize_href(&format!("https://ok.example/#{atk}")).is_none());
+        assert!(normalize_href(&format!("https://ok.example/?a=1#{atk}")).is_none());
+        // Percent-encoded, same hiding place.
+        assert!(normalize_href(&format!(
+            "https://ok.example/?u=/v1/contract/web/{ID}/%2e%2e/%2e%2e/v1/secret"
+        ))
+        .is_none());
+        // Backslashes are path separators to the WHATWG parser for special
+        // schemes, so `\..\..\` traverses exactly like `/../../`.
+        assert!(normalize_href(&format!("freenet:{ID}\\..\\..\\..\\v1/secret")).is_none());
+        assert!(normalize_href(&format!(
+            "https://gw.example/v1/contract/web/{ID}\\..\\..\\v1/x"
+        ))
+        .is_none());
+        // A `#…` following a REAL gateway path is the app's client-side route
+        // and must survive — the Delta hub's own locator is a `#` route, and
+        // dropping it would collapse every page of an SPA onto its root.
+        let (loc, _) = normalize_href(&format!("https://gw.example/v1/contract/web/{ID}/a#r/1"))
+            .expect("plain gateway link still indexes");
+        assert_eq!(loc, format!("freenet:{ID}/a#r/1"));
+        let (loc, _) =
+            normalize_href(&format!("freenet:{ID}/?q=1#AmcVD/2/links")).expect("indexes");
+        assert_eq!(loc, format!("freenet:{ID}/#AmcVD/2/links"));
+        // But a gateway prefix that only appears INSIDE the fragment is not a
+        // gateway link at all — it stays the external URL it actually is.
+        let (loc, kind) =
+            normalize_href(&format!("https://ok.example/p#/v1/contract/web/{ID}/x")).unwrap();
+        assert_eq!(kind, "external");
+        assert_eq!(loc, "https://ok.example/p");
+    }
+
+    #[test]
+    fn the_fetch_url_is_checked_after_parsing_not_before() {
+        // The backstop: whatever the locator guards did or did not catch, the
+        // URL that will actually be sent to the node is parsed and its path
+        // compared against the contract's own web root.
+        let gw = "http://127.0.0.1:7509";
+        assert!(gateway_url(gw, ID, "/about").is_ok());
+        assert!(gateway_url(gw, ID, "").is_ok());
+        assert!(gateway_url(gw, ID, "/a?__sandbox=1").is_ok());
+        for escape in [
+            "/../../../../v1/secret",
+            "/%2e%2e/%2e%2e/%2e%2e/%2e%2e/v1/secret",
+            "\\..\\..\\..\\..\\v1/secret",
+            "/a/../../../../../v1/secret?__sandbox=1",
+        ] {
+            let err = gateway_url(gw, ID, escape)
+                .expect_err("must refuse a path that leaves the contract root");
+            assert!(
+                err.to_string().contains("escapes the contract web root"),
+                "unexpected error for {escape}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_persisted_locator_is_revalidated_on_load() {
+        // A queue written by an older build carries whatever that build let
+        // through. Upgrading must not fetch it unchecked.
+        let tmp = TmpFile::new("revalidate");
+        let path = tmp.path();
+        fs::write(
+            path,
+            format!(
+                "0\tsite\tAUTHOR\tfreenet:{ID}/../../v1/secret\n\
+                 0\tsite\tAUTHOR\tfreenet:{ID}/%2e%2e/v1/secret\n\
+                 0\texternal\tAUTHOR\thttps://good.example/page\n\
+                 0\tsite\tAUTHOR\tfreenet:{ID}/ok\n"
+            ),
+        )
+        .unwrap();
+        let p = Pending::load(path);
+        assert!(!p.contains(&format!("freenet:{ID}/../../v1/secret")));
+        assert!(!p.contains(&format!("freenet:{ID}/%2e%2e/v1/secret")));
+        assert!(p.contains("https://good.example/page"));
+        assert!(p.contains(&format!("freenet:{ID}/ok")));
+        assert_eq!(p.len(), 2);
+    }
+
+    #[test]
+    fn the_starved_author_leads_the_next_run() {
+        // A budget-limited run typically stops one author short, and that
+        // author must lead next time. Advancing by n+1 unconditionally stepped
+        // straight over them: with `buckets` authors and `n == buckets - 1`,
+        // `(n+1) % buckets == 0` left the rotation exactly where it started, so
+        // the same author was starved every run forever.
+        let tmp = TmpFile::new("starve");
+        let mut p = Pending::load(tmp.path());
+        for a in ["A", "B", "C", "D"] {
+            assert!(p.add(&format!("https://x.example/{a}"), "external", a));
+        }
+        // Serve every author but the last one in this run's order.
+        let order = p.drain_order();
+        let first_unserved = order[3].2.clone();
+        p.advance_cursor(3);
+        assert_eq!(
+            p.drain_order()[0].2,
+            first_unserved,
+            "the author left unserved must lead the next run"
+        );
+        // And when a run does serve everyone, the rotation must still move on,
+        // or the second-and-later slots freeze onto the same authors.
+        let before = p.drain_order()[0].2.clone();
+        p.advance_cursor(4);
+        assert_ne!(p.drain_order()[0].2, before);
     }
 
     #[test]
