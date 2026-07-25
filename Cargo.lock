@@ -158,7 +158,7 @@ dependencies = [
  "ciborium",
  "clap",
  "ed25519-dalek",
- "freenet-stdlib 0.8.3",
+ "freenet-stdlib",
  "reqwest",
  "river-core",
  "serde",
@@ -174,7 +174,7 @@ version = "0.1.0"
 dependencies = [
  "atlas-common",
  "ciborium",
- "freenet-stdlib 0.6.1",
+ "freenet-stdlib",
 ]
 
 [[package]]
@@ -184,7 +184,7 @@ dependencies = [
  "atlas-common",
  "ciborium",
  "dioxus",
- "freenet-stdlib 0.6.1",
+ "freenet-stdlib",
  "gloo-timers",
  "js-sys",
  "serde",
@@ -203,7 +203,7 @@ dependencies = [
  "ciborium",
  "clap",
  "ed25519-dalek",
- "freenet-stdlib 0.6.1",
+ "freenet-stdlib",
  "rand 0.8.6",
  "serde",
  "tokio",
@@ -1475,6 +1475,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "freenet-migrate-build"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c1f8c31bbf8b6902fa6b1afb866cdba9234578ac8923d6a75f3e6043551db39f"
+dependencies = [
+ "blake3",
+ "bs58",
+ "serde",
+ "toml",
+]
+
+[[package]]
 name = "freenet-scaffold"
 version = "0.2.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1492,36 +1504,6 @@ checksum = "99c6d26e7ce019d8eba883b307ee55dd1d10c85ccc9bec72b069bdf07c50a87d"
 dependencies = [
  "quote",
  "syn",
-]
-
-[[package]]
-name = "freenet-stdlib"
-version = "0.8.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2ce69f7b87ca5fedb784da0194e26a3315bc23b11e346f7a8413c48abdcac73f"
-dependencies = [
- "bincode",
- "blake3",
- "bs58",
- "byteorder",
- "bytes",
- "chrono",
- "flatbuffers",
- "freenet-macros",
- "futures",
- "js-sys",
- "semver",
- "serde",
- "serde-wasm-bindgen",
- "serde_json",
- "serde_with",
- "thiserror 2.0.18",
- "tokio",
- "tokio-tungstenite",
- "tracing",
- "tracing-subscriber",
- "wasm-bindgen",
- "web-sys",
 ]
 
 [[package]]
@@ -2869,9 +2851,9 @@ dependencies = [
 
 [[package]]
 name = "river-core"
-version = "0.1.13"
+version = "0.1.17"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c8ff2f0fab3e1fec155af62f72db26aaaff5cd5f4ba0b053d520e7867be9520d"
+checksum = "279afd424d004529e3b360309af4638ae1cd19ee66bff50065356ffd9f282857"
 dependencies = [
  "base64",
  "blake3",
@@ -2879,11 +2861,11 @@ dependencies = [
  "ciborium",
  "data-encoding",
  "ed25519-dalek",
+ "freenet-migrate-build",
  "freenet-scaffold",
  "freenet-scaffold-macro",
- "freenet-stdlib 0.8.3",
+ "freenet-stdlib",
  "serde",
- "toml",
 ]
 
 [[package]]

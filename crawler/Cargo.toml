@@ -19,18 +19,16 @@ url = "2"
 
 # River-room ingestion (Atlas issue #2). river-core re-exports `ChatRoomStateV1`
 # and (behind the `migration` feature) the owner-VK-anchored room-contract key
-# derivation used to survive River re-keys. river-core 0.1.13 pulls
-# freenet-stdlib ^0.8.3, which is ALSO the version the local node speaks
-# (freenet-core 0.2.97 embeds stdlib 0.8.2), so the crawler's WS client and the
-# room-state types share one stdlib version. This is DELIBERATELY separate from
-# the atlas workspace's freenet-stdlib 0.6.0 pin: bumping the workspace would
-# rebuild the Atlas index contract WASM and re-key the live Atlas index, so the
-# cli/ui/contract crates stay on 0.6.0 while only the crawler talks 0.8 (it
-# never shares a stdlib type with them — it shells out to `atlasctl` to add).
+# derivation used to survive River re-keys. river-core 0.1.13 requires
+# freenet-stdlib ^0.8.3, which matches the workspace pin (and the version the
+# local node speaks), so the crawler's WS client and the room-state types share
+# one stdlib.
 river-core = { version = "0.1.13", features = ["migration"] }
-freenet-stdlib = { version = "0.8.3", features = ["net"] }
-ciborium = "0.2.2"
-ed25519-dalek = "2.1.1"
-bs58 = "0.5"
+freenet-stdlib = { workspace = true, features = ["net"] }
+ciborium = { workspace = true }
+# The workspace pins this with default-features off so the contract WASM stays
+# lean; the crawler is a native binary and needs `std` for error interop.
+ed25519-dalek = { workspace = true, features = ["std"] }
+bs58 = { workspace = true }
 tokio = { version = "1", features = ["rt-multi-thread", "time", "net", "io-util"] }
 tokio-tungstenite = { version = "0.27", features = ["rustls-tls-webpki-roots"] }
