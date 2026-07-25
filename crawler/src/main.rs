@@ -454,6 +454,7 @@ impl Pending {
             return p;
         };
         let mut dropped = 0usize;
+        let mut rewritten = 0usize;
         for line in body.lines() {
             if let Some(n) = line.strip_prefix("#cursor\t") {
                 p.cursor = n.trim().parse().unwrap_or(0);
@@ -484,11 +485,16 @@ impl Pending {
                 dropped += 1;
                 continue;
             };
+            // A locator that merely normalizes DIFFERENTLY is rewritten, not
+            // dropped. Dropping it would be the silent loss this queue exists
+            // to prevent, and it is reachable without any attacker: curated and
+            // hub entries are queued as written, so an operator's sources line
+            // carrying a `#fragment` would be discarded on every restart.
+            // Only a locator that no longer validates at all is dropped.
             if canon != loc {
-                dropped += 1;
-                continue;
+                rewritten += 1;
             }
-            p.insert_raw(loc.to_string(), kind, author.to_string(), attempts);
+            p.insert_raw(canon, kind, author.to_string(), attempts);
         }
         // The bounds are enforced on load as well as on insert. Otherwise an
         // oversized file (a hand-edit, or a later lowering of the constants)
@@ -511,7 +517,7 @@ impl Pending {
         p.refused_author = 0;
         p.refused_total = 0;
         p.evicted = 0;
-        p.dirty = dropped > 0 || over > 0;
+        p.dirty = dropped > 0 || over > 0 || rewritten > 0;
         p
     }
 
@@ -700,11 +706,10 @@ impl Pending {
     /// served everyone): there `offset + n` is `offset` again, which freezes the
     /// rotation. Nobody starves, but the second-and-later slots go to the same
     /// authors forever, so nudge past it.
-    fn advance_cursor(&mut self, n: usize) {
+    fn advance_cursor(&mut self, n: usize, buckets: usize) {
         if n == 0 {
             return;
         }
-        let buckets = self.per_author.values().filter(|n| **n > 0).count();
         let step = if buckets > 0 && n.is_multiple_of(buckets) {
             n + 1
         } else {
@@ -930,11 +935,18 @@ fn run_once(
             let owner_vk = owner_vk.trim().to_string();
             captured += crawl_river_room(cli, &owner_vk, &seen, &mut pending);
         } else {
-            // A curated locator from the operator's own file.
-            trusted.insert(line.to_string());
-            // A curated line may be `freenet:<id>` as well as https.
-            let kind = normalize_href(line).map(|(_, k)| k).unwrap_or("external");
-            if !seen.contains(line) && pending.add(line, kind, CURATED_AUTHOR) {
+            // A curated locator from the operator's own file. Normalized before
+            // it is queued, like every other locator: queuing the raw line meant
+            // a sources entry that normalizes differently (a `#fragment`, say)
+            // was stored in a form nothing else would ever produce, so it could
+            // not be matched against `seen` and did not survive a reload
+            // unchanged. A curated line may be `freenet:<id>` as well as https.
+            let (loc, kind) = match normalize_href(line) {
+                Some((loc, kind)) => (loc, kind),
+                None => (line.to_string(), "external"),
+            };
+            trusted.insert(loc.clone());
+            if !seen.contains(&loc) && pending.add(&loc, kind, CURATED_AUTHOR) {
                 captured += 1;
             }
         }
@@ -952,7 +964,18 @@ fn run_once(
     let mut added = 0usize;
     let mut author_used: HashMap<String, usize> = HashMap::new();
     let mut authors_served: HashSet<String> = HashSet::new();
-    for (loc, kind, author) in pending.drain_order() {
+    let order = pending.drain_order();
+    // Captured BEFORE the loop. The rotation is an offset into this bucket
+    // list, and the loop removes entries as it describes them, so reading the
+    // bucket count afterwards measures a different list than the one the offset
+    // refers to — with the queue drained down to a single author it read as 1,
+    // which makes "did this run serve everyone" true for every n.
+    let bucket_count = order
+        .iter()
+        .map(|(_, _, a)| a.as_str())
+        .collect::<HashSet<_>>()
+        .len();
+    for (loc, kind, author) in order {
         if seen.contains(&loc) {
             pending.remove(&loc);
             continue;
@@ -1010,7 +1033,7 @@ fn run_once(
             }
         }
     }
-    pending.advance_cursor(authors_served.len());
+    pending.advance_cursor(authors_served.len(), bucket_count);
     pending.report_refusals();
     pending.save();
 
@@ -1129,11 +1152,17 @@ fn gateway_url(gw: &str, id: &str, rest: &str) -> Result<String> {
     let raw = format!("{gw}/v1/contract/web/{id}{rest}");
     let parsed = url::Url::parse(&raw).with_context(|| format!("bad gateway url: {raw}"))?;
     let root = format!("/v1/contract/web/{id}");
-    if parsed.path() != root && !parsed.path().starts_with(&format!("{root}/")) {
-        anyhow::bail!(
-            "refusing to fetch: {} escapes the contract web root {root}",
-            parsed.path()
-        );
+    let path = parsed.path();
+    if path != root && !path.starts_with(&format!("{root}/")) {
+        anyhow::bail!("refusing to fetch: {path} escapes the contract web root {root}");
+    }
+    // Checking `parsed.path()` alone is ONE DECODE SHORT. The URL parser
+    // deliberately leaves `%2f` and `%2e` alone, but the node percent-decodes
+    // the path before resolving it, so `<root>/..%2f..%2fetc%2fpasswd` passes
+    // the prefix test above and still escapes at the far end. Compare what the
+    // node will actually resolve, not what the parser hands back.
+    if has_dot_segment(path) {
+        anyhow::bail!("refusing to fetch: {path} decodes to a path that escapes {root}");
     }
     Ok(raw)
 }
@@ -1159,10 +1188,18 @@ fn get_page(cli: &Cli, client: &reqwest::blocking::Client, gw: &str, loc: &str) 
                 }
             }
         }
-        let sep = if path.contains('?') { '&' } else { '?' };
+        // `__sandbox=1` has to go in the QUERY, which means before any `#`.
+        // Appending it to a locator that carries an SPA route put the `?`
+        // inside the fragment, so the parsed URL had no query at all, the node
+        // saw a plain page request and served the loader shell instead of the
+        // app — every fragment-bearing locator would have been described from
+        // an empty wrapper. The fragment itself is not sent to the server, so
+        // it is simply dropped here rather than reordered.
+        let path_only = path.split('#').next().unwrap_or(path);
+        let sep = if path_only.contains('?') { '&' } else { '?' };
         let html = fetch(
             client,
-            &gateway_url(gw, id, &format!("{path}{sep}__sandbox=1"))?,
+            &gateway_url(gw, id, &format!("{path_only}{sep}__sandbox=1"))?,
         )?;
         let text = visible_text(&html);
         Ok(Page { html, text })
@@ -1264,8 +1301,11 @@ fn crawl_hub(
         }
     };
     let mut captured = 0;
-    // A hub is itself a resource worth listing, so capture it too.
-    if !seen.contains(hub) && pending.add(hub, "site", HUB_AUTHOR) {
+    // A hub is itself a resource worth listing, so capture it too — normalized,
+    // so it round-trips like everything else in the queue.
+    let hub_loc = normalize_href(hub).map(|(l, _)| l);
+    let hub_loc = hub_loc.as_deref().unwrap_or(hub);
+    if !seen.contains(hub_loc) && pending.add(hub_loc, "site", HUB_AUTHOR) {
         captured += 1;
     }
     let links = extract_locators(&page.html);
@@ -1689,18 +1729,30 @@ fn normalize_href(href: &str) -> Option<(String, &'static str)> {
 
 /// True if any path SEGMENT is `.` or `..` once percent-decoded.
 ///
-/// Both halves matter. A substring test for ".." is too weak — `%2e%2e` is a
-/// dot segment to the WHATWG URL parser, so it normalizes past the web root
-/// exactly like a literal `..` — and too strong, since a legitimate path may
-/// contain a double dot without being a traversal (`/docs/1.2..1.3/`), which a
-/// substring test would silently refuse to index.
+/// DECODE FIRST, then split. The order is the whole point, and getting it
+/// backwards was a real bypass: splitting first makes
+/// `..%2f..%2f..%2fetc%2fpasswd` a SINGLE segment, which decodes to
+/// `../../../etc/passwd` — not equal to `..`, so it passed. The encoded
+/// separator is invisible to the URL parser too (it deliberately never decodes
+/// `%2f` in a path), so nothing downstream caught it either, while the node
+/// percent-decodes the path before resolving it and sees real separators and
+/// real dot segments. Decoding first collapses that whole class: whatever the
+/// far end will decode, this sees first.
+///
+/// Both halves of the segment test matter. A substring test for ".." is too
+/// weak — `%2e%2e` is a dot segment to the WHATWG parser, so it normalizes past
+/// the web root exactly like a literal `..` — and too strong, since a
+/// legitimate path may contain a double dot without being a traversal
+/// (`/docs/1.2..1.3/`), which a substring test would silently refuse to index.
+///
 /// `\` counts as a separator alongside `/`: the WHATWG parser treats it as one
 /// for special schemes (`http`/`https`), so `…/<id>\..\..\v1/secret` collapses
-/// to `/v1/secret` at fetch time exactly as the `/` form does. Splitting on `/`
-/// alone saw one long segment and passed it.
+/// to `/v1/secret` at fetch time exactly as the `/` form does.
 fn has_dot_segment(path: &str) -> bool {
-    path.split(['/', '\\'])
-        .any(|seg| matches!(percent_decode_ascii(seg).as_slice(), b"." | b".."))
+    let decoded = percent_decode_ascii(path);
+    decoded
+        .split(|b| *b == b'/' || *b == b'\\')
+        .any(|seg| seg == b"." || seg == b"..")
 }
 
 /// Decode `%XX` escapes (either case) for comparison purposes only. Invalid
@@ -2722,7 +2774,7 @@ mod tests {
                 served.insert(author.clone());
                 ever_served.insert(author);
             }
-            p.advance_cursor(served.len());
+            p.advance_cursor(served.len(), authors);
             p.save();
         }
         assert_eq!(
@@ -2806,7 +2858,7 @@ mod tests {
             }
         }
         let first = p.drain_order()[0].2.clone();
-        p.advance_cursor(authors); // every author served
+        p.advance_cursor(authors, authors); // every author served
         let second = p.drain_order()[0].2.clone();
         assert_ne!(
             first, second,
@@ -2875,6 +2927,15 @@ mod tests {
             "https://ok.example/?u=/v1/contract/web/{ID}/%2e%2e/%2e%2e/v1/secret"
         ))
         .is_none());
+        // Encoded SEPARATORS, not just encoded dots. Splitting the path before
+        // decoding made `..%2f..%2f..%2fetc%2fpasswd` a single segment that
+        // decoded to something longer than `..`, so it was never flagged — and
+        // the URL parser does not decode `%2f` either, so nothing downstream
+        // caught it, while the node decodes before resolving.
+        assert!(normalize_href(&format!("freenet:{ID}/..%2f..%2f..%2fetc%2fpasswd")).is_none());
+        assert!(normalize_href(&format!("freenet:{ID}/%2e%2e%2f%2e%2e%2fetc")).is_none());
+        assert!(normalize_href(&format!("freenet:{ID}/a%2F..%2F..%2Fetc")).is_none());
+        assert!(normalize_href(&format!("freenet:{ID}/..%5c..%5cwin")).is_none());
         // Backslashes are path separators to the WHATWG parser for special
         // schemes, so `\..\..\` traverses exactly like `/../../`.
         assert!(normalize_href(&format!("freenet:{ID}\\..\\..\\..\\v1/secret")).is_none());
@@ -2913,11 +2974,19 @@ mod tests {
             "/%2e%2e/%2e%2e/%2e%2e/%2e%2e/v1/secret",
             "\\..\\..\\..\\..\\v1/secret",
             "/a/../../../../../v1/secret?__sandbox=1",
+            // Encoded SEPARATORS. The URL parser deliberately leaves `%2f`
+            // alone, so the path still looks like one long segment inside the
+            // contract root — but the node percent-decodes before resolving,
+            // and then it is a real traversal to a real file.
+            "/..%2f..%2f..%2f..%2f..%2fetc%2fpasswd",
+            "/%2e%2e%2f%2e%2e%2fetc%2fpasswd",
+            "/a%2f..%2f..%2f..%2fetc%2fpasswd?__sandbox=1",
+            "/..%5c..%5c..%5cwindows",
         ] {
             let err = gateway_url(gw, ID, escape)
                 .expect_err("must refuse a path that leaves the contract root");
             assert!(
-                err.to_string().contains("escapes the contract web root"),
+                err.to_string().contains("escapes"),
                 "unexpected error for {escape}: {err}"
             );
         }
@@ -2948,6 +3017,28 @@ mod tests {
     }
 
     #[test]
+    fn a_locator_that_merely_normalizes_differently_is_kept() {
+        // Re-validation must not become a second way to lose links. A curated
+        // sources line carrying a `#fragment` normalizes to a different string;
+        // dropping it would discard the operator's own link on every restart.
+        let tmp = TmpFile::new("rewrite");
+        let path = tmp.path();
+        fs::write(
+            path,
+            "0\texternal\t@curated\thttps://example.org/docs#intro\n\
+             0\texternal\t@curated\thttps://example.org/keep\n",
+        )
+        .unwrap();
+        let p = Pending::load(path);
+        assert_eq!(p.len(), 2, "neither entry may be dropped");
+        assert!(
+            p.contains("https://example.org/docs"),
+            "it should be rewritten to its canonical form, not discarded"
+        );
+        assert!(p.contains("https://example.org/keep"));
+    }
+
+    #[test]
     fn the_starved_author_leads_the_next_run() {
         // A budget-limited run typically stops one author short, and that
         // author must lead next time. Advancing by n+1 unconditionally stepped
@@ -2962,7 +3053,7 @@ mod tests {
         // Serve every author but the last one in this run's order.
         let order = p.drain_order();
         let first_unserved = order[3].2.clone();
-        p.advance_cursor(3);
+        p.advance_cursor(3, 4);
         assert_eq!(
             p.drain_order()[0].2,
             first_unserved,
@@ -2971,7 +3062,7 @@ mod tests {
         // And when a run does serve everyone, the rotation must still move on,
         // or the second-and-later slots freeze onto the same authors.
         let before = p.drain_order()[0].2.clone();
-        p.advance_cursor(4);
+        p.advance_cursor(4, 4);
         assert_ne!(p.drain_order()[0].2, before);
     }
 
