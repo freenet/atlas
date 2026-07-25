@@ -542,6 +542,13 @@ impl Pending {
         attempts: u32,
     ) -> bool {
         if !self.index.insert(loc.clone()) {
+            // Colliding entries keep the LOWER retry count. The survivor is
+            // whichever line was read first, so without this a fresh capture
+            // (0 attempts) colliding with a stale one could inherit a count one
+            // failure short of being given up on permanently.
+            if let Some((_, e)) = self.entries.iter_mut().find(|(l, _)| *l == loc) {
+                e.attempts = e.attempts.min(attempts);
+            }
             return false;
         }
         *self.per_author.entry(author.clone()).or_insert(0) += 1;
@@ -1184,6 +1191,13 @@ fn gateway_url(gw: &str, id: &str, rest: &str) -> Result<String> {
     if has_dot_segment(path) {
         anyhow::bail!("refusing to fetch: {path} decodes to a path that escapes {root}");
     }
+    // Traversal is not the only way out of the root. The node joins the
+    // contract-relative remainder onto a base directory, and joining an
+    // ABSOLUTE path throws the base away, so `<root>//home/ian/.ssh/id_ed25519`
+    // reads that file while containing no dot segment at all.
+    if is_absolute_contract_path(&path[root.len()..]) {
+        anyhow::bail!("refusing to fetch: {path} is absolute and would escape {root}");
+    }
     Ok(raw)
 }
 
@@ -1313,6 +1327,18 @@ fn crawl_hub(
     seen: &HashSet<String>,
     pending: &mut Pending,
 ) -> usize {
+    // Normalized ONCE, BEFORE the fetch, and used for everything after: the
+    // fetch itself, the queued locator, the self-comparison, and the
+    // contract-id filter. Using the raw operator line meant
+    // `freenet_id(hub) == None` for a hub written in gateway form, which
+    // disabled the same-contract filter and captured every one of the hub's own
+    // in-app links as if it were an outbound site. Normalizing after the fetch
+    // did not actually fix that, because the gateway form is an `http://`
+    // loopback URL that `ssrf_check` rejects, so the run ended before reaching
+    // the normalization. Converting it to a `freenet:` locator first is what
+    // makes a gateway-form hub line work at all.
+    let hub_canon = normalize_href(hub).map(|(l, _)| l);
+    let hub = hub_canon.as_deref().unwrap_or(hub);
     let page = match get_page(cli, client, gw, hub) {
         Ok(p) => p,
         Err(e) => {
@@ -1321,14 +1347,6 @@ fn crawl_hub(
         }
     };
     let mut captured = 0;
-    // Normalized ONCE, at the top, and used for all three of: the queued
-    // locator, the self-comparison, and the contract-id filter below. Using the
-    // raw operator line for the latter two meant a hub written in gateway form
-    // (`http://gw/v1/contract/web/<id>/`) yielded `freenet_id(hub) == None`, so
-    // the same-contract filter was disabled and every one of the hub's own
-    // in-app links was captured as if it were an outbound site.
-    let hub_canon = normalize_href(hub).map(|(l, _)| l);
-    let hub = hub_canon.as_deref().unwrap_or(hub);
     // A hub is itself a resource worth listing, so capture it too.
     if !seen.contains(hub) && pending.add(hub, "site", HUB_AUTHOR) {
         captured += 1;
@@ -1735,7 +1753,7 @@ fn normalize_href(href: &str) -> Option<(String, &'static str)> {
         let id_end = rest.find(|c: char| !is_b58(c)).unwrap_or(rest.len());
         if matches!(id_end, 43 | 44) {
             let path = &rest[id_end..];
-            if is_asset_path(path) {
+            if is_asset_path(path) || is_absolute_contract_path(path) {
                 return None;
             }
             return Some((
@@ -1751,7 +1769,7 @@ fn normalize_href(href: &str) -> Option<(String, &'static str)> {
         let id_end = after.find(|c: char| !is_b58(c)).unwrap_or(after.len());
         if matches!(id_end, 43 | 44) {
             let path = &after[id_end..];
-            if is_asset_path(path) {
+            if is_asset_path(path) || is_absolute_contract_path(path) {
                 return None;
             }
             return Some((
@@ -1796,6 +1814,39 @@ fn has_dot_segment(path: &str) -> bool {
     decoded
         .split(|b| *b == b'/' || *b == b'\\')
         .any(|seg| seg == b"." || seg == b"..")
+}
+
+/// True if a contract-relative path escapes the contract root by being
+/// ABSOLUTE rather than by traversing.
+///
+/// A different primitive from `..`, and no amount of dot-segment checking finds
+/// it, because it contains no dots. The node splits `<key>/<path>` and hands
+/// the remainder to `Path::join`, and `join` with an absolute path DISCARDS THE
+/// BASE — verified: `base.join("/home/ian/.ssh/id_ed25519")` is
+/// `/home/ian/.ssh/id_ed25519`, not something under `base`. So a posted locator
+/// `freenet:<id>//home/ian/.ssh/id_ed25519` reads that file directly.
+///
+/// The remainder the node joins is everything after the FIRST separator, so the
+/// test is whether a second separator follows immediately. An interior `//`
+/// (`/a//b`) is harmless — it stays under the base — and a lone trailing slash
+/// is the ordinary root form, so neither is refused.
+///
+/// Decoded to a fixed point first, for the same reason as `has_dot_segment`:
+/// `/%2fhome/...` and `/%252fhome/...` are this attack wearing a coat.
+fn is_absolute_contract_path(path: &str) -> bool {
+    let decoded = percent_decode_fully(path.as_bytes());
+    // A control byte that only EXISTS after decoding. `normalize_href` rejects
+    // control characters in the raw href, but `%00` and `%0a` are ordinary
+    // printable text there and become NUL and newline here. Nothing downstream
+    // expects either in a path.
+    if decoded.iter().any(|b| *b < 0x20 || *b == 0x7f) {
+        return true;
+    }
+    let sep = |b: u8| b == b'/' || b == b'\\';
+    match decoded.split_first() {
+        Some((first, rest)) if sep(*first) => rest.first().is_some_and(|b| sep(*b)),
+        _ => false,
+    }
 }
 
 /// Decode `%XX` escapes REPEATEDLY, until decoding changes nothing.
@@ -3131,6 +3182,50 @@ mod tests {
     }
 
     #[test]
+    fn an_absolute_contract_path_is_rejected() {
+        // A DIFFERENT escape primitive from `..`, and one that contains no dots
+        // at all, so every dot-segment guard in this file is blind to it. The
+        // node splits `<key>/<path>` and joins the remainder onto the webapp
+        // cache directory, and `Path::join` with an absolute path DISCARDS the
+        // base — verified: `base.join("/home/ian/.ssh/id_ed25519")` is that
+        // file, not something under base. So this reads it and ships the
+        // contents to the LLM and the public index.
+        assert!(normalize_href(&format!("freenet:{ID}//home/ian/.ssh/id_ed25519")).is_none());
+        assert!(normalize_href(&format!("freenet:{ID}//etc/hostname")).is_none());
+        assert!(normalize_href(&format!("freenet:{ID}/%2fhome/ian/.bash_history")).is_none());
+        assert!(normalize_href(&format!("freenet:{ID}/%252fhome/ian/x.txt")).is_none());
+        assert!(normalize_href(&format!("freenet:{ID}\\\\home\\ian\\x")).is_none());
+        assert!(
+            normalize_href(&format!("https://gw.example/v1/contract/web/{ID}//etc/x")).is_none()
+        );
+        // The backstop refuses them too, whatever the locator guard did.
+        for escape in [
+            "//home/ian/.ssh/id_ed25519",
+            "/%2fetc/passwd",
+            "//etc/x?__sandbox=1",
+        ] {
+            assert!(
+                gateway_url("http://127.0.0.1:7509", ID, escape).is_err(),
+                "must refuse {escape}"
+            );
+        }
+        // Ordinary paths, including the bare root form the hub uses, still pass.
+        // An INTERIOR `//` is harmless — it stays under the base — so refusing
+        // it would be over-rejection, not safety.
+        assert!(normalize_href(&format!("freenet:{ID}/")).is_some());
+        assert!(normalize_href(&format!("freenet:{ID}")).is_some());
+        assert!(normalize_href(&format!("freenet:{ID}/about")).is_some());
+        assert!(normalize_href(&format!("freenet:{ID}/a//b")).is_some());
+        // A control byte that exists only AFTER decoding: the raw-href control
+        // check never sees `%00`, it sees three printable characters.
+        assert!(normalize_href(&format!("freenet:{ID}/x%00.html")).is_none());
+        assert!(normalize_href(&format!("freenet:{ID}/a%0d%0ab")).is_none());
+        assert!(gateway_url("http://127.0.0.1:7509", ID, "/").is_ok());
+        assert!(gateway_url("http://127.0.0.1:7509", ID, "/a//b").is_ok());
+        assert!(gateway_url("http://127.0.0.1:7509", ID, "").is_ok());
+    }
+
+    #[test]
     fn normalizing_a_locator_twice_changes_nothing() {
         // `Pending::load` rewrites each stored locator to its canonical form, so
         // a non-idempotent normalization silently mutates the queue on every
@@ -3139,6 +3234,9 @@ mod tests {
         // first `/v1/contract/web/` anywhere in the path, so a locator whose own
         // path contained that prefix was retargeted at a different contract.
         let id2 = "2222222222222222222222222222222222222222222";
+        // Counted, so that a future change making everything `None` cannot turn
+        // this into a test that passes by checking nothing.
+        let mut checked = 0;
         for input in [
             format!("freenet:{ID}/a/..?z"),
             format!("freenet:{ID}/a/.."),
@@ -3153,12 +3251,17 @@ mod tests {
             let Some((canon, kind)) = normalize_href(&input) else {
                 continue;
             };
+            checked += 1;
             assert_eq!(
                 normalize_href(&canon),
                 Some((canon.clone(), kind)),
                 "normalize is not idempotent for {input}: {canon} changed again"
             );
         }
+        assert!(
+            checked >= 6,
+            "only {checked} inputs actually normalized — the test has gone vacuous"
+        );
     }
 
     #[test]
