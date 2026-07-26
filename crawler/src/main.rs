@@ -757,7 +757,7 @@ impl Pending {
         }
         if self.refused_author > 0 {
             eprintln!(
-                "warn: {} link(s) refused — an author is at their {MAX_PENDING_PER_AUTHOR}-entry queue limit",
+                "warn: {} link(s) refused — an author is at their per-author queue limit ({MAX_PENDING_PER_AUTHOR}, or {MAX_PENDING_CURATED} for curated sources)",
                 self.refused_author
             );
         }
@@ -1230,6 +1230,15 @@ fn get_page(cli: &Cli, client: &reqwest::blocking::Client, gw: &str, loc: &str) 
         // an empty wrapper. The fragment itself is not sent to the server, so
         // it is simply dropped here rather than reordered.
         let path_only = path.split('#').next().unwrap_or(path);
+        // Empty means the bare `freenet:<id>` form, which is what a person
+        // usually types. Without the slash the URL matches the node's
+        // no-trailing-slash route, which answers 308 to the slash form AND
+        // strips the sandbox flag; the redirect policy then refuses the hop
+        // because it is plain http, so `fetch` fails. Every attempt still
+        // charges the budget, so three of them burned real money and then
+        // marked the locator seen forever. The renderer branch already
+        // normalizes this, which is what gave the oversight away.
+        let path_only = if path_only.is_empty() { "/" } else { path_only };
         let sep = if path_only.contains('?') { '&' } else { '?' };
         let html = fetch(
             client,
@@ -1843,10 +1852,22 @@ fn is_absolute_contract_path(path: &str) -> bool {
         return true;
     }
     let sep = |b: u8| b == b'/' || b == b'\\';
-    match decoded.split_first() {
-        Some((first, rest)) if sep(*first) => rest.first().is_some_and(|b| sep(*b)),
-        _ => false,
+    let Some((first, rest)) = decoded.split_first() else {
+        return false;
+    };
+    if !sep(*first) {
+        return false;
     }
+    // A second separator makes the remainder absolute on any OS.
+    if rest.first().is_some_and(|b| sep(*b)) {
+        return true;
+    }
+    // On Windows a DRIVE PREFIX replaces the base just as a leading separator
+    // does, and it needs no separator to do it: `join("C:/Windows/win.ini")`
+    // and even the drive-relative `join("C:foo")` both discard the base. The
+    // node may run on Windows while this crawler does not, so the check cannot
+    // be conditioned on the crawler's own platform.
+    matches!(rest, [d, b':', ..] if d.is_ascii_alphabetic())
 }
 
 /// Decode `%XX` escapes REPEATEDLY, until decoding changes nothing.
@@ -3220,6 +3241,15 @@ mod tests {
         // check never sees `%00`, it sees three printable characters.
         assert!(normalize_href(&format!("freenet:{ID}/x%00.html")).is_none());
         assert!(normalize_href(&format!("freenet:{ID}/a%0d%0ab")).is_none());
+        // A Windows DRIVE PREFIX replaces the base exactly as a leading
+        // separator does, and needs no separator to do it. The node may run on
+        // Windows even when this crawler does not.
+        assert!(normalize_href(&format!("freenet:{ID}/C:/Windows/win.ini")).is_none());
+        assert!(normalize_href(&format!("freenet:{ID}/c:foo")).is_none());
+        assert!(normalize_href(&format!("freenet:{ID}/%43%3a/Windows/win.ini")).is_none());
+        // A colon that is not a drive prefix is ordinary path text.
+        assert!(normalize_href(&format!("freenet:{ID}/ab:cd")).is_some());
+        assert!(normalize_href(&format!("freenet:{ID}/a/b:c")).is_some());
         assert!(gateway_url("http://127.0.0.1:7509", ID, "/").is_ok());
         assert!(gateway_url("http://127.0.0.1:7509", ID, "/a//b").is_ok());
         assert!(gateway_url("http://127.0.0.1:7509", ID, "").is_ok());
