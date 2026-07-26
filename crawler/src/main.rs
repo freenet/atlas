@@ -503,10 +503,18 @@ impl Pending {
                 merged += 1;
             }
         }
-        // The bounds are enforced on load as well as on insert. Otherwise an
-        // oversized file (a hand-edit, or a later lowering of the constants)
+        // The TOTAL bound is enforced on load as well as on insert. Otherwise an
+        // oversized file (a hand-edit, or a later lowering of the constant)
         // would be carried whole, and since `add` evicts exactly one entry per
         // insertion the queue would never trim back down.
+        //
+        // The per-author and curated bounds are deliberately NOT trimmed here.
+        // They are admission limits, and an author already over their cap is
+        // self-correcting: `add` refuses them more, and they are the largest
+        // backlog so `evict_one` picks them first once the queue is full.
+        // Trimming them on load would instead DELETE already-captured links —
+        // the room-captured ones being exactly what cannot be re-read — to
+        // enforce a bound that costs nothing to leave temporarily exceeded.
         let over = p.entries.len().saturating_sub(MAX_PENDING_TOTAL);
         while p.entries.len() > MAX_PENDING_TOTAL {
             if !p.evict_one() {
@@ -619,18 +627,31 @@ impl Pending {
     /// un-evictable is what would turn a full queue back into an absorbing
     /// state — but they are only touched when nothing else remains.
     fn evict_one(&mut self) -> bool {
-        let worst = self
-            .per_author
-            .iter()
-            .filter(|(a, n)| a.as_str() != CURATED_AUTHOR && **n > 0)
-            .max_by_key(|(_, n)| **n)
-            .map(|(a, _)| a.clone())
-            .or_else(|| {
-                self.per_author
-                    .iter()
-                    .find(|(_, n)| **n > 0)
-                    .map(|(a, _)| a.clone())
-            });
+        // Victims in order of how cheaply they can be recovered, because the
+        // only cost that matters here is whether the link comes back.
+        //
+        // A hub entry is re-extracted on the next hub crawl and a curated entry
+        // is re-read from the operator's own sources file on the very next run,
+        // so evicting either costs nothing at all. A room-captured link is the
+        // one kind that cannot be re-read: the room keeps only its most recent
+        // messages, so by the time it is evicted the message may already be
+        // gone. Evicting one of those to make space for a locator that is
+        // sitting in a local file — which is what happened when curated entries
+        // were merely exempt — destroys the irreplaceable to protect the
+        // trivially replaceable.
+        //
+        // Among room entries the largest backlog still goes first, so a flood
+        // continues to cost the flooder rather than their neighbours.
+        let pick = |p: &Self, want: &dyn Fn(&str) -> bool| -> Option<String> {
+            p.per_author
+                .iter()
+                .filter(|(a, n)| **n > 0 && want(a.as_str()))
+                .max_by_key(|(_, n)| **n)
+                .map(|(a, _)| a.clone())
+        };
+        let worst = pick(self, &|a| a == HUB_AUTHOR)
+            .or_else(|| pick(self, &|a| a == CURATED_AUTHOR))
+            .or_else(|| pick(self, &|a| a != HUB_AUTHOR && a != CURATED_AUTHOR));
         let Some(worst) = worst else {
             return false;
         };
@@ -638,6 +659,13 @@ impl Pending {
             return false;
         };
         let (loc, _) = self.entries[pos].clone();
+        // An eviction is permanent, so the first few identities are logged even
+        // though the count alone is what gets reported. One line per eviction
+        // floods the journal under a sustained flood; no line at all leaves no
+        // record of which links were destroyed.
+        if self.evicted < 5 {
+            eprintln!("  evicting queued locator to make room: {loc}");
+        }
         self.evicted += 1;
         self.remove(&loc);
         true
@@ -2958,12 +2986,72 @@ mod tests {
             p.add("https://fresh.example/", "external", "ALICE"),
             "a full queue must not lock out new links"
         );
-        // …and so does the operator's own curated source.
+        // …and so does the operator's own curated source, up to its own
+        // reservation. ("Never refused" was true only while curated locators
+        // were unbounded, which is what made a full queue absorbing.)
         assert!(
             p.add("https://curated.example/", "external", CURATED_AUTHOR),
-            "curated sources must never be refused"
+            "a curated source must still get in below its reservation"
         );
         assert!(p.len() <= MAX_PENDING_TOTAL);
+    }
+
+    #[test]
+    fn eviction_destroys_the_recoverable_entry_first() {
+        // A curated locator is re-read from the operator's sources file on the
+        // NEXT run and a hub locator is re-extracted on the next hub crawl, so
+        // losing either costs nothing. A room-captured link cannot be re-read —
+        // the room keeps only its most recent messages — so it must be the last
+        // thing destroyed, not the first.
+        let f = TmpFile::new("evict-priority");
+        let mut p = Pending::load(f.path());
+        assert!(p.add("https://room.example/irreplaceable", "external", "MEMBER"));
+        assert!(p.add(
+            "https://curated.example/rereadable",
+            "external",
+            CURATED_AUTHOR
+        ));
+        assert!(p.add("https://hub.example/reextracted", "site", HUB_AUTHOR));
+
+        assert!(p.evict_one());
+        assert!(
+            !p.contains("https://hub.example/reextracted"),
+            "the hub entry is the cheapest to recover, so it goes first"
+        );
+        assert!(p.contains("https://room.example/irreplaceable"));
+
+        assert!(p.evict_one());
+        assert!(
+            !p.contains("https://curated.example/rereadable"),
+            "the curated entry is re-read next run, so it goes before the room link"
+        );
+        assert!(
+            p.contains("https://room.example/irreplaceable"),
+            "the room-captured link must be the last one standing"
+        );
+
+        // Only when nothing recoverable is left does the room link go — the
+        // queue must never become an absorbing state that refuses everyone.
+        assert!(p.evict_one());
+        assert!(!p.contains("https://room.example/irreplaceable"));
+        assert!(!p.evict_one(), "an empty queue has nothing to evict");
+    }
+
+    #[test]
+    fn a_flood_still_costs_the_flooder() {
+        // Recoverable-first must not undo the anti-spam property: among room
+        // entries the largest backlog is still the one that pays.
+        let f = TmpFile::new("evict-flood");
+        let mut p = Pending::load(f.path());
+        assert!(p.add("https://quiet.example/only", "external", "QUIET"));
+        for i in 0..5 {
+            assert!(p.add(&format!("https://spam.example/{i}"), "external", "FLOODER"));
+        }
+        assert!(p.evict_one());
+        assert!(
+            p.contains("https://quiet.example/only"),
+            "the member with one link must not pay for the flooder's backlog"
+        );
     }
 
     /// A queue filled entirely by curated entries must still admit new links —
