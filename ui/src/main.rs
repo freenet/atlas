@@ -34,6 +34,16 @@ const INDEX_ID: &str = env!(
      freezes the published site at an old index generation."
 );
 
+/// `env!` is satisfied by an EMPTY value, which is exactly what
+/// `ATLAS_INDEX_ID=$(atlasctl key)` produces when `atlasctl` fails (command
+/// substitution discards the exit status). The build would succeed and the site
+/// would show "bad index id" forever, which is the same silent-failure shape this
+/// constant exists to prevent. Check the shape at compile time.
+const _: () = assert!(
+    INDEX_ID.len() == 43 || INDEX_ID.len() == 44,
+    "ATLAS_INDEX_ID must be a 43-44 char base58 contract instance id"
+);
+
 static STATE: GlobalSignal<Option<IndexState>> = Signal::global(|| None);
 static STATUS: GlobalSignal<String> = Signal::global(|| "connecting…".to_string());
 

@@ -300,6 +300,21 @@ impl RecordBody {
             if e.snippet.len() > MAX_SNIPPET {
                 return Err("snippet too long".to_string());
             }
+            // `title` and `snippet` are LLM output derived from untrusted page
+            // HTML, and `atlasctl show` prints them raw to a terminal, so a CR or
+            // an ANSI escape sequence in them is terminal injection. A control
+            // character has no legitimate place in either field. (Unlike `name`
+            // these are free-form human text, so only control characters are
+            // refused, not non-ASCII.)
+            if crate::path::has_control_char(&e.title) {
+                return Err("title contains a control character".to_string());
+            }
+            if crate::path::has_control_char(&e.snippet) {
+                return Err("snippet contains a control character".to_string());
+            }
+            if e.tags.iter().any(|t| crate::path::has_control_char(t)) {
+                return Err("a tag contains a control character".to_string());
+            }
             if e.tags.len() > MAX_TAGS || e.tags.iter().any(|t| t.len() > MAX_TAG_LEN) {
                 return Err("too many tags or a tag is too long".to_string());
             }

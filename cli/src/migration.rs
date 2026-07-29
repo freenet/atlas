@@ -27,15 +27,23 @@ use freenet_stdlib::prelude::{ContractKey, Parameters};
 ///
 /// - `C6vpLoy2sdzbw9crd9wiAtUJQdeofN4NrANbqAGcLGTU`
 ///   freenet-stdlib 0.8.3 generation, retired by the app-registry change (which
-///   touched `common/`, so the contract re-keyed). NOTE: this generation was
-///   never published. The 0.8.3 bump re-keyed the index but its migration was
-///   never run, so the live curated entries were still sitting at the 0.6.0
-///   address when this entry was added. It is registered anyway so the chain
-///   stays complete: probing an address that never received a PUT is a cheap
-///   no-op, whereas omitting a generation that did would strand it.
+///   touched `common/`, so the contract re-keyed).
+///
+///   **This generation IS published and holds the NEWEST state.** Probed
+///   2026-07-29 it had 36 records / 29 live entries, MORE than the 0.6.0 address
+///   (30 / 23). The 0.8.3 migration did run; what never happened was the UI
+///   rebuild, so the published site kept reading 0.6.0 and froze six entries
+///   behind. Skipping this generation in a migration therefore loses more than
+///   skipping 0.6.0 would.
+///
+///   (An earlier version of this comment asserted the opposite — that it was
+///   never published. It was wrong, and the mistake is instructive: registering a
+///   generation on the belief that it holds nothing, then treating a NotFound on
+///   it as confirmation, is a way to lose exactly the entries you were migrating.
+///   Probe before you conclude.)
 /// - `GDt9A4DteAP6SYPmFXzoTScQuPfwufMaoZxxJaDDB1Yt`
-///   freenet-stdlib 0.6.0 generation, retired by the 0.8.3 bump. This is where
-///   the live curated entries actually were.
+///   freenet-stdlib 0.6.0 generation, retired by the 0.8.3 bump. Still holds the
+///   pre-bump snapshot, and is what the published UI has been reading.
 pub const LEGACY_INDEX_CODE_HASHES: &[&str] = &[
     "C6vpLoy2sdzbw9crd9wiAtUJQdeofN4NrANbqAGcLGTU",
     "GDt9A4DteAP6SYPmFXzoTScQuPfwufMaoZxxJaDDB1Yt",

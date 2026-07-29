@@ -145,6 +145,10 @@ enum Cmd {
         /// Probe/GET only; report what WOULD be carried forward without PUTting.
         #[arg(long)]
         dry_run: bool,
+        /// Accept generations that report NOT FOUND instead of failing. Only use
+        /// this once you have confirmed by hand that they hold nothing.
+        #[arg(long)]
+        allow_missing: bool,
     },
     /// Write the web-container params (root vk) and print its contract id
     /// (needed for the UI base_path). Reuses the root key as the UI owner.
@@ -275,7 +279,10 @@ async fn main() -> Result<()> {
             }
             Ok(())
         }
-        Cmd::Migrate { dry_run } => migrate(&cli, &dir, *dry_run).await,
+        Cmd::Migrate {
+            dry_run,
+            allow_missing,
+        } => migrate(&cli, &dir, *dry_run, *allow_missing).await,
         Cmd::WebappParams { wasm, out_params } => webapp_params(&dir, wasm, out_params),
         Cmd::WebappSign {
             archive,
@@ -331,7 +338,7 @@ async fn push_state(dir: &Path, slug: &str, from: &str, to: &str) -> Result<()> 
 /// A legacy GET that *errors* (a dead-ended / timed-out cross-node probe) is NOT
 /// treated as an empty state: it aborts, so the operator never rebuilds the UI
 /// onto an empty index while entries still live at the old address.
-async fn migrate(cli: &Cli, dir: &Path, dry_run: bool) -> Result<()> {
+async fn migrate(cli: &Cli, dir: &Path, dry_run: bool, allow_missing: bool) -> Result<()> {
     let params = params_bytes(dir, &cli.slug)?;
     let current_key = NodeClient::contract_key(CONTRACT_WASM, &params);
     let legacy_keys = migration::legacy_index_keys(&params);
@@ -360,7 +367,8 @@ async fn migrate(cli: &Cli, dir: &Path, dry_run: bool) -> Result<()> {
         // surveying the remaining generations, then exit non-zero at the end, so
         // the operator sees the full picture rather than only the first failure.
         // A definitive NotFound means the address genuinely holds nothing, which
-        // is a normal outcome when a registered generation was never published.
+        // can be a legitimate outcome (a registered generation that holds nothing),
+        // but is NOT proof of it.
         // Treating it as an abort (which folding it into the error bucket did)
         // made the command unusable: probing an empty generation stopped the run
         // before it reached the generation holding the entries.
@@ -444,19 +452,25 @@ async fn migrate(cli: &Cli, dir: &Path, dry_run: bool) -> Result<()> {
         );
     }
 
-    // The dangerous shape is "skipped everything, merged nothing": that is
-    // indistinguishable from a node that cannot find any of the generations, and
-    // proceeding to rebuild the UI against an empty new index is exactly the
-    // stranding this command exists to prevent. Merging at least one generation
-    // proves the node can reach the old addresses, which makes a NotFound on
-    // another one credible.
-    if missing > 0 && merged == 0 {
+    // ANY skipped generation fails the run unless the operator explicitly accepts
+    // it. An earlier version only failed when NOTHING merged, on the reasoning
+    // that reaching one address made a NotFound elsewhere credible. That
+    // reasoning is wrong: each generation is a different contract key, so a
+    // different ring location with independent placement and findability, and
+    // reaching one says nothing about another.
+    //
+    // The concrete failure it allowed: the newest entries live at legacy[0], not
+    // legacy[1]. If legacy[0] answered NotFound and legacy[1] merged, migrate
+    // exited 0 having silently dropped exactly the entries it was run to recover.
+    if missing > 0 && !allow_missing {
         bail!(
-            "inconclusive: every generation that could have held entries reported \
-             NOT FOUND, and nothing was merged. That is what an unreachable node \
-             looks like, not necessarily an empty history. Confirm connectivity \
-             (`atlasctl raw-get <legacy-id> --out /tmp/x`) and re-run; do NOT \
-             rebuild the UI against this index yet."
+            "{missing} registered generation(s) reported NOT FOUND and were skipped. \
+             NotFound is not proof of absence (a node returns it on retry \
+             exhaustion too), and each generation is a separate contract at a \
+             separate ring location, so reaching one says nothing about another. \
+             Confirm with `atlasctl raw-get <legacy-id> --out /tmp/x`, then either \
+             re-run once reachable or pass --allow-missing to accept the gap. Do \
+             NOT publish a UI against this index until you have."
         );
     }
 
@@ -653,7 +667,15 @@ async fn add(
     // path, so two links to different pages of ONE Delta site collapse here
     // rather than becoming two cards.
     if !allow_duplicate {
-        if let Some(state) = fetch_state(cli, dir).await? {
+        let read = fetch_state(cli, dir).await?;
+        if matches!(read, IndexRead::Unfindable) {
+            eprintln!(
+                "warning: the node could not find the index, so the duplicate check \
+                 was SKIPPED — this may create a second listing for something already \
+                 indexed"
+            );
+        }
+        if let IndexRead::Present(state) = read {
             let key = locator.dedup_key();
             if let Some(existing) = state.live_entries().find(|e| e.locator.dedup_key() == key) {
                 bail!(
@@ -772,22 +794,37 @@ async fn send_index_delta(
     client.update_delta(key, delta).await
 }
 
-/// GET the current index state, or `None` when the index is empty.
-async fn fetch_state(cli: &Cli, dir: &Path) -> Result<Option<IndexState>> {
+/// What a read of the index actually told us.
+///
+/// Three outcomes, and conflating the last two is a real hazard: `NotFound` from
+/// the node means "I could not find this contract", which covers both a
+/// never-initialized index AND an index that exists but is momentarily
+/// unfindable (the node returns NotFound on retry exhaustion too). Treating that
+/// as "no registry yet" is how a curator ends up signing a fresh v1 registry that
+/// silently discards the v7 one already on the network.
+enum IndexRead {
+    /// The node served a state. Boxed only to keep the enum small; a whole index
+    /// state dwarfs the other two variants.
+    Present(Box<IndexState>),
+    /// The node served an empty state (initialized but nothing in it).
+    Empty,
+    /// The node could not find the contract. NOT proof it does not exist.
+    Unfindable,
+}
+
+async fn fetch_state(cli: &Cli, dir: &Path) -> Result<IndexRead> {
     let params = params_bytes(dir, &cli.slug)?;
     let key = NodeClient::contract_key(CONTRACT_WASM, &params);
     let mut client = NodeClient::connect(&cli.node).await?;
-    // `get_optional`, not `get`: a not-yet-initialized index is a legitimate
-    // starting state for `app-set`, not a failure.
     let Some(bytes) = client.get_optional(&key, false).await? else {
-        return Ok(None);
+        return Ok(IndexRead::Unfindable);
     };
     if bytes.is_empty() {
-        return Ok(None);
+        return Ok(IndexRead::Empty);
     }
-    Ok(Some(
+    Ok(IndexRead::Present(Box::new(
         ciborium::de::from_reader(&bytes[..]).context("decoding index state")?,
-    ))
+    )))
 }
 
 /// Set (or, with `record: None`, remove) one app in the registry.
@@ -809,7 +846,23 @@ async fn app_set(
         root_vk: root.verifying_key(),
         slug: cli.slug.clone(),
     };
-    let current = fetch_state(cli, dir).await?.and_then(|s| s.apps);
+    let current = match fetch_state(cli, dir).await? {
+        // Refusing here is the whole point of the tri-state. If the node cannot
+        // find the index we do not know what registry is on the network, and
+        // proceeding would sign a body built from nothing: the contract would
+        // reject it as too old (so the edit silently does not happen) or, worse,
+        // accept it and drop every app the real registry held.
+        IndexRead::Unfindable => bail!(
+            "the node could not find this index, so the current registry is \
+             unknown. That is NOT proof it does not exist — a node reports the \
+             same thing when a GET exhausts its retries. Refusing to sign a \
+             registry that could silently discard the apps already registered. \
+             Check `atlasctl apps` / `atlasctl show` and retry once the index is \
+             reachable."
+        ),
+        IndexRead::Empty => None,
+        IndexRead::Present(state) => state.apps,
+    };
     // NEVER let the root key sign bytes we have not verified. The fetched state
     // is whatever the node handed back; if it were doctored (hostile `--node`, a
     // node bug, a corrupt local store) its app records would be carried into the
@@ -936,7 +989,27 @@ fn apps_json(registry: Option<&AppRegistry>) -> String {
 }
 
 async fn apps(cli: &Cli, dir: &Path, json: bool) -> Result<()> {
-    let registry = fetch_state(cli, dir).await?.and_then(|s| s.apps);
+    let root = load_key(&dir.join("root.key"))?;
+    let params = IndexParams {
+        root_vk: root.verifying_key(),
+        slug: cli.slug.clone(),
+    };
+    let registry = match fetch_state(cli, dir).await? {
+        IndexRead::Unfindable => bail!("the node could not find this index"),
+        IndexRead::Empty => None,
+        IndexRead::Present(state) => state.apps,
+    };
+    // Verify before printing. `apps --json` is documented as the crawler's input,
+    // and the printer is a hand-rolled serializer that is only safe because the
+    // fields are charset-validated — but that validation happens at WRITE time and
+    // in the contract, so a node serving a doctored state would otherwise have its
+    // unvalidated field values printed straight into the JSON.
+    if let Some(reg) = &registry {
+        reg.verify_for(&params)
+            .map_err(|e| anyhow!("refusing to print an unverified registry: {e}"))?;
+        reg.check_structure()
+            .map_err(|e| anyhow!("refusing to print a malformed registry: {e}"))?;
+    }
     if json {
         println!("{}", apps_json(registry.as_ref()));
         return Ok(());

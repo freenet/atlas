@@ -53,7 +53,10 @@ jobs:
       # the UI compiles, and the real value is supplied at publish time.
       - name: ui check
         env:
-          ATLAS_INDEX_ID: CJUR37WSMxV7C1yhrr3xSgjnrJT5yuvQGFNcgvSnsvg
+          # Obviously-fake placeholder of the right shape. Deliberately NOT a real
+          # index id: the previous value here was the retired 0.6.0 address, i.e.
+          # exactly the stale id that froze the live site, which invites a copy-paste.
+          ATLAS_INDEX_ID: PLACEHOLDERnotARealIndexId111111111111111111
         run: cargo check --locked -p atlas-ui --target wasm32-unknown-unknown
 
   contract-key:

@@ -4,7 +4,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use freenet_stdlib::client_api::{
     ClientRequest, ContractRequest, ContractResponse, HostResponse, WebApi,
 };
@@ -122,11 +122,30 @@ impl NodeClient {
             subscribe,
             blocking_subscribe: subscribe,
         };
+        let want = *key.id();
         match self.roundtrip(ClientRequest::ContractOp(req)).await? {
-            HostResponse::ContractResponse(ContractResponse::GetResponse { state, .. }) => {
+            // Match the identity, do not discard it. `migrate` drives several keys
+            // through ONE client in sequence, and `roundtrip` takes whatever frame
+            // arrives next, so a late reply to an earlier (timed-out) request would
+            // otherwise be attributed to the key being probed now. That used to
+            // cost an abort; now that NotFound means "absent", it would instead
+            // silently skip a generation that holds entries.
+            HostResponse::ContractResponse(ContractResponse::GetResponse {
+                key: got,
+                state,
+                ..
+            }) => {
+                if *got.id() != want {
+                    bail!("GET response was for contract {got}, not {want}");
+                }
                 Ok(Some(state.as_ref().to_vec()))
             }
-            HostResponse::ContractResponse(ContractResponse::NotFound { .. }) => Ok(None),
+            HostResponse::ContractResponse(ContractResponse::NotFound { instance_id }) => {
+                if instance_id != want {
+                    bail!("NotFound response was for contract {instance_id}, not {want}");
+                }
+                Ok(None)
+            }
             other => Err(anyhow!("unexpected GET response: {other:?}")),
         }
     }

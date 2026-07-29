@@ -59,6 +59,23 @@ pub struct IndexSummary {
     pub versions: BTreeMap<SubjectId, u64>,
     #[serde(default)]
     pub apps_version: u64,
+    /// First 8 bytes of the app registry's signature, or zero when there is none.
+    ///
+    /// A VERSION ALONE IS NOT ENOUGH, and the reason is upstream of this contract:
+    /// freenet-core's `plan_fanout_send` returns `Skip` when two peers' summary
+    /// BYTES are identical, before `get_state_delta` is ever called
+    /// (`node/network_bridge/broadcast_queue.rs`, "byte-identical summaries are
+    /// trivially converged"). So two peers holding different registry bodies at
+    /// the same version would summarise identically, never exchange, and diverge
+    /// permanently — and no amount of loosening the delta gate could fix it,
+    /// because the delta is never requested.
+    ///
+    /// The signature covers the body, so differing bodies give differing
+    /// signatures and therefore differing summary bytes. Eight bytes is a
+    /// convergence hint, not a security boundary: a collision (2^-64) costs one
+    /// missed sync that the full-state anti-entropy path still heals.
+    #[serde(default)]
+    pub apps_fingerprint: [u8; 8],
 }
 
 /// The diff a peer needs to catch up: records newer than its summary, and a
@@ -198,11 +215,14 @@ impl IndexState {
         // supersede it. Verify before adopting, and adopt only a strictly newer
         // one so replaying an old delta cannot roll the registry back.
         //
-        // Decided here but APPLIED at the end, after every fallible check below.
-        // Mutating `self` and then returning `Err` would leave a partially
-        // applied state for any caller that keeps its state on error (the
-        // contract discards it, but that is the caller's choice, not a property
-        // of this function).
+        // Decided here but APPLIED at the end, after every fallible check below, so
+        // a rejected delta cannot leave a re-pointed registry behind.
+        //
+        // Scoped to the registry on purpose: the RECORD loop below is NOT atomic
+        // (it inserts as it goes, so a later record failing verification returns
+        // `Err` with earlier ones already applied). That is pre-existing and safe
+        // only because the contract discards its state on error. Do not read this
+        // comment as a claim about the whole function.
         let new_registry = match &delta.apps {
             Some(apps) => {
                 apps.verify_for(params)?;
@@ -214,21 +234,14 @@ impl IndexState {
             }
             None => None,
         };
-        // A registry-only delta carries no records, so do not demand a key_auth it
-        // has no use for: the old code rejected it with a message about records it
-        // never sent, which is simply a wrong error.
-        //
-        // This does NOT make `app-set` work against an uninitialized index —
-        // `verify` still requires a key_auth (and the contract re-verifies the
-        // merged state), so such an index still refuses the update, just with an
-        // accurate message. Pinned by
-        // `a_registry_only_delta_is_admitted_but_an_uninitialized_index_fails_verify`.
-        if delta.records.is_empty() {
-            if let Some(r) = new_registry {
-                self.apps = Some(r);
-            }
-            return Ok(());
-        }
+        // NOTE: there is deliberately no "registry-only delta skips the key_auth
+        // lookup" shortcut here. One was added on the belief that it fixed
+        // `app-set` against a fresh index; it did not. For an INITIALIZED index the
+        // lookup already succeeds and the empty record loop is a no-op, and for an
+        // UNINITIALIZED one the contract's post-merge `verify` demands a key_auth
+        // anyway. So the shortcut changed no observable behaviour while adding a
+        // path through the contract that skipped the key_auth and MAX_ENTRIES
+        // checks. Removed.
         let ka = self
             .key_auth
             .clone()
@@ -266,6 +279,11 @@ impl IndexState {
                 .map(|(sid, rec)| (sid.clone(), rec.body.version()))
                 .collect(),
             apps_version: self.apps.as_ref().map_or(0, |a| a.body.version),
+            apps_fingerprint: self.apps.as_ref().map_or([0u8; 8], |a| {
+                let mut fp = [0u8; 8];
+                fp.copy_from_slice(&a.sig.to_bytes()[..8]);
+                fp
+            }),
         }
     }
 
@@ -274,14 +292,25 @@ impl IndexState {
             Some(ka) if ka.body.version > summary.key_auth_version => Some(ka.clone()),
             _ => None,
         };
-        // `>=`, not `>`. `registry_order` breaks equal-version ties on signature
-        // bytes, but the SUMMARY carries only the version, so two peers holding
-        // different registry bodies at the same version produce identical
-        // summaries and neither would ever send its copy: they would diverge
-        // permanently while both believed they were in sync. Re-sending at equal
-        // version costs one small object and the merge is idempotent.
+        // Send when we are strictly newer, OR at equal version when the bodies
+        // actually differ (detected via the fingerprint, not the version).
+        //
+        // An earlier attempt used `>=` unconditionally. That was wrong twice over:
+        // it could not fix the equal-version divergence it was aimed at, because
+        // freenet-core skips fan-out on byte-identical summaries before asking for
+        // a delta (see `IndexSummary::apps_fingerprint`); and it made the delta
+        // NEVER empty for any state holding a registry, which defeats the
+        // empty-delta convergence verdict the node uses to suppress redundant
+        // fan-out. With the fingerprint in the summary, differing bodies differ in
+        // summary bytes, so the exchange happens and this gate can stay tight.
         let apps = match &self.apps {
-            Some(a) if a.body.version >= summary.apps_version => Some(a.clone()),
+            Some(a) if a.body.version > summary.apps_version => Some(a.clone()),
+            Some(a)
+                if a.body.version == summary.apps_version
+                    && a.sig.to_bytes()[..8] != summary.apps_fingerprint =>
+            {
+                Some(a.clone())
+            }
             _ => None,
         };
         let records = self
@@ -733,10 +762,36 @@ mod tests {
     /// still refuses the resulting state, so the contract rejects the update. The
     /// early return is about giving an accurate error, not about permitting it.
     #[test]
-    fn a_registry_only_delta_is_admitted_but_an_uninitialized_index_fails_verify() {
+    fn a_registry_only_delta_against_an_uninitialized_index_is_rejected() {
         let root = key();
         let params = params(&root);
         let mut st = IndexState::default();
+        let err = st
+            .apply_delta(
+                &IndexDelta {
+                    key_auth: None,
+                    records: vec![],
+                    apps: Some(registry(&root, 1, ID_A)),
+                },
+                &params,
+            )
+            .expect_err("an index with no key_auth must refuse the update");
+        assert!(err.contains("key_auth"), "unexpected error: {err}");
+        // And nothing was applied: a rejected delta must not leave the registry
+        // behind, which is what deciding-then-applying buys.
+        assert!(
+            st.apps.is_none(),
+            "a rejected delta must not mutate the state"
+        );
+    }
+
+    /// The same delta against an INITIALIZED index is accepted — which is why the
+    /// records-empty shortcut was unnecessary.
+    #[test]
+    fn a_registry_only_delta_against_an_initialized_index_is_accepted() {
+        let (root, online) = (key(), key());
+        let params = params(&root);
+        let mut st = IndexState::initialized(key_auth(&root, &online, 1));
         st.apply_delta(
             &IndexDelta {
                 key_auth: None,
@@ -745,15 +800,8 @@ mod tests {
             },
             &params,
         )
-        .expect("a registry-only delta needs no key_auth to be applied");
-        assert!(st.apps.is_some());
-        let err = st
-            .verify(&params)
-            .expect_err("a state with no key_auth must still fail verify");
-        assert!(
-            err.contains("key_auth"),
-            "the error must name the real problem, got: {err}"
-        );
+        .expect("a registry-only delta needs no records");
+        assert_eq!(st.apps.as_ref().unwrap().body.version, 1);
     }
 
     /// Same for `merge`: adopting into a state that has none.
@@ -867,11 +915,22 @@ mod tests {
         ba.merge(&a);
         assert_eq!(ab.apps, ba.apps, "equal-version registries must converge");
 
-        // The summary carries only the version, so an equal-version peer must
-        // still be sent the registry.
+        // The summaries must DIFFER IN BYTES, or freenet-core skips the fan-out
+        // before a delta is ever requested and the two never converge.
+        let (sa, sb) = (a.summarize(), b.summarize());
+        assert_ne!(
+            sa.apps_fingerprint, sb.apps_fingerprint,
+            "equal-version different-body summaries must not be byte-identical"
+        );
         assert!(
-            a.delta(&b.summarize()).apps.is_some(),
-            "an equal-version summary must still receive the registry"
+            a.delta(&sb).apps.is_some(),
+            "an equal-version peer with a different body must receive the registry"
+        );
+        // …and an equal-version peer with the SAME body must NOT, so the
+        // empty-delta convergence verdict still works.
+        assert!(
+            a.delta(&sa).apps.is_none(),
+            "an identical peer must not be re-sent the registry"
         );
     }
 

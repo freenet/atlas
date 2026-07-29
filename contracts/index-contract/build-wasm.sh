@@ -32,7 +32,10 @@ export RUSTFLAGS="\
 ${RUSTFLAGS:-}"
 
 cd "$workspace"
-cargo build --release -p atlas-index-contract --target wasm32-unknown-unknown
+# --locked: this artifact's hash IS the contract's address, and freenet-stdlib is a
+# caret requirement, so letting cargo re-resolve would silently change the address.
+# Fail loudly on a stale lockfile instead.
+cargo build --locked --release -p atlas-index-contract --target wasm32-unknown-unknown
 
 built="$workspace/target/wasm32-unknown-unknown/release/atlas_index_contract.wasm"
 dest="$here/atlas_index_contract.wasm"
