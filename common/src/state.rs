@@ -2,33 +2,73 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
-use crate::types::{IndexEntry, IndexParams, KeyAuth, RecordBody, SignedRecord, SubjectId};
+use crate::types::{
+    AppRegistry, IndexEntry, IndexParams, KeyAuth, RecordBody, SignedRecord, SubjectId,
+};
 use crate::{MAX_AUTHORIZED, MAX_ENTRIES};
+
+/// Total order used to resolve which app registry wins. Higher version wins;
+/// ties break deterministically on signature bytes so merge is commutative.
+///
+/// Unlike `key_auth` (immutable in 0.1, see [`IndexState::merge`]), the registry
+/// is genuinely mutable: the curator re-points an app whenever it republishes.
+/// That is safe for associativity here because the registry does not gate
+/// authorization of anything else in the state, so no record's admissibility
+/// depends on which registry version is current. Records are authorized by
+/// `key_auth` alone, and an `AppResource` entry naming an app the registry does
+/// not (yet) know is structurally valid and merely unresolvable.
+fn registry_order(r: &AppRegistry) -> (u64, [u8; 64]) {
+    (r.body.version, r.sig.to_bytes())
+}
 
 /// The full index state: a root-signed authorization of online keys, plus one
 /// current record per subject. Records merge as a commutative monoid (per-subject
 /// last-write-wins by `(version, signature)`), so peers converge regardless of
 /// the order updates arrive in.
+///
+/// ADDING A FIELD (the migration path constrains this). `atlasctl migrate` GETs
+/// a PRIOR generation's state and deserializes it with the CURRENT types, so a
+/// field the old encoding does not have must default rather than fail the whole
+/// decode — a decode error there would silently strand the entire curated index.
+/// Two verified facts about the encoding govern what is safe (both pinned by
+/// `a_state_encoded_before_the_apps_field_still_decodes` and
+/// `a_summary_encoded_before_apps_version_still_decodes`):
+///
+/// 1. ciborium encodes a struct as a CBOR **map keyed by field name**, not a
+///    positional array, so a new field may be added anywhere and reordering
+///    fields is not a wire change.
+/// 2. A missing `Option<T>` field decodes to `None` on its own (serde's derive
+///    special-cases it); a missing NON-`Option` field is a hard decode error.
+///
+/// So `#[serde(default)]` is REQUIRED on any new non-`Option` field, and is kept
+/// on `Option` ones as documentation of the intent rather than for effect.
 #[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug, Default)]
 pub struct IndexState {
     pub key_auth: Option<KeyAuth>,
     pub records: BTreeMap<SubjectId, SignedRecord>,
+    /// Root-signed registry resolving `Locator::AppResource` to a live address.
+    #[serde(default)]
+    pub apps: Option<AppRegistry>,
 }
 
 /// Compact "what I have" for delta computation: per-subject versions plus the
-/// key_auth version.
+/// key_auth and app-registry versions.
 #[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug, Default)]
 pub struct IndexSummary {
     pub key_auth_version: u64,
     pub versions: BTreeMap<SubjectId, u64>,
+    #[serde(default)]
+    pub apps_version: u64,
 }
 
 /// The diff a peer needs to catch up: records newer than its summary, and a
-/// newer key_auth if any.
+/// newer key_auth or app registry if any.
 #[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug, Default)]
 pub struct IndexDelta {
     pub key_auth: Option<KeyAuth>,
     pub records: Vec<SignedRecord>,
+    #[serde(default)]
+    pub apps: Option<AppRegistry>,
 }
 
 /// Total order used to resolve which record wins for a subject. Higher version
@@ -47,6 +87,7 @@ impl IndexState {
         IndexState {
             key_auth: Some(key_auth),
             records: BTreeMap::new(),
+            apps: None,
         }
     }
 
@@ -61,6 +102,10 @@ impl IndexState {
                 "key_auth authorizes too many keys: {}",
                 ka.body.authorized.len()
             ));
+        }
+        if let Some(apps) = &self.apps {
+            apps.verify_sig(&params.root_vk)?;
+            apps.check_structure()?;
         }
         if self.records.len() > MAX_ENTRIES {
             return Err(format!("too many records: {}", self.records.len()));
@@ -107,11 +152,22 @@ impl IndexState {
             }
             _ => {}
         }
+        // App registry: plain max by (version, sig bytes) — commutative,
+        // associative, idempotent, with None as the identity.
+        if let Some(o) = &other.apps {
+            let take = self
+                .apps
+                .as_ref()
+                .is_none_or(|cur| registry_order(o) > registry_order(cur));
+            if take {
+                self.apps = Some(o.clone());
+            }
+        }
         for (sid, orec) in &other.records {
             let take = self
                 .records
                 .get(sid)
-                .map_or(true, |cur| record_order(orec) > record_order(cur));
+                .is_none_or(|cur| record_order(orec) > record_order(cur));
             if take {
                 self.records.insert(sid.clone(), orec.clone());
             }
@@ -138,6 +194,20 @@ impl IndexState {
                 Some(_) => return Err("key_auth is immutable in this version".to_string()),
             }
         }
+        // The registry is root-signed and mutable, so a delta may legitimately
+        // supersede it. Verify before adopting, and adopt only a strictly newer
+        // one so replaying an old delta cannot roll the registry back.
+        if let Some(apps) = &delta.apps {
+            apps.verify_sig(&params.root_vk)?;
+            apps.check_structure()?;
+            let take = self
+                .apps
+                .as_ref()
+                .is_none_or(|cur| registry_order(apps) > registry_order(cur));
+            if take {
+                self.apps = Some(apps.clone());
+            }
+        }
         let ka = self
             .key_auth
             .clone()
@@ -152,7 +222,7 @@ impl IndexState {
             let take = self
                 .records
                 .get(&sid)
-                .map_or(true, |cur| record_order(rec) > record_order(cur));
+                .is_none_or(|cur| record_order(rec) > record_order(cur));
             if take {
                 self.records.insert(sid, rec.clone());
             }
@@ -171,12 +241,17 @@ impl IndexState {
                 .iter()
                 .map(|(sid, rec)| (sid.clone(), rec.body.version()))
                 .collect(),
+            apps_version: self.apps.as_ref().map_or(0, |a| a.body.version),
         }
     }
 
     pub fn delta(&self, summary: &IndexSummary) -> IndexDelta {
         let key_auth = match &self.key_auth {
             Some(ka) if ka.body.version > summary.key_auth_version => Some(ka.clone()),
+            _ => None,
+        };
+        let apps = match &self.apps {
+            Some(a) if a.body.version > summary.apps_version => Some(a.clone()),
             _ => None,
         };
         let records = self
@@ -186,11 +261,39 @@ impl IndexState {
                 summary
                     .versions
                     .get(*sid)
-                    .map_or(true, |v| rec.body.version() > *v)
+                    .is_none_or(|v| rec.body.version() > *v)
             })
             .map(|(_, rec)| rec.clone())
             .collect();
-        IndexDelta { key_auth, records }
+        IndexDelta {
+            key_auth,
+            records,
+            apps,
+        }
+    }
+
+    /// Resolve an entry's locator to a gateway-relative href, or `None` when it
+    /// is an [`Locator::AppResource`] whose app the registry does not know yet.
+    ///
+    /// Lives here rather than in the UI so `atlasctl` and the UI agree on what a
+    /// locator points at.
+    pub fn resolve_href(&self, loc: &crate::types::Locator) -> Option<String> {
+        use crate::types::Locator;
+        match loc {
+            Locator::External { url } => Some(url.clone()),
+            Locator::Freenet { contract_id, path } => Some(contract_web_href(contract_id, path)),
+            Locator::AppResource {
+                app,
+                resource,
+                path,
+            } => {
+                let rec = self.apps.as_ref()?.get(app)?;
+                Some(contract_web_href(
+                    &rec.contract_id,
+                    &rec.resolve(resource, path),
+                ))
+            }
+        }
     }
 
     /// Live (non-tombstoned) entries, for clients rendering Discover/search.
@@ -199,6 +302,22 @@ impl IndexState {
             RecordBody::Live(e) => Some(e),
             RecordBody::Tomb(_) => None,
         })
+    }
+}
+
+/// Build `/v1/contract/web/<id><suffix>`, guaranteeing the slash the gateway's
+/// cross-contract nav handler requires between the id and the suffix.
+///
+/// The gateway tolerates a slash-less form on a direct top-level load (it 308s),
+/// but a click inside the sandboxed app iframe is validated against
+/// `/v1/contract/web/<id>/` by the parent shell and is silently dropped without
+/// it. A locator whose suffix is empty or starts with `#`/`?` would otherwise
+/// produce exactly that.
+pub fn contract_web_href(contract_id: &str, suffix: &str) -> String {
+    if suffix.starts_with('/') {
+        format!("/v1/contract/web/{contract_id}{suffix}")
+    } else {
+        format!("/v1/contract/web/{contract_id}/{suffix}")
     }
 }
 
@@ -277,6 +396,7 @@ mod tests {
             &IndexDelta {
                 key_auth: None,
                 records: vec![rec],
+                apps: None,
             },
             &p,
         )
@@ -324,6 +444,7 @@ mod tests {
             &IndexDelta {
                 key_auth: None,
                 records: vec![v2],
+                apps: None,
             },
             &p,
         )
@@ -332,6 +453,7 @@ mod tests {
             &IndexDelta {
                 key_auth: None,
                 records: vec![v1],
+                apps: None,
             },
             &p,
         )
@@ -357,6 +479,7 @@ mod tests {
             &IndexDelta {
                 key_auth: None,
                 records: vec![live],
+                apps: None,
             },
             &p,
         )
@@ -366,6 +489,7 @@ mod tests {
             &IndexDelta {
                 key_auth: None,
                 records: vec![tomb],
+                apps: None,
             },
             &p,
         )
@@ -389,6 +513,7 @@ mod tests {
                 &IndexDelta {
                     key_auth: None,
                     records: vec![rec],
+                    apps: None,
                 },
                 &p,
             )
@@ -409,6 +534,7 @@ mod tests {
                 &IndexDelta {
                     key_auth: None,
                     records: vec![rec],
+                    apps: None,
                 },
                 &p,
             )
@@ -428,11 +554,220 @@ mod tests {
                 &IndexDelta {
                     key_auth: Some(forged),
                     records: vec![],
+                    apps: None,
                 },
                 &p,
             )
             .unwrap_err();
         assert!(err.contains("key_auth sig"), "got: {err}");
+    }
+
+    // --- app registry ---
+
+    fn app_record(id: &str) -> crate::types::AppRecord {
+        crate::types::AppRecord {
+            contract_id: id.to_string(),
+            name: "Delta".to_string(),
+            link_template: "/#{resource}{path}".to_string(),
+        }
+    }
+
+    fn registry(root: &SigningKey, version: u64, id: &str) -> AppRegistry {
+        let mut body = crate::types::AppRegistryBody {
+            version,
+            ..Default::default()
+        };
+        body.apps.insert("delta".to_string(), app_record(id));
+        let sig = sign(&body, root);
+        AppRegistry { body, sig }
+    }
+
+    const ID_A: &str = "EqJ5YpEEV3XLqEvKWLQHFhGAac2qXzSUoE6k2zbdnXBr";
+    const ID_B: &str = "771DvtPMwt2PumPyrFvsz7fpvU1gogcmb5qtS1yYEEH9";
+
+    /// A re-pointed registry must win, and the merge must be order-independent:
+    /// this is the whole reason an app republish is one edit and not N.
+    #[test]
+    fn newer_app_registry_wins_in_either_merge_order() {
+        let (root, online) = (key(), key());
+        let mut a = IndexState::initialized(key_auth(&root, &online, 1));
+        a.apps = Some(registry(&root, 1, ID_A));
+        let mut b = IndexState::initialized(key_auth(&root, &online, 1));
+        b.apps = Some(registry(&root, 2, ID_B));
+
+        let mut ab = a.clone();
+        ab.merge(&b);
+        let mut ba = b.clone();
+        ba.merge(&a);
+        assert_eq!(ab.apps, ba.apps, "registry merge must be commutative");
+        assert_eq!(
+            ab.apps.as_ref().unwrap().get("delta").unwrap().contract_id,
+            ID_B,
+            "the newer registry version must win"
+        );
+        // Idempotent.
+        let mut again = ab.clone();
+        again.merge(&b);
+        assert_eq!(again.apps, ab.apps);
+    }
+
+    /// Replaying an OLD registry delta must not roll the registry back, or an
+    /// app republish could be silently undone by stale traffic.
+    #[test]
+    fn an_older_registry_delta_does_not_roll_back() {
+        let (root, online) = (key(), key());
+        let params = params(&root);
+        let mut st = IndexState::initialized(key_auth(&root, &online, 1));
+        st.apps = Some(registry(&root, 5, ID_B));
+        st.apply_delta(
+            &IndexDelta {
+                key_auth: None,
+                records: vec![],
+                apps: Some(registry(&root, 2, ID_A)),
+            },
+            &params,
+        )
+        .unwrap();
+        assert_eq!(
+            st.apps.as_ref().unwrap().get("delta").unwrap().contract_id,
+            ID_B,
+            "an older registry version must be ignored"
+        );
+    }
+
+    /// The registry re-points every AppResource entry, so a non-root signature
+    /// must be refused: an online-key compromise must not redirect Delta.
+    #[test]
+    fn a_registry_not_signed_by_root_is_rejected() {
+        let (root, online) = (key(), key());
+        let params = params(&root);
+        let mut st = IndexState::initialized(key_auth(&root, &online, 1));
+        // Signed by the ONLINE key, which is authorized for entries but not for
+        // the registry.
+        let forged = registry(&online, 1, ID_A);
+        assert!(st
+            .apply_delta(
+                &IndexDelta {
+                    key_auth: None,
+                    records: vec![],
+                    apps: Some(forged.clone()),
+                },
+                &params,
+            )
+            .is_err());
+        // …and a state carrying it fails validate_state too.
+        st.apps = Some(forged);
+        assert!(st.verify(&params).is_err());
+    }
+
+    /// `atlasctl migrate` decodes a PRIOR generation's state with the CURRENT
+    /// types. A state encoded before `apps` existed must still decode, or the
+    /// migration silently loses the entire curated index.
+    #[test]
+    fn a_state_encoded_before_the_apps_field_still_decodes() {
+        #[derive(Serialize)]
+        struct LegacyIndexState {
+            key_auth: Option<KeyAuth>,
+            records: BTreeMap<SubjectId, SignedRecord>,
+        }
+        let (root, online) = (key(), key());
+        let s = sid(1);
+        let mut records = BTreeMap::new();
+        records.insert(
+            s.clone(),
+            signed(RecordBody::Live(entry(&s, 1, "legacy")), &online),
+        );
+        let legacy = LegacyIndexState {
+            key_auth: Some(key_auth(&root, &online, 1)),
+            records,
+        };
+        let mut buf = Vec::new();
+        ciborium::ser::into_writer(&legacy, &mut buf).unwrap();
+
+        let decoded: IndexState = ciborium::de::from_reader(&buf[..]).unwrap();
+        assert_eq!(decoded.records.len(), 1, "legacy records must survive");
+        assert!(decoded.apps.is_none());
+        assert!(decoded.verify(&params(&root)).is_ok());
+    }
+
+    /// Same for the summary: a peer running the older code sends a summary with
+    /// no `apps_version`, and we must treat that as 0 (send it the registry)
+    /// rather than failing to decode its summary at all.
+    #[test]
+    fn a_summary_encoded_before_apps_version_still_decodes() {
+        #[derive(Serialize)]
+        struct LegacySummary {
+            key_auth_version: u64,
+            versions: BTreeMap<SubjectId, u64>,
+        }
+        let legacy = LegacySummary {
+            key_auth_version: 1,
+            versions: BTreeMap::new(),
+        };
+        let mut buf = Vec::new();
+        ciborium::ser::into_writer(&legacy, &mut buf).unwrap();
+        let decoded: IndexSummary = ciborium::de::from_reader(&buf[..]).unwrap();
+        assert_eq!(decoded.apps_version, 0);
+
+        // …and the delta computed against it therefore carries the registry.
+        let (root, online) = (key(), key());
+        let mut st = IndexState::initialized(key_auth(&root, &online, 1));
+        st.apps = Some(registry(&root, 3, ID_A));
+        assert!(st.delta(&decoded).apps.is_some());
+    }
+
+    /// An entry pointing at an app the registry does not know is VALID but
+    /// unresolvable. Rejecting it instead would make validity depend on merge
+    /// order (entry before registry edit).
+    #[test]
+    fn an_unknown_app_is_valid_but_unresolvable() {
+        let (root, online) = (key(), key());
+        let params = params(&root);
+        let s = sid(9);
+        let mut e = entry(&s, 1, "a delta site");
+        e.locator = Locator::AppResource {
+            app: "delta".into(),
+            resource: "AmcVD92D3U".into(),
+            path: "/3/delta-sites".into(),
+        };
+        let loc = e.locator.clone();
+        let mut st = IndexState::initialized(key_auth(&root, &online, 1));
+        st.apply_delta(
+            &IndexDelta {
+                key_auth: None,
+                records: vec![signed(RecordBody::Live(e), &online)],
+                apps: None,
+            },
+            &params,
+        )
+        .expect("an entry naming an unregistered app must still be accepted");
+        assert!(st.verify(&params).is_ok());
+        assert!(st.resolve_href(&loc).is_none(), "not resolvable yet");
+
+        // Registering the app makes every such entry resolve, with no entry edit.
+        st.apps = Some(registry(&root, 1, ID_A));
+        assert_eq!(
+            st.resolve_href(&loc).unwrap(),
+            format!("/v1/contract/web/{ID_A}/#AmcVD92D3U/3/delta-sites")
+        );
+    }
+
+    /// The slash between the contract id and the suffix is load-bearing: without
+    /// it a click inside the sandboxed iframe is silently dropped by the shell.
+    #[test]
+    fn resolved_hrefs_always_separate_the_id_from_the_suffix() {
+        assert_eq!(
+            contract_web_href(ID_A, "/#x"),
+            format!("/v1/contract/web/{ID_A}/#x")
+        );
+        assert_eq!(
+            contract_web_href(ID_A, "#x"),
+            format!("/v1/contract/web/{ID_A}/#x")
+        );
+        assert_eq!(
+            contract_web_href(ID_A, ""),
+            format!("/v1/contract/web/{ID_A}/")
+        );
     }
 
     #[test]
@@ -509,6 +844,7 @@ mod tests {
                 &IndexDelta {
                     key_auth: Some(key_auth(&root, &k2, 2)),
                     records: vec![],
+                    apps: None,
                 },
                 &p,
             )
@@ -519,6 +855,7 @@ mod tests {
             &IndexDelta {
                 key_auth: Some(key_auth(&root, &k1, 1)),
                 records: vec![],
+                apps: None,
             },
             &p,
         )
@@ -545,6 +882,7 @@ mod tests {
                     &IndexDelta {
                         key_auth: None,
                         records: vec![rec],
+                        apps: None,
                     },
                     &p,
                 )

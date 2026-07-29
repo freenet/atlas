@@ -11,8 +11,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, bail, Context, Result};
 use atlas_common::{
-    generate_key, sign, IndexDelta, IndexEntry, IndexParams, IndexState, KeyAuth, KeyAuthBody,
-    Kind, Locator, RecordBody, SignedRecord, SubjectId, Tombstone,
+    generate_key, sign, AppRecord, AppRegistry, IndexDelta, IndexEntry, IndexParams, IndexState,
+    KeyAuth, KeyAuthBody, Kind, Locator, RecordBody, SignedRecord, SubjectId, Tombstone,
 };
 use clap::{Parser, Subcommand};
 use ed25519_dalek::{Signature, Signer, SigningKey};
@@ -57,7 +57,8 @@ enum Cmd {
         /// Comma-separated tags.
         #[arg(long, default_value = "")]
         tags: String,
-        /// `freenet:<full-id><path>` or `https://...`
+        /// `freenet:<full-id><path>`, `app:<slug>/<resource>[<path>]`, or
+        /// `https://...`
         #[arg(long)]
         locator: String,
         #[arg(long)]
@@ -69,6 +70,40 @@ enum Cmd {
         subject: String,
         #[arg(long)]
         cur_version: u64,
+    },
+    /// Register or re-point an app in the root-signed app registry, so
+    /// `app:<slug>/<resource>` locators resolve to a live address.
+    ///
+    /// Run this after an app republishes: it is the ONE edit that re-points
+    /// every `AppResource` entry for that app, instead of rewriting each entry.
+    /// Reads the current registry, applies the change, and PUTs it back at
+    /// version+1 (root-signed).
+    AppSet {
+        /// App slug, `[a-z0-9-]` (e.g. `delta`).
+        #[arg(long)]
+        slug: String,
+        /// The app's CURRENT web-container contract instance id.
+        #[arg(long)]
+        contract_id: String,
+        /// Display name (e.g. `Delta`).
+        #[arg(long)]
+        name: String,
+        /// Path template after the contract id; `{resource}` and `{path}` are
+        /// substituted.
+        #[arg(long, default_value = "/#{resource}{path}")]
+        link_template: String,
+    },
+    /// Remove an app from the registry. Entries naming it stay in the index but
+    /// become unresolvable, so prefer re-pointing over removing.
+    AppUnset {
+        #[arg(long)]
+        slug: String,
+    },
+    /// Print the app registry. `--json` emits the machine-readable form the
+    /// crawler consumes to recognise app-hosted links.
+    Apps {
+        #[arg(long)]
+        json: bool,
     },
     /// GET and print the index's live entries.
     Show {
@@ -169,6 +204,26 @@ async fn main() -> Result<()> {
             subject,
             cur_version,
         } => remove(&cli, &dir, subject, *cur_version).await,
+        Cmd::AppSet {
+            slug,
+            contract_id,
+            name,
+            link_template,
+        } => {
+            app_set(
+                &cli,
+                &dir,
+                slug,
+                Some(AppRecord {
+                    contract_id: contract_id.clone(),
+                    name: name.clone(),
+                    link_template: link_template.clone(),
+                }),
+            )
+            .await
+        }
+        Cmd::AppUnset { slug } => app_set(&cli, &dir, slug, None).await,
+        Cmd::Apps { json } => apps(&cli, &dir, *json).await,
         Cmd::Show { subscribe } => show(&cli, &dir, *subscribe).await,
         Cmd::Key => {
             let params = params_bytes(&dir, &cli.slug)?;
@@ -559,10 +614,21 @@ async fn show(cli: &Cli, dir: &Path, subscribe: bool) -> Result<()> {
     let mut entries: Vec<_> = state.live_entries().collect();
     entries.sort_by_key(|e| std::cmp::Reverse(e.added_at));
     println!("{} live entries:", entries.len());
+    let mut unresolvable = 0;
     for e in entries {
         let star = if e.featured { "★ " } else { "  " };
+        // Flag an app-hosted entry the registry cannot resolve: the listing is
+        // structurally valid but would not open, and that is a curator action
+        // (register the app) rather than a bad entry.
+        let note = match state.resolve_href(&e.locator) {
+            Some(_) => String::new(),
+            None => {
+                unresolvable += 1;
+                "  [UNRESOLVABLE: app not in registry]".to_string()
+            }
+        };
         println!(
-            "{star}{}  [{:?}]  {}\n     {}\n     {}",
+            "{star}{}  [{:?}]  {}\n     {}\n     {}{note}",
             e.subject_id.as_str(),
             e.kind,
             e.title,
@@ -570,18 +636,131 @@ async fn show(cli: &Cli, dir: &Path, subscribe: bool) -> Result<()> {
             e.locator.to_uri()
         );
     }
+    if unresolvable > 0 {
+        println!(
+            "\n{unresolvable} entr{} unresolvable — register the app with `atlasctl app-set`",
+            if unresolvable == 1 { "y is" } else { "ies are" }
+        );
+    }
     Ok(())
 }
 
 async fn send_delta(cli: &Cli, dir: &Path, records: Vec<SignedRecord>) -> Result<()> {
+    send_index_delta(cli, dir, records, None).await
+}
+
+async fn send_index_delta(
+    cli: &Cli,
+    dir: &Path,
+    records: Vec<SignedRecord>,
+    apps: Option<AppRegistry>,
+) -> Result<()> {
     let delta = encode(&IndexDelta {
         key_auth: None,
         records,
+        apps,
     })?;
     let params = params_bytes(dir, &cli.slug)?;
     let key = NodeClient::contract_key(CONTRACT_WASM, &params);
     let mut client = NodeClient::connect(&cli.node).await?;
     client.update_delta(key, delta).await
+}
+
+/// GET the current index state, or `None` when the index is empty.
+async fn fetch_state(cli: &Cli, dir: &Path) -> Result<Option<IndexState>> {
+    let params = params_bytes(dir, &cli.slug)?;
+    let key = NodeClient::contract_key(CONTRACT_WASM, &params);
+    let mut client = NodeClient::connect(&cli.node).await?;
+    let bytes = client.get(&key, false).await?;
+    if bytes.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(
+        ciborium::de::from_reader(&bytes[..]).context("decoding index state")?,
+    ))
+}
+
+/// Set (or, with `record: None`, remove) one app in the registry.
+///
+/// Read-modify-write against the live registry rather than a blind overwrite, so
+/// re-pointing `delta` cannot silently drop `river`. The version increments off
+/// what is actually on the network; a concurrent curator edit would be resolved
+/// by the contract's max-by-(version, sig) merge, and the loser is visibly the
+/// one whose change is absent from a later `atlasctl apps`.
+async fn app_set(cli: &Cli, dir: &Path, slug: &str, record: Option<AppRecord>) -> Result<()> {
+    let root = load_key(&dir.join("root.key"))?;
+    let current = fetch_state(cli, dir).await?.and_then(|s| s.apps);
+    let mut body = current.map(|a| a.body).unwrap_or_default();
+    match record {
+        Some(rec) => {
+            rec.check()
+                .map_err(|e| anyhow!("invalid app record: {e}"))?;
+            body.apps.insert(slug.to_string(), rec);
+        }
+        None => {
+            if body.apps.remove(slug).is_none() {
+                bail!("app `{slug}` is not registered");
+            }
+        }
+    }
+    body.version += 1;
+    let registry = AppRegistry {
+        sig: sign(&body, &root),
+        body,
+    };
+    registry
+        .check_structure()
+        .map_err(|e| anyhow!("invalid app registry: {e}"))?;
+    let version = registry.body.version;
+    let count = registry.body.apps.len();
+    send_index_delta(cli, dir, Vec::new(), Some(registry)).await?;
+    println!("app registry now at version {version} ({count} app(s))");
+    Ok(())
+}
+
+async fn apps(cli: &Cli, dir: &Path, json: bool) -> Result<()> {
+    let registry = fetch_state(cli, dir).await?.and_then(|s| s.apps);
+    let Some(registry) = registry else {
+        if json {
+            println!("{{\"version\":0,\"apps\":{{}}}}");
+        } else {
+            println!("(no app registry)");
+        }
+        return Ok(());
+    };
+    if json {
+        // Hand-rolled so the CLI does not take a serde_json dependency purely
+        // for this. Every field is validated (slug `[a-z0-9-]`, base58 id, and a
+        // template with no `:` and no unknown placeholder), so none can contain
+        // a character that needs JSON escaping.
+        let apps = registry
+            .body
+            .apps
+            .iter()
+            .map(|(slug, r)| {
+                format!(
+                    "\"{slug}\":{{\"contract_id\":\"{}\",\"name\":\"{}\",\"link_template\":\"{}\"}}",
+                    r.contract_id,
+                    r.name.replace('\\', "\\\\").replace('"', "\\\""),
+                    r.link_template
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        println!(
+            "{{\"version\":{},\"apps\":{{{apps}}}}}",
+            registry.body.version
+        );
+    } else {
+        println!("app registry version {}:", registry.body.version);
+        for (slug, r) in &registry.body.apps {
+            println!(
+                "  {slug}  {}  {}\n     template {}",
+                r.name, r.contract_id, r.link_template
+            );
+        }
+    }
+    Ok(())
 }
 
 fn params_bytes(dir: &Path, slug: &str) -> Result<Vec<u8>> {
@@ -635,6 +814,22 @@ fn parse_kind(s: &str) -> Result<Kind> {
 }
 
 fn parse_locator(s: &str) -> Result<Locator> {
+    if let Some(rest) = s.strip_prefix("app:") {
+        // `app:<slug>/<resource>[<path>]`. The resource ends at the first
+        // separator, so a deep link (`app:delta/AmcVD92D3U/3/delta-sites`) keeps
+        // everything after it as the path.
+        let (slug, after) = rest
+            .split_once('/')
+            .ok_or_else(|| anyhow!("app locator must be `app:<slug>/<resource>[<path>]`"))?;
+        let res_end = after.find(['/', '#', '?']).unwrap_or(after.len());
+        let loc = Locator::AppResource {
+            app: slug.to_string(),
+            resource: after[..res_end].to_string(),
+            path: after[res_end..].to_string(),
+        };
+        loc.check().map_err(|e| anyhow!("{e}"))?;
+        return Ok(loc);
+    }
     if let Some(rest) = s.strip_prefix("freenet:") {
         let is_b58 = |c: char| {
             matches!(c,
@@ -652,7 +847,7 @@ fn parse_locator(s: &str) -> Result<Locator> {
         loc.check().map_err(|e| anyhow!("{e}"))?;
         Ok(loc)
     } else {
-        bail!("locator must start with `freenet:` or `https://`")
+        bail!("locator must start with `freenet:`, `app:` or `https://`")
     }
 }
 

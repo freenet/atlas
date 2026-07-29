@@ -14,8 +14,8 @@ mod types;
 
 pub use state::{IndexDelta, IndexState, IndexSummary};
 pub use types::{
-    IndexEntry, IndexParams, KeyAuth, KeyAuthBody, Kind, Locator, RecordBody, SignedRecord,
-    SubjectId, Tombstone,
+    AppRecord, AppRegistry, AppRegistryBody, IndexEntry, IndexParams, KeyAuth, KeyAuthBody, Kind,
+    Locator, RecordBody, SignedRecord, SubjectId, Tombstone,
 };
 
 /// Max records in a single index contract. Keeps the full state inside the
@@ -30,6 +30,23 @@ pub const MAX_TITLE: usize = 200;
 pub const MAX_SNIPPET: usize = 500;
 pub const MAX_TAGS: usize = 16;
 pub const MAX_TAG_LEN: usize = 40;
+
+/// Cap on registered apps in the app registry. The registry is root-signed and
+/// resolves every `Locator::AppResource`, so it is small, curated, and bounded
+/// well below the entry count.
+pub const MAX_APPS: usize = 64;
+/// Max length of an app slug (`delta`, `river`, …).
+pub const MAX_APP_SLUG: usize = 32;
+/// Max length of an app's display name.
+pub const MAX_APP_NAME: usize = 64;
+/// Max length of an app's link template.
+pub const MAX_LINK_TEMPLATE: usize = 128;
+/// Max length of an app-hosted resource handle (a Delta site prefix, a River
+/// room handle, …). Generous enough for a full base58 verifying key.
+pub const MAX_RESOURCE: usize = 64;
+/// Max length of the path suffix inside any locator. Bounds state growth from a
+/// pathological deep link.
+pub const MAX_LOCATOR_PATH: usize = 512;
 
 /// Canonical CBOR bytes used as the signing payload for any signed struct.
 /// Signing and verification must both go through this so the bytes match.
