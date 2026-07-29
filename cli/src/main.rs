@@ -92,12 +92,18 @@ enum Cmd {
         /// substituted.
         #[arg(long, default_value = "/#{resource}{path}")]
         link_template: String,
+        /// The registry version you believe you are superseding. Required once a
+        /// registry exists, so a stale read cannot silently drop another app.
+        #[arg(long)]
+        expect_version: Option<u64>,
     },
     /// Remove an app from the registry. Entries naming it stay in the index but
     /// become unresolvable, so prefer re-pointing over removing.
     AppUnset {
         #[arg(long)]
         slug: String,
+        #[arg(long)]
+        expect_version: Option<u64>,
     },
     /// Print the app registry. `--json` emits the machine-readable form the
     /// crawler consumes to recognise app-hosted links.
@@ -209,6 +215,7 @@ async fn main() -> Result<()> {
             contract_id,
             name,
             link_template,
+            expect_version,
         } => {
             app_set(
                 &cli,
@@ -219,10 +226,14 @@ async fn main() -> Result<()> {
                     name: name.clone(),
                     link_template: link_template.clone(),
                 }),
+                *expect_version,
             )
             .await
         }
-        Cmd::AppUnset { slug } => app_set(&cli, &dir, slug, None).await,
+        Cmd::AppUnset {
+            slug,
+            expect_version,
+        } => app_set(&cli, &dir, slug, None, *expect_version).await,
         Cmd::Apps { json } => apps(&cli, &dir, *json).await,
         Cmd::Show { subscribe } => show(&cli, &dir, *subscribe).await,
         Cmd::Key => {
@@ -315,6 +326,7 @@ async fn migrate(cli: &Cli, dir: &Path, dry_run: bool) -> Result<()> {
     // early-return — every non-empty generation participates.
     let mut merged = 0usize;
     let mut probe_errors = 0usize;
+    let mut missing = 0usize;
     for (i, key) in legacy_keys.iter().enumerate() {
         // M1: a GET *error* (dead-ended / timed-out cross-node probe) must NEVER
         // be silently treated as an empty state — otherwise a rebuild would land
@@ -323,7 +335,29 @@ async fn migrate(cli: &Cli, dir: &Path, dry_run: bool) -> Result<()> {
         // re-runs; the merge is idempotent). In a dry-run we instead warn and keep
         // surveying the remaining generations, then exit non-zero at the end, so
         // the operator sees the full picture rather than only the first failure.
-        let plan = match plan_generation(client.get(key, false).await) {
+        // A definitive NotFound means the address genuinely holds nothing, which
+        // is a normal outcome when a registered generation was never published.
+        // Treating it as an abort (which folding it into the error bucket did)
+        // made the command unusable: probing an empty generation stopped the run
+        // before it reached the generation holding the entries.
+        //
+        // It is reported LOUDLY rather than silently, because NotFound is not
+        // absolute proof of absence — a contract that exists but is momentarily
+        // unfindable answers the same way. The merge is idempotent, so re-running
+        // later recovers such a generation; the operator just has to know to.
+        let probe = client.get_optional(key, false).await;
+        if let Ok(None) = &probe {
+            println!(
+                "legacy[{i}] {} NOT FOUND — treated as absent and skipped.\n\
+                 WARNING: if that generation was actually published, it is \
+                 momentarily unfindable rather than empty; re-run migrate later \
+                 (merging is idempotent) and confirm with `atlasctl show`.",
+                key.id()
+            );
+            missing += 1;
+            continue;
+        }
+        let plan = match plan_generation(probe.map(|o| o.unwrap_or_default())) {
             Ok(plan) => plan,
             Err(e) if dry_run => {
                 eprintln!(
@@ -373,6 +407,14 @@ async fn migrate(cli: &Cli, dir: &Path, dry_run: bool) -> Result<()> {
                 }
             }
         }
+    }
+
+    if missing > 0 {
+        println!(
+            "\nNOTE: {missing} registered generation(s) reported NOT FOUND and were \
+             skipped as absent. If any of them was in fact published, re-run \
+             `atlasctl migrate` once it is reachable — merging is idempotent."
+        );
     }
 
     if dry_run {
@@ -687,10 +729,56 @@ async fn fetch_state(cli: &Cli, dir: &Path) -> Result<Option<IndexState>> {
 /// what is actually on the network; a concurrent curator edit would be resolved
 /// by the contract's max-by-(version, sig) merge, and the loser is visibly the
 /// one whose change is absent from a later `atlasctl apps`.
-async fn app_set(cli: &Cli, dir: &Path, slug: &str, record: Option<AppRecord>) -> Result<()> {
+async fn app_set(
+    cli: &Cli,
+    dir: &Path,
+    slug: &str,
+    record: Option<AppRecord>,
+    expect_version: Option<u64>,
+) -> Result<()> {
     let root = load_key(&dir.join("root.key"))?;
+    let params = IndexParams {
+        root_vk: root.verifying_key(),
+        slug: cli.slug.clone(),
+    };
     let current = fetch_state(cli, dir).await?.and_then(|s| s.apps);
+    // NEVER let the root key sign bytes we have not verified. The fetched state
+    // is whatever the node handed back; if it were doctored (hostile `--node`, a
+    // node bug, a corrupt local store) its app records would be carried into the
+    // new body and signed with the ROOT key, laundering an attacker-chosen
+    // contract id into a legitimately root-signed registry. That is precisely
+    // the authority root-signing exists to withhold.
+    if let Some(cur) = &current {
+        cur.verify_for(&params).map_err(|e| {
+            anyhow!(
+                "refusing to build on the registry this node returned: {e}. \
+                 The node may be serving a forged or corrupt state."
+            )
+        })?;
+        cur.check_structure()
+            .map_err(|e| anyhow!("refusing to build on a malformed registry: {e}"))?;
+    }
+    let cur_version = current.as_ref().map_or(0, |a| a.body.version);
+    // A stale local replica is the realistic hazard, not a racing curator: a
+    // stale read plus version+1 still wins the merge and silently drops an app
+    // registered elsewhere. Once a registry exists, make the operator state the
+    // version they believe they are superseding.
+    match expect_version {
+        Some(v) if v != cur_version => bail!(
+            "registry is at version {cur_version}, not {v} — re-run `atlasctl apps` \
+             and retry with the version you intend to supersede"
+        ),
+        None if cur_version > 0 => bail!(
+            "registry is at version {cur_version}; pass --expect-version {cur_version} \
+             to confirm you are editing that version (guards against a stale read \
+             silently dropping another app)"
+        ),
+        _ => {}
+    }
     let mut body = current.map(|a| a.body).unwrap_or_default();
+    // Binds the signature to THIS index, so it cannot be replayed into another
+    // index run by the same root key.
+    body.index_slug = cli.slug.clone();
     match record {
         Some(rec) => {
             rec.check()
@@ -703,7 +791,9 @@ async fn app_set(cli: &Cli, dir: &Path, slug: &str, record: Option<AppRecord>) -
             }
         }
     }
-    body.version += 1;
+    body.version = cur_version
+        .checked_add(1)
+        .ok_or_else(|| anyhow!("registry version would overflow"))?;
     let registry = AppRegistry {
         sig: sign(&body, &root),
         body,
@@ -711,6 +801,11 @@ async fn app_set(cli: &Cli, dir: &Path, slug: &str, record: Option<AppRecord>) -
     registry
         .check_structure()
         .map_err(|e| anyhow!("invalid app registry: {e}"))?;
+    // Verify what we just built, so a bug here cannot ship a registry the
+    // contract would refuse.
+    registry
+        .verify_for(&params)
+        .map_err(|e| anyhow!("built an invalid registry: {e}"))?;
     let version = registry.body.version;
     let count = registry.body.apps.len();
     send_index_delta(cli, dir, Vec::new(), Some(registry)).await?;
@@ -729,10 +824,14 @@ async fn apps(cli: &Cli, dir: &Path, json: bool) -> Result<()> {
         return Ok(());
     };
     if json {
-        // Hand-rolled so the CLI does not take a serde_json dependency purely
-        // for this. Every field is validated (slug `[a-z0-9-]`, base58 id, and a
-        // template with no `:` and no unknown placeholder), so none can contain
-        // a character that needs JSON escaping.
+        // Hand-rolled so the CLI does not take a serde_json dependency purely for
+        // this. Safe only because every interpolated field is charset-validated
+        // by `AppRecord::check` / `check_app_slug`: the slug is `[a-z0-9-]`, the
+        // contract id is base58, `name` is printable ASCII minus `"` and `\\`,
+        // and the template is restricted to URL-suffix characters. So no value
+        // can contain a character that would need escaping or could break the
+        // document. If any of those charsets is ever widened, this must switch to
+        // a real JSON serializer.
         let apps = registry
             .body
             .apps
@@ -740,9 +839,7 @@ async fn apps(cli: &Cli, dir: &Path, json: bool) -> Result<()> {
             .map(|(slug, r)| {
                 format!(
                     "\"{slug}\":{{\"contract_id\":\"{}\",\"name\":\"{}\",\"link_template\":\"{}\"}}",
-                    r.contract_id,
-                    r.name.replace('\\', "\\\\").replace('"', "\\\""),
-                    r.link_template
+                    r.contract_id, r.name, r.link_template
                 )
             })
             .collect::<Vec<_>>()

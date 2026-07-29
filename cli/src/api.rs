@@ -92,6 +92,30 @@ impl NodeClient {
     }
 
     pub async fn get(&mut self, key: &ContractKey, subscribe: bool) -> Result<Vec<u8>> {
+        match self.get_optional(key, subscribe).await? {
+            Some(state) => Ok(state),
+            None => Err(anyhow!("contract {} not found", key.id())),
+        }
+    }
+
+    /// GET that distinguishes "the node says this contract does not exist" from
+    /// "the request failed".
+    ///
+    /// The difference is load-bearing for `migrate`. Folding `NotFound` into the
+    /// same bucket as a timeout meant probing a legacy generation that genuinely
+    /// holds nothing aborted the whole migration before it reached the generation
+    /// that holds the entries. A definitive `NotFound` is exactly the
+    /// "genuinely-absent address" signal the migration needs.
+    ///
+    /// Caveat the caller must respect: `NotFound` is not an absolute proof of
+    /// absence. A contract that exists but is currently unfindable (the known
+    /// near-miss floor) also answers `NotFound`, so a caller treating `None` as
+    /// empty must say so loudly rather than silently.
+    pub async fn get_optional(
+        &mut self,
+        key: &ContractKey,
+        subscribe: bool,
+    ) -> Result<Option<Vec<u8>>> {
         let req = ContractRequest::Get {
             key: *key.id(),
             return_contract_code: false,
@@ -100,8 +124,9 @@ impl NodeClient {
         };
         match self.roundtrip(ClientRequest::ContractOp(req)).await? {
             HostResponse::ContractResponse(ContractResponse::GetResponse { state, .. }) => {
-                Ok(state.as_ref().to_vec())
+                Ok(Some(state.as_ref().to_vec()))
             }
+            HostResponse::ContractResponse(ContractResponse::NotFound { .. }) => Ok(None),
             other => Err(anyhow!("unexpected GET response: {other:?}")),
         }
     }

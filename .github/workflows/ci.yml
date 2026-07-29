@@ -15,12 +15,11 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      # rust-toolchain.toml pins the channel, components and the wasm target, so
-      # the action installs exactly what the contract build needs.
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          toolchain: none
-      - run: rustup show active-toolchain || rustup toolchain install
+      # No toolchain action: rust-toolchain.toml pins the channel, components and
+      # the wasm target, and `rustup toolchain install` with no argument installs
+      # exactly that. Naming a version here too would let the two drift, and the
+      # contract's address depends on the exact compiler.
+      - run: rustup toolchain install && rustup show
       - uses: Swatinem/rust-cache@v2
 
       - name: cargo fmt
@@ -29,37 +28,44 @@ jobs:
       # The contract and the UI target wasm32 and are covered by their own jobs;
       # linting them for the host target would fail on wasm-only deps.
       - name: cargo clippy (native crates)
-        run: cargo clippy --workspace --exclude atlas-ui --exclude atlas-index-contract --all-targets
+        run: cargo clippy --locked --workspace --exclude atlas-ui --exclude atlas-index-contract --all-targets
 
       - name: cargo test (native crates)
-        run: cargo test --workspace --exclude atlas-ui --exclude atlas-index-contract
+        run: cargo test --locked --workspace --exclude atlas-ui --exclude atlas-index-contract
 
   wasm:
     name: wasm builds
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          toolchain: none
-      - run: rustup show active-toolchain || rustup toolchain install
+      # No toolchain action: rust-toolchain.toml pins the channel, components and
+      # the wasm target, and `rustup toolchain install` with no argument installs
+      # exactly that. Naming a version here too would let the two drift, and the
+      # contract's address depends on the exact compiler.
+      - run: rustup toolchain install && rustup show
       - uses: Swatinem/rust-cache@v2
 
       - name: contract clippy
-        run: cargo clippy -p atlas-index-contract --target wasm32-unknown-unknown
+        run: cargo clippy --locked -p atlas-index-contract --target wasm32-unknown-unknown
 
+      # ATLAS_INDEX_ID has no default by design (a stale default silently froze
+      # the published site once). A placeholder is fine here: this job checks that
+      # the UI compiles, and the real value is supplied at publish time.
       - name: ui check
-        run: cargo check -p atlas-ui --target wasm32-unknown-unknown
+        env:
+          ATLAS_INDEX_ID: CJUR37WSMxV7C1yhrr3xSgjnrJT5yuvQGFNcgvSnsvg
+        run: cargo check --locked -p atlas-ui --target wasm32-unknown-unknown
 
   contract-key:
     name: committed contract WASM is current
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          toolchain: none
-      - run: rustup show active-toolchain || rustup toolchain install
+      # No toolchain action: rust-toolchain.toml pins the channel, components and
+      # the wasm target, and `rustup toolchain install` with no argument installs
+      # exactly that. Naming a version here too would let the two drift, and the
+      # contract's address depends on the exact compiler.
+      - run: rustup toolchain install && rustup show
       - uses: Swatinem/rust-cache@v2
 
       # The index's on-network address is hash(compiled_wasm, params), and
@@ -69,10 +75,20 @@ jobs:
       # vice versa). This job rebuilds and diffs, so the re-key is visible in the
       # PR rather than discovered after a publish.
       #
-      # It does NOT assert byte-reproducibility against another machine — only
-      # that the artifact matches THIS source tree, built with the same
-      # remap-path-prefix flags the release script uses.
+      # This IS a cross-machine byte-reproducibility assertion: it compares an
+      # artifact built on a contributor's machine against a rebuild on the runner.
+      # So a red diff here means EITHER a stale committed artifact OR a genuine
+      # reproducibility break (toolchain drift, an unremapped path leaking in).
+      # Check `rustup show` and the RUSTFLAGS below before assuming staleness.
+      #
+      # RUSTFLAGS is cleared: build-wasm.sh appends `${RUSTFLAGS:-}` to its own
+      # remap flags, so the workflow-level `-D warnings` would reach this build
+      # and not a local one. Lint level does not affect codegen today, but the
+      # whole point of this job is byte identity, and the next flag someone adds
+      # to that env block might.
       - name: rebuild contract wasm
+        env:
+          RUSTFLAGS: ""
         run: contracts/index-contract/build-wasm.sh
 
       - name: committed artifact matches source
@@ -87,3 +103,29 @@ jobs:
             exit 1
           fi
           echo "committed WASM matches source"
+
+      # The stale-artifact check above does NOT catch the other half of the
+      # hazard: a `common/` change that legitimately re-keys the contract but
+      # never registers the OUTGOING generation. That passes every other check
+      # (the artifact matches source, the registered hashes still match their
+      # preserved WASMs) and silently orphans the curated index at the old
+      # address. So: if the artifact changed versus the merge base, the migration
+      # registry and a preserved WASM must change in the same diff.
+      - name: a re-key must register the outgoing generation
+        if: github.event_name == 'pull_request'
+        run: |
+          base="origin/${{ github.base_ref }}"
+          git fetch --depth=1 origin "${{ github.base_ref }}"
+          wasm=contracts/index-contract/atlas_index_contract.wasm
+          if git diff --quiet "$base" HEAD -- "$wasm"; then
+            echo "contract WASM unchanged versus $base — no re-key, nothing to register"
+            exit 0
+          fi
+          echo "contract WASM CHANGED versus $base: the index re-keys."
+          ok=1
+          git diff --name-only "$base" HEAD -- cli/src/migration.rs | grep -q . \
+            || { echo "::error::contract WASM changed but cli/src/migration.rs was not updated — prepend the OUTGOING code hash to LEGACY_INDEX_CODE_HASHES"; ok=0; }
+          git diff --name-only --diff-filter=A "$base" HEAD -- 'contracts/index-contract/legacy/*.wasm' | grep -q . \
+            || { echo "::error::contract WASM changed but no new file was added under contracts/index-contract/legacy/ — preserve the outgoing generation's WASM"; ok=0; }
+          [ "$ok" = 1 ] && echo "re-key ritual present"
+          exit $((1 - ok))

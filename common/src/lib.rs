@@ -9,10 +9,11 @@
 use ed25519_dalek::{Signature, SignatureError, Signer, SigningKey, VerifyingKey};
 use serde::Serialize;
 
+mod path;
 mod state;
 mod types;
 
-pub use state::{IndexDelta, IndexState, IndexSummary};
+pub use state::{contract_web_href, IndexDelta, IndexState, IndexSummary};
 pub use types::{
     AppRecord, AppRegistry, AppRegistryBody, IndexEntry, IndexParams, KeyAuth, KeyAuthBody, Kind,
     Locator, RecordBody, SignedRecord, SubjectId, Tombstone,
@@ -44,6 +45,9 @@ pub const MAX_LINK_TEMPLATE: usize = 128;
 /// Max length of an app-hosted resource handle (a Delta site prefix, a River
 /// room handle, …). Generous enough for a full base58 verifying key.
 pub const MAX_RESOURCE: usize = 64;
+/// Max length of an external `https://` url. Previously unbounded, which made
+/// `MAX_ENTRIES` meaningless as a byte bound.
+pub const MAX_EXTERNAL_URL: usize = 1024;
 /// Max length of the path suffix inside any locator. Bounds state growth from a
 /// pathological deep link.
 pub const MAX_LOCATOR_PATH: usize = 512;

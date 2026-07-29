@@ -112,6 +112,12 @@ impl Locator {
                 if !url.starts_with("https://") {
                     return Err("external locator must be https".to_string());
                 }
+                if url.len() > crate::MAX_EXTERNAL_URL {
+                    return Err(format!("external url length {} out of range", url.len()));
+                }
+                if crate::path::has_control_char(url) {
+                    return Err("external url contains a control character".to_string());
+                }
                 Ok(())
             }
             Locator::AppResource {
@@ -163,21 +169,49 @@ impl Locator {
     }
 }
 
-/// Shared path rule for every locator variant: no `..` segment in the path,
-/// query, or fragment, and a bounded length.
+/// Shared path rule for every locator variant.
+///
+/// Applied to the WHOLE suffix (path, query and fragment together) rather than
+/// to the path portion alone. An app-hosted locator routes through the fragment,
+/// so a traversal there is a real attempt on the app's router; and the browser
+/// normalises dot segments across the whole URL regardless of which component we
+/// think they live in.
+///
+/// Delegates to [`crate::path`] so the encoded forms are actually covered.
+/// A hand-rolled check against the literal strings `..` and `%2e%2e` is worse
+/// than nothing, because it reads as complete coverage while `..%2f`,
+/// `%2e%2e%2f`, `%252e%252e`, `.%2e` and `..\` all walk straight through it.
 fn check_path(path: &str) -> Result<(), String> {
     if path.len() > crate::MAX_LOCATOR_PATH {
         return Err(format!("path length {} out of range", path.len()));
     }
-    // Split off query/fragment first, then look for a traversal segment. The
-    // fragment matters here as well as the path: an app-hosted locator routes
-    // through the fragment, so a `..` there is a real traversal attempt on the
-    // app's own router, not inert trailing text.
-    if path.split(['?', '#']).any(|part| {
-        part.split('/')
-            .any(|seg| seg == ".." || seg.eq_ignore_ascii_case("%2e%2e"))
-    }) {
-        return Err("path contains a `..` segment".to_string());
+    if crate::path::has_control_char(path) {
+        return Err("path contains a control character".to_string());
+    }
+    if crate::path::has_dot_segment(path) {
+        return Err("path contains a `.`/`..` segment (in any encoding)".to_string());
+    }
+    // A leading `//` escapes the contract root without using dots at all: the
+    // node hands the post-key remainder to `Path::join`, which DISCARDS the base
+    // when given an absolute path.
+    if crate::path::is_absolute_escape(path) {
+        return Err("path escapes the contract root by being absolute".to_string());
+    }
+    Ok(())
+}
+
+/// Printable-ASCII, length-bounded text for a field that reaches both a DOM text
+/// node and a JSON string value. Excluding control characters and the JSON
+/// metacharacters at validation time means neither sink has to escape.
+fn check_display_text(s: &str, max: usize, what: &str) -> Result<(), String> {
+    if s.is_empty() || s.len() > max {
+        return Err(format!("{what} length {} out of range", s.len()));
+    }
+    if let Some(c) = s
+        .chars()
+        .find(|c| !matches!(c, ' '..='~') || *c == '"' || *c == '\\')
+    {
+        return Err(format!("{what} has a disallowed character {c:?}"));
     }
     Ok(())
 }
@@ -346,27 +380,47 @@ impl AppRecord {
         if !self.contract_id.chars().all(is_base58_char) {
             return Err("app contract id has non-base58 chars".to_string());
         }
-        if self.name.is_empty() || self.name.len() > crate::MAX_APP_NAME {
-            return Err(format!("app name length {} out of range", self.name.len()));
-        }
+        // `name` reaches the DOM as text and `atlasctl apps --json` as a JSON
+        // string value. A printable-ASCII allowlist makes both safe by
+        // construction rather than by escaping at each sink.
+        check_display_text(&self.name, crate::MAX_APP_NAME, "app name")?;
         let t = &self.link_template;
         if t.is_empty() || t.len() > crate::MAX_LINK_TEMPLATE {
             return Err(format!("link template length {} out of range", t.len()));
         }
+        // The template is emitted into a JSON string too, and `"`/`\` there would
+        // break the document. Restrict it to the characters a URL suffix actually
+        // needs, which also removes `%` (so no encoded traversal can hide in the
+        // template itself) and `\` (a path separator to the URL parser).
+        for c in t.chars() {
+            if !matches!(c,
+                'a'..='z' | 'A'..='Z' | '0'..='9'
+                | '/' | '-' | '_' | '.' | '~' | '#' | '?' | '=' | '&' | '+' | ',' | '{' | '}')
+            {
+                return Err(format!("link template has a disallowed character {c:?}"));
+            }
+        }
         if !t.starts_with('/') {
             return Err("link template must start with `/`".to_string());
-        }
-        // `//host` is protocol-relative: appended to a gateway origin it would
-        // still be same-origin, but as a bare href it retargets to another host.
-        // Refuse it rather than reason about every context it lands in.
-        if t.starts_with("//") {
-            return Err("link template must not start with `//`".to_string());
         }
         if !t.contains("{resource}") {
             return Err("link template must contain `{resource}`".to_string());
         }
-        if t.contains(':') {
-            return Err("link template must not contain `:`".to_string());
+        // Without `{path}` an entry's deep link is silently discarded at resolve
+        // time while the entry still reports as resolvable. Require it, so a
+        // template can never swallow part of a locator.
+        if !t.contains("{path}") {
+            return Err("link template must contain `{path}`".to_string());
+        }
+        // `{resource}` must be the FIRST placeholder. Otherwise `/{path}...`
+        // puts caller-controlled text immediately after the leading slash, and a
+        // `path` of `/x` yields a `//x` suffix — the absolute-escape primitive
+        // that `check_path` refuses for a locator, smuggled in via the template.
+        // `resource` is base58, so it can never begin with a separator.
+        let r_at = t.find("{resource}").expect("checked above");
+        let p_at = t.find("{path}").expect("checked above");
+        if p_at < r_at {
+            return Err("`{path}` must not precede `{resource}` in a link template".to_string());
         }
         check_path(t)?;
         // Any placeholder other than the two we substitute would survive into
@@ -395,6 +449,19 @@ impl AppRecord {
 #[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug, Default)]
 pub struct AppRegistryBody {
     pub version: u64,
+    /// The `slug` from the index's own [`IndexParams`], binding this signature to
+    /// ONE index instance.
+    ///
+    /// Without it, a root key that operates more than one index (the `--slug`
+    /// flag exists precisely for that: a staging index alongside production)
+    /// produces registries that are valid at every one of its indices, because
+    /// `verify_sig` only checks `root_vk`. Any peer could then lift a
+    /// higher-version registry from staging and replay it into production, where
+    /// it wins on version and re-points every `AppResource` entry. `KeyAuth` has
+    /// the same missing binding but is immune because it is immutable; a
+    /// version-ordered mutable object replays and STICKS.
+    #[serde(default)]
+    pub index_slug: String,
     /// Slug -> record. A `BTreeMap` so the CBOR signing payload is deterministic.
     pub apps: BTreeMap<String, AppRecord>,
 }
@@ -413,9 +480,19 @@ pub struct AppRegistry {
 }
 
 impl AppRegistry {
-    pub fn verify_sig(&self, root_vk: &VerifyingKey) -> Result<(), String> {
-        crate::verify(&self.body, &self.sig, root_vk)
-            .map_err(|e| format!("bad app registry sig: {e}"))
+    /// Verify the root signature AND that this registry was signed for THIS
+    /// index. Takes the whole [`IndexParams`] rather than just the key so the
+    /// slug binding cannot be forgotten at a call site.
+    pub fn verify_for(&self, params: &IndexParams) -> Result<(), String> {
+        crate::verify(&self.body, &self.sig, &params.root_vk)
+            .map_err(|e| format!("bad app registry sig: {e}"))?;
+        if self.body.index_slug != params.slug {
+            return Err(format!(
+                "app registry is signed for index slug {:?}, not {:?}",
+                self.body.index_slug, params.slug
+            ));
+        }
+        Ok(())
     }
 
     pub fn check_structure(&self) -> Result<(), String> {
@@ -468,6 +545,8 @@ impl IndexParams {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ed25519_dalek::SigningKey;
+    use rand::rngs::OsRng;
 
     const ID: &str = "EqJ5YpEEV3XLqEvKWLQHFhGAac2qXzSUoE6k2zbdnXBr";
 
@@ -582,13 +661,22 @@ mod tests {
         // Each of these could retarget or escape the app's web root once
         // concatenated after /v1/contract/web/<id>.
         for bad in [
-            "#{resource}",               // no leading slash
-            "//evil.example/{resource}", // protocol-relative
-            "https://evil.example/{resource}",
-            "/x:{resource}",      // scheme-ish
-            "/{resource}/../..",  // traversal
-            "/#{res}",            // missing {resource}
-            "/#{resource}{oops}", // unknown placeholder survives into the URL
+            "#{resource}{path}",               // no leading slash
+            "//evil.example/{resource}{path}", // protocol-relative
+            "https://evil.example/{resource}{path}",
+            "/x:{resource}{path}",      // scheme-ish
+            "/{resource}{path}/../..",  // traversal
+            "/{resource}{path}/%2e%2e", // encoded traversal
+            "/#{res}{path}",            // missing {resource}
+            "/#{resource}{path}{oops}", // unknown placeholder survives into the URL
+            "/#{resource}",             // missing {path} silently drops deep links
+            // `{path}` before `{resource}` puts caller-controlled text right
+            // after the leading slash, so a path of `/x` yields a `//x` suffix:
+            // the absolute-escape primitive, smuggled in via the template.
+            "/{path}{resource}",
+            "/#{resource}{path}\"", // would emit invalid `apps --json`
+            "/#{resource}{path}\\", // ditto, and `\` is a path separator
+            "/#{resource}{path} ",  // space
             "",
         ] {
             assert!(
@@ -597,7 +685,108 @@ mod tests {
             );
         }
         assert!(record("/#{resource}{path}").check().is_ok());
-        assert!(record("/{resource}").check().is_ok());
+        assert!(record("/{resource}{path}").check().is_ok());
+    }
+
+    /// The `{path}`-before-`{resource}` rule exists to stop a `//` suffix. Pin
+    /// the concrete escape it prevents, so the rule cannot be relaxed silently.
+    #[test]
+    fn a_path_first_template_would_have_produced_an_absolute_escape() {
+        let hostile = AppRecord {
+            contract_id: ID.to_string(),
+            name: "Delta".to_string(),
+            link_template: "/{path}{resource}".to_string(),
+        };
+        // Rejected at validation…
+        assert!(hostile.check().is_err());
+        // …and this is why: the resolved suffix escapes the contract root.
+        let suffix = hostile.resolve("AmcVD92D3U", "/etc/passwd");
+        assert!(
+            crate::path::is_absolute_escape(&suffix),
+            "expected an absolute escape, got {suffix:?}"
+        );
+    }
+
+    /// `resource` is substituted BEFORE `path`, so a `{resource}` appearing
+    /// inside a path is inert rather than being expanded a second time.
+    #[test]
+    fn resolve_does_not_re_substitute_into_the_path() {
+        let r = record("/#{resource}{path}");
+        assert_eq!(
+            r.resolve("AmcVD92D3U", "/{resource}"),
+            "/#AmcVD92D3U/{resource}"
+        );
+    }
+
+    #[test]
+    fn app_record_rejects_a_bad_contract_id() {
+        // NB 43 chars is legal as well as 44, so a one-char truncation is valid.
+        for bad in [
+            "",
+            "short",
+            "../../x",
+            &format!("{ID}x"),
+            &ID[2..],
+            "0OIl0OIl0OIl0OIl0OIl0OIl0OIl0OIl0OIl0OIl0OIl",
+        ] {
+            let mut r = record("/#{resource}{path}");
+            r.contract_id = bad.to_string();
+            assert!(r.check().is_err(), "contract_id {bad:?} should be rejected");
+        }
+    }
+
+    #[test]
+    fn app_record_rejects_an_unprintable_or_json_breaking_name() {
+        for bad in ["", "a\nb", "a\tb", "a\"b", "a\\b", "a\0b"] {
+            let mut r = record("/#{resource}{path}");
+            r.name = bad.to_string();
+            assert!(r.check().is_err(), "name {bad:?} should be rejected");
+        }
+        let mut r = record("/#{resource}{path}");
+        r.name = "x".repeat(crate::MAX_APP_NAME + 1);
+        assert!(r.check().is_err(), "an over-long name should be rejected");
+    }
+
+    /// Every new bound must actually bind; deleting any one of them should fail.
+    #[test]
+    fn every_new_bound_is_enforced_at_the_cap() {
+        assert!(app_res("d", &"b".repeat(crate::MAX_RESOURCE + 1), "")
+            .check()
+            .is_err());
+        assert!(
+            app_res(&"a".repeat(crate::MAX_APP_SLUG + 1), "AmcVD92D3U", "")
+                .check()
+                .is_err()
+        );
+        assert!(
+            app_res("delta", "AmcVD92D3U", &"/p".repeat(crate::MAX_LOCATOR_PATH))
+                .check()
+                .is_err()
+        );
+        let mut r = record("/#{resource}{path}");
+        r.link_template = format!(
+            "/#{{resource}}{{path}}{}",
+            "x".repeat(crate::MAX_LINK_TEMPLATE)
+        );
+        assert!(r.check().is_err());
+        assert!(Locator::External {
+            url: format!("https://e.example/{}", "x".repeat(crate::MAX_EXTERNAL_URL))
+        }
+        .check()
+        .is_err());
+        // MAX_APPS
+        let mut body = AppRegistryBody {
+            version: 1,
+            index_slug: String::new(),
+            ..Default::default()
+        };
+        for i in 0..=crate::MAX_APPS {
+            body.apps
+                .insert(format!("a{i}"), record("/#{resource}{path}"));
+        }
+        let k = SigningKey::generate(&mut OsRng);
+        let sig = crate::sign(&body, &k);
+        assert!(AppRegistry { body, sig }.check_structure().is_err());
     }
 
     #[test]

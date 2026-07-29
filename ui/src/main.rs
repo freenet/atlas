@@ -14,12 +14,25 @@ use freenet_stdlib::prelude::ContractInstanceId;
 use wasm_bindgen::JsValue;
 use wasm_bindgen_futures::spawn_local;
 
-/// The index contract instance id. Baked in at build time; overridable so the
-/// same UI can target a test index. Default is the local-dev index.
-const INDEX_ID: &str = match option_env!("ATLAS_INDEX_ID") {
-    Some(s) => s,
-    None => "CJUR37WSMxV7C1yhrr3xSgjnrJT5yuvQGFNcgvSnsvg",
-};
+/// The index contract instance id, baked in at build time. REQUIRED: there is
+/// deliberately no default.
+///
+/// A default is what froze the live site. The index re-keys on any `common/`
+/// change, and `atlasctl` derives its target from the committed WASM, so after a
+/// re-key the curator writes to the new address while a UI built with a stale
+/// default keeps reading the old one. The result is not an error the operator
+/// notices: the site renders the pre-re-key snapshot indefinitely and simply
+/// never shows anything new. That happened at the stdlib-0.8.3 bump and left the
+/// published UI six entries behind for over a week.
+///
+/// `env!` turns forgetting it into a build failure instead. Get the value from
+/// `atlasctl key`.
+const INDEX_ID: &str = env!(
+    "ATLAS_INDEX_ID",
+    "ATLAS_INDEX_ID must be set when building the Atlas UI — run `atlasctl key` \
+     to get the current index contract id. A stale or defaulted value silently \
+     freezes the published site at an old index generation."
+);
 
 static STATE: GlobalSignal<Option<IndexState>> = Signal::global(|| None);
 static STATUS: GlobalSignal<String> = Signal::global(|| "connecting…".to_string());

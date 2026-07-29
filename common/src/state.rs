@@ -104,7 +104,7 @@ impl IndexState {
             ));
         }
         if let Some(apps) = &self.apps {
-            apps.verify_sig(&params.root_vk)?;
+            apps.verify_for(params)?;
             apps.check_structure()?;
         }
         if self.records.len() > MAX_ENTRIES {
@@ -197,16 +197,32 @@ impl IndexState {
         // The registry is root-signed and mutable, so a delta may legitimately
         // supersede it. Verify before adopting, and adopt only a strictly newer
         // one so replaying an old delta cannot roll the registry back.
-        if let Some(apps) = &delta.apps {
-            apps.verify_sig(&params.root_vk)?;
-            apps.check_structure()?;
-            let take = self
-                .apps
-                .as_ref()
-                .is_none_or(|cur| registry_order(apps) > registry_order(cur));
-            if take {
-                self.apps = Some(apps.clone());
+        //
+        // Decided here but APPLIED at the end, after every fallible check below.
+        // Mutating `self` and then returning `Err` would leave a partially
+        // applied state for any caller that keeps its state on error (the
+        // contract discards it, but that is the caller's choice, not a property
+        // of this function).
+        let new_registry = match &delta.apps {
+            Some(apps) => {
+                apps.verify_for(params)?;
+                apps.check_structure()?;
+                self.apps
+                    .as_ref()
+                    .is_none_or(|cur| registry_order(apps) > registry_order(cur))
+                    .then(|| apps.clone())
             }
+            None => None,
+        };
+        // A registry-only delta is legitimate and carries no records, so do not
+        // demand a key_auth it has no use for. Requiring one made
+        // `atlasctl app-set` against a not-yet-initialized index fail with a
+        // message about records it never sent.
+        if delta.records.is_empty() {
+            if let Some(r) = new_registry {
+                self.apps = Some(r);
+            }
+            return Ok(());
         }
         let ka = self
             .key_auth
@@ -230,6 +246,9 @@ impl IndexState {
         if self.records.len() > MAX_ENTRIES {
             return Err(format!("too many records: {}", self.records.len()));
         }
+        if let Some(r) = new_registry {
+            self.apps = Some(r);
+        }
         Ok(())
     }
 
@@ -250,8 +269,14 @@ impl IndexState {
             Some(ka) if ka.body.version > summary.key_auth_version => Some(ka.clone()),
             _ => None,
         };
+        // `>=`, not `>`. `registry_order` breaks equal-version ties on signature
+        // bytes, but the SUMMARY carries only the version, so two peers holding
+        // different registry bodies at the same version produce identical
+        // summaries and neither would ever send its copy: they would diverge
+        // permanently while both believed they were in sync. Re-sending at equal
+        // version costs one small object and the merge is idempotent.
         let apps = match &self.apps {
-            Some(a) if a.body.version > summary.apps_version => Some(a.clone()),
+            Some(a) if a.body.version >= summary.apps_version => Some(a.clone()),
             _ => None,
         };
         let records = self
@@ -370,6 +395,8 @@ mod tests {
         let sig = sign(&body, root);
         KeyAuth { body, sig }
     }
+
+    const TEST_SLUG: &str = "default";
 
     fn params(root: &SigningKey) -> IndexParams {
         IndexParams {
@@ -573,8 +600,15 @@ mod tests {
     }
 
     fn registry(root: &SigningKey, version: u64, id: &str) -> AppRegistry {
+        registry_for(root, version, id, TEST_SLUG)
+    }
+
+    /// `index_slug` binds the signature to one index instance, so the tests must
+    /// set it exactly as the curator would.
+    fn registry_for(root: &SigningKey, version: u64, id: &str, slug: &str) -> AppRegistry {
         let mut body = crate::types::AppRegistryBody {
             version,
+            index_slug: slug.to_string(),
             ..Default::default()
         };
         body.apps.insert("delta".to_string(), app_record(id));
@@ -658,6 +692,217 @@ mod tests {
         // …and a state carrying it fails validate_state too.
         st.apps = Some(forged);
         assert!(st.verify(&params).is_err());
+    }
+
+    /// The FIRST registry adoption is the primary production path (the first
+    /// `atlasctl app-set` on an index). Without this, `is_none_or` -> `is_some_and`
+    /// passes the whole suite while that first write becomes a silent no-op and
+    /// every AppResource entry is permanently "Unavailable".
+    #[test]
+    fn the_first_registry_is_adopted_through_apply_delta() {
+        let (root, online) = (key(), key());
+        let params = params(&root);
+        let mut st = IndexState::initialized(key_auth(&root, &online, 1));
+        assert!(st.apps.is_none());
+        st.apply_delta(
+            &IndexDelta {
+                key_auth: None,
+                records: vec![],
+                apps: Some(registry(&root, 1, ID_A)),
+            },
+            &params,
+        )
+        .expect("a registry-only delta must be accepted");
+        assert_eq!(
+            st.apps
+                .as_ref()
+                .expect("registry must be stored")
+                .body
+                .version,
+            1
+        );
+    }
+
+    /// Same for `merge`: adopting into a state that has none.
+    #[test]
+    fn merge_adopts_a_registry_into_a_state_that_has_none() {
+        let (root, online) = (key(), key());
+        let mut a = IndexState::initialized(key_auth(&root, &online, 1));
+        let mut b = IndexState::initialized(key_auth(&root, &online, 1));
+        b.apps = Some(registry(&root, 1, ID_A));
+        a.merge(&b);
+        assert_eq!(a.apps, b.apps);
+    }
+
+    /// The migration PUTs a legacy state whose `apps` is None as a full state.
+    /// That must not clear a registry the node already has.
+    #[test]
+    fn merging_a_registryless_state_keeps_the_registry() {
+        let (root, online) = (key(), key());
+        let mut a = IndexState::initialized(key_auth(&root, &online, 1));
+        a.apps = Some(registry(&root, 3, ID_A));
+        let before = a.apps.clone();
+        a.merge(&IndexState::initialized(key_auth(&root, &online, 1)));
+        assert_eq!(a.apps, before);
+    }
+
+    /// A hostile `link_template` must be refused on BOTH contract paths. Without
+    /// these, deleting either `check_structure()` call leaves the suite green
+    /// while a root-signed registry re-points every Delta entry off-origin.
+    #[test]
+    fn a_registry_with_a_hostile_template_is_rejected_on_both_paths() {
+        let (root, online) = (key(), key());
+        let params = params(&root);
+        let mut body = crate::types::AppRegistryBody {
+            version: 1,
+            index_slug: TEST_SLUG.to_string(),
+            ..Default::default()
+        };
+        body.apps.insert(
+            "delta".to_string(),
+            crate::types::AppRecord {
+                contract_id: ID_A.to_string(),
+                name: "Delta".to_string(),
+                link_template: "https://evil.example/{resource}{path}".to_string(),
+            },
+        );
+        let sig = sign(&body, &root);
+        let hostile = AppRegistry { body, sig };
+
+        let mut st = IndexState::initialized(key_auth(&root, &online, 1));
+        let err = st
+            .apply_delta(
+                &IndexDelta {
+                    key_auth: None,
+                    records: vec![],
+                    apps: Some(hostile.clone()),
+                },
+                &params,
+            )
+            .expect_err("apply_delta must reject a hostile template");
+        assert!(err.contains("link template"), "unexpected error: {err}");
+
+        st.apps = Some(hostile);
+        assert!(st.verify(&params).is_err(), "verify must reject it too");
+    }
+
+    /// A registry is signed for ONE index. Lifting a higher-version registry from
+    /// another index under the same root key must not apply here, or a staging
+    /// registry replays into production and re-points every entry.
+    #[test]
+    fn a_registry_signed_for_another_index_slug_is_rejected() {
+        let (root, online) = (key(), key());
+        let params = params(&root); // slug "default"
+        let mut st = IndexState::initialized(key_auth(&root, &online, 1));
+        st.apps = Some(registry(&root, 1, ID_A));
+        // Genuinely root-signed, higher version, but for the `staging` index.
+        let foreign = registry_for(&root, 99, ID_B, "staging");
+        let err = st
+            .apply_delta(
+                &IndexDelta {
+                    key_auth: None,
+                    records: vec![],
+                    apps: Some(foreign.clone()),
+                },
+                &params,
+            )
+            .expect_err("a registry for another index must be rejected");
+        assert!(err.contains("index slug"), "unexpected error: {err}");
+        assert_eq!(
+            st.apps.as_ref().unwrap().get("delta").unwrap().contract_id,
+            ID_A,
+            "the foreign registry must not have been adopted"
+        );
+        st.apps = Some(foreign);
+        assert!(st.verify(&params).is_err());
+    }
+
+    /// Equal version, different bodies: they must converge, and the summary must
+    /// be able to TRANSPORT that. `delta()` gating on `>` would make both peers
+    /// summarise identically and never exchange, diverging permanently.
+    #[test]
+    fn two_registries_at_equal_version_converge_and_can_still_sync() {
+        let (root, online) = (key(), key());
+        let mut a = IndexState::initialized(key_auth(&root, &online, 1));
+        a.apps = Some(registry(&root, 3, ID_A));
+        let mut b = IndexState::initialized(key_auth(&root, &online, 1));
+        b.apps = Some(registry(&root, 3, ID_B));
+
+        let mut ab = a.clone();
+        ab.merge(&b);
+        let mut ba = b.clone();
+        ba.merge(&a);
+        assert_eq!(ab.apps, ba.apps, "equal-version registries must converge");
+
+        // The summary carries only the version, so an equal-version peer must
+        // still be sent the registry.
+        assert!(
+            a.delta(&b.summarize()).apps.is_some(),
+            "an equal-version summary must still receive the registry"
+        );
+    }
+
+    #[test]
+    fn registry_merge_is_associative() {
+        let (root, online) = (key(), key());
+        let mk = |v: u64, id: &str| {
+            let mut s = IndexState::initialized(key_auth(&root, &online, 1));
+            s.apps = Some(registry(&root, v, id));
+            s
+        };
+        let (a, b, c) = (mk(1, ID_A), mk(2, ID_B), mk(3, ID_A));
+        let mut left = a.clone();
+        left.merge(&b);
+        left.merge(&c);
+        let mut right = b.clone();
+        right.merge(&c);
+        let mut right2 = a.clone();
+        right2.merge(&right);
+        assert_eq!(left.apps, right2.apps);
+    }
+
+    #[test]
+    fn summarize_reports_the_registry_version_and_delta_respects_it() {
+        let (root, online) = (key(), key());
+        let mut st = IndexState::initialized(key_auth(&root, &online, 1));
+        st.apps = Some(registry(&root, 5, ID_A));
+        assert_eq!(st.summarize().apps_version, 5);
+        // A peer already ahead of us must not be sent the registry.
+        let ahead = IndexSummary {
+            apps_version: 6,
+            ..st.summarize()
+        };
+        assert!(st.delta(&ahead).apps.is_none());
+    }
+
+    /// `resolve_href` replaced the UI's `open_href`, so its non-app arms carry
+    /// pre-existing behaviour that nothing else pins.
+    #[test]
+    fn resolve_href_covers_every_locator_variant() {
+        let (root, online) = (key(), key());
+        let st = IndexState::initialized(key_auth(&root, &online, 1));
+        assert_eq!(
+            st.resolve_href(&Locator::External {
+                url: "https://example.com".into()
+            }),
+            Some("https://example.com".to_string())
+        );
+        assert_eq!(
+            st.resolve_href(&Locator::Freenet {
+                contract_id: ID_A.into(),
+                path: String::new()
+            }),
+            Some(format!("/v1/contract/web/{ID_A}/"))
+        );
+        // The slash between id and fragment is load-bearing: without it the
+        // parent shell silently drops the click.
+        assert_eq!(
+            st.resolve_href(&Locator::Freenet {
+                contract_id: ID_A.into(),
+                path: "#frag".into()
+            }),
+            Some(format!("/v1/contract/web/{ID_A}/#frag"))
+        );
     }
 
     /// `atlasctl migrate` decodes a PRIOR generation's state with the CURRENT
