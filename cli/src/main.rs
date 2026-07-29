@@ -101,8 +101,10 @@ enum Cmd {
         /// substituted.
         #[arg(long, default_value = "/#{resource}{path}")]
         link_template: String,
-        /// The registry version you believe you are superseding. Required once a
-        /// registry exists, so a stale read cannot silently drop another app.
+        /// The registry version you believe you are superseding. ALWAYS required,
+        /// including `--expect-version 0` for the first-ever registry: a node that
+        /// has merely not seen the registry also reports 0, so accepting an omitted
+        /// value there would let a stale read silently drop every registered app.
         #[arg(long)]
         expect_version: Option<u64>,
     },
@@ -145,10 +147,16 @@ enum Cmd {
         /// Probe/GET only; report what WOULD be carried forward without PUTting.
         #[arg(long)]
         dry_run: bool,
-        /// Accept generations that report NOT FOUND instead of failing. Only use
-        /// this once you have confirmed by hand that they hold nothing.
-        #[arg(long)]
-        allow_missing: bool,
+        /// Accept a SPECIFIC generation reporting NOT FOUND, by instance id.
+        /// Repeatable.
+        ///
+        /// Deliberately per-generation rather than a blanket flag: a registered
+        /// generation that legitimately holds nothing reports NOT FOUND on every
+        /// run forever, so a blanket flag would become habitual and would then also
+        /// silence the generation that DOES hold entries — the exact failure this
+        /// guard exists to prevent.
+        #[arg(long, value_name = "INSTANCE_ID")]
+        allow_missing: Vec<String>,
     },
     /// Write the web-container params (root vk) and print its contract id
     /// (needed for the UI base_path). Reuses the root key as the UI owner.
@@ -282,7 +290,7 @@ async fn main() -> Result<()> {
         Cmd::Migrate {
             dry_run,
             allow_missing,
-        } => migrate(&cli, &dir, *dry_run, *allow_missing).await,
+        } => migrate(&cli, &dir, *dry_run, allow_missing).await,
         Cmd::WebappParams { wasm, out_params } => webapp_params(&dir, wasm, out_params),
         Cmd::WebappSign {
             archive,
@@ -338,7 +346,7 @@ async fn push_state(dir: &Path, slug: &str, from: &str, to: &str) -> Result<()> 
 /// A legacy GET that *errors* (a dead-ended / timed-out cross-node probe) is NOT
 /// treated as an empty state: it aborts, so the operator never rebuilds the UI
 /// onto an empty index while entries still live at the old address.
-async fn migrate(cli: &Cli, dir: &Path, dry_run: bool, allow_missing: bool) -> Result<()> {
+async fn migrate(cli: &Cli, dir: &Path, dry_run: bool, allow_missing: &[String]) -> Result<()> {
     let params = params_bytes(dir, &cli.slug)?;
     let current_key = NodeClient::contract_key(CONTRACT_WASM, &params);
     let legacy_keys = migration::legacy_index_keys(&params);
@@ -357,7 +365,7 @@ async fn migrate(cli: &Cli, dir: &Path, dry_run: bool, allow_missing: bool) -> R
     // early-return — every non-empty generation participates.
     let mut merged = 0usize;
     let mut probe_errors = 0usize;
-    let mut missing = 0usize;
+    let mut missing: Vec<String> = Vec::new();
     for (i, key) in legacy_keys.iter().enumerate() {
         // M1: a GET *error* (dead-ended / timed-out cross-node probe) must NEVER
         // be silently treated as an empty state — otherwise a rebuild would land
@@ -378,6 +386,7 @@ async fn migrate(cli: &Cli, dir: &Path, dry_run: bool, allow_missing: bool) -> R
         // unfindable answers the same way. The merge is idempotent, so re-running
         // later recovers such a generation; the operator just has to know to.
         let probe = client.get_optional(key, false).await;
+        let id_str = key.id().to_string();
         if let Ok(None) = &probe {
             println!(
                 "legacy[{i}] {} NOT FOUND — treated as absent and skipped.\n\
@@ -386,7 +395,7 @@ async fn migrate(cli: &Cli, dir: &Path, dry_run: bool, allow_missing: bool) -> R
                  (merging is idempotent) and confirm with `atlasctl show`.",
                 key.id()
             );
-            missing += 1;
+            missing.push(id_str.clone());
             continue;
         }
         let plan = match plan_generation(probe.map(|o| o.unwrap_or_default())) {
@@ -419,6 +428,22 @@ async fn migrate(cli: &Cli, dir: &Path, dry_run: bool, allow_missing: bool) -> R
                     "legacy[{i}] {} holds {live} live / {tomb} tombstone record(s)",
                     key.id()
                 );
+                // Pre-flight BEFORE the PUT (and in a dry-run, where it is the
+                // whole point): the node will reject the entire generation if any
+                // one record fails, so find that out here with a per-record
+                // report rather than from an opaque contract error mid-publish.
+                let index_params = IndexParams::from_bytes(&params)
+                    .ok_or_else(|| anyhow!("could not parse index params"))?;
+                if let Err(e) = preflight_generation(&state, &index_params) {
+                    if dry_run {
+                        eprintln!("legacy[{i}] {} PRE-FLIGHT FAILED: {e:#}", key.id());
+                        probe_errors += 1;
+                        continue;
+                    }
+                    return Err(e).with_context(|| {
+                        format!("legacy[{i}] {} would be rejected by the contract", key.id())
+                    });
+                }
                 if dry_run {
                     println!(
                         "  [dry-run] would PUT-merge legacy[{i}] into {}",
@@ -441,17 +466,6 @@ async fn migrate(cli: &Cli, dir: &Path, dry_run: bool, allow_missing: bool) -> R
         }
     }
 
-    if missing > 0 {
-        println!(
-            "\nNOTE: {missing} registered generation(s) reported NOT FOUND and were \
-             skipped as absent. NotFound is NOT proof of absence — the node also \
-             reports it when a GET exhausts its retries (an isolated or \
-             poorly-connected node returns it for a contract that exists), so if \
-             any of those was in fact published, re-run `atlasctl migrate` once it \
-             is reachable. Merging is idempotent."
-        );
-    }
-
     // ANY skipped generation fails the run unless the operator explicitly accepts
     // it. An earlier version only failed when NOTHING merged, on the reasoning
     // that reaching one address made a NotFound elsewhere credible. That
@@ -462,15 +476,30 @@ async fn migrate(cli: &Cli, dir: &Path, dry_run: bool, allow_missing: bool) -> R
     // The concrete failure it allowed: the newest entries live at legacy[0], not
     // legacy[1]. If legacy[0] answered NotFound and legacy[1] merged, migrate
     // exited 0 having silently dropped exactly the entries it was run to recover.
-    if missing > 0 && !allow_missing {
-        bail!(
-            "{missing} registered generation(s) reported NOT FOUND and were skipped. \
-             NotFound is not proof of absence (a node returns it on retry \
-             exhaustion too), and each generation is a separate contract at a \
-             separate ring location, so reaching one says nothing about another. \
-             Confirm with `atlasctl raw-get <legacy-id> --out /tmp/x`, then either \
-             re-run once reachable or pass --allow-missing to accept the gap. Do \
-             NOT publish a UI against this index until you have."
+    // Any skipped generation the operator has NOT explicitly acknowledged fails the
+    // run. Per-generation, not blanket: see the note on `--allow-missing`.
+    //
+    // Checked AFTER the readback below on a real run, so the operator still gets the
+    // "current index now holds N live entries" line — the PUTs already happened, so
+    // bailing before it protects nothing and hides the most useful datum.
+    let unacknowledged: Vec<&String> = missing
+        .iter()
+        .filter(|id| !allow_missing.iter().any(|a| a == *id))
+        .collect();
+    if !missing.is_empty() {
+        println!(
+            "\nNOTE: {} generation(s) reported NOT FOUND and were skipped:\n{}",
+            missing.len(),
+            missing
+                .iter()
+                .map(|id| format!("  {id}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
+        println!(
+            "NotFound is NOT proof of absence: a node returns it when a GET exhausts \
+             its retries, so an existing-but-unfindable contract looks identical. \
+             Merging is idempotent, so re-running later is safe."
         );
     }
 
@@ -480,6 +509,13 @@ async fn migrate(cli: &Cli, dir: &Path, dry_run: bool, allow_missing: bool) -> R
                 "[dry-run] {probe_errors} legacy generation(s) were unreachable — a \
                  real migrate would abort on these; fix connectivity and retry so \
                  their entries are not left stranded"
+            );
+        }
+        if !unacknowledged.is_empty() {
+            bail!(
+                "[dry-run] {} skipped generation(s) unacknowledged — a real migrate \
+                 would refuse. Confirm them, or pass --allow-missing <id> for each.",
+                unacknowledged.len()
             );
         }
         println!("[dry-run] complete — no state written");
@@ -500,6 +536,23 @@ async fn migrate(cli: &Cli, dir: &Path, dry_run: bool, allow_missing: bool) -> R
     if merged == 0 {
         println!("no legacy generation held any state — nothing was carried forward");
     }
+    if !unacknowledged.is_empty() {
+        bail!(
+            "{} skipped generation(s) were not acknowledged. Each generation is a \
+             separate contract at a separate ring location, so reaching one says \
+             nothing about another — and the generation holding the NEWEST entries \
+             is not necessarily the one that answered. Confirm each with \
+             `atlasctl raw-get <id> --out /tmp/x`, then re-run, or accept \
+             explicitly with:\n{}\nDo NOT publish a UI against this index until you \
+             have.",
+            unacknowledged.len(),
+            unacknowledged
+                .iter()
+                .map(|id| format!("  --allow-missing {id}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
+    }
     Ok(())
 }
 
@@ -516,36 +569,86 @@ fn plan_generation(get_result: Result<Vec<u8>>) -> Result<Option<(Vec<u8>, usize
     if state.is_empty() {
         return Ok(None);
     }
-    let (live, tomb) = count_records(&state);
+    let (live, tomb) = count_records(&state)?;
     Ok(Some((state, live, tomb)))
 }
 
-/// Decode an index state and count its (live, tombstone) records; (0, 0) if empty
-/// or undecodable (best-effort, for logging only).
-fn count_records(state: &[u8]) -> (usize, usize) {
+/// Decode an index state and count its (live, tombstone) records.
+///
+/// An undecodable state is an ERROR, not `(0, 0)`. It used to be the latter, which
+/// printed "holds 0 live / 0 tombstone record(s)" — indistinguishable from a
+/// genuinely empty generation — and then PUT the bytes anyway.
+fn count_records(state: &[u8]) -> Result<(usize, usize)> {
     if state.is_empty() {
-        return (0, 0);
+        return Ok((0, 0));
     }
-    match ciborium::de::from_reader::<IndexState, &[u8]>(state) {
-        Ok(st) => {
-            let mut live = 0;
-            let mut tomb = 0;
-            for rec in st.records.values() {
-                match rec.body {
-                    RecordBody::Live(_) => live += 1,
-                    RecordBody::Tomb(_) => tomb += 1,
-                }
-            }
-            (live, tomb)
+    let st: IndexState = ciborium::de::from_reader(state)
+        .context("legacy state did not decode with the current types")?;
+    let mut live = 0;
+    let mut tomb = 0;
+    for rec in st.records.values() {
+        match rec.body {
+            RecordBody::Live(_) => live += 1,
+            RecordBody::Tomb(_) => tomb += 1,
         }
-        Err(_) => (0, 0),
     }
+    Ok((live, tomb))
+}
+
+/// Run the validation the CONTRACT will run, and report every record that fails.
+///
+/// This is the pre-flight, and it has to live here rather than in a scratch
+/// script. `validate_state` is all-or-nothing: the node loops every record and one
+/// failure rejects the ENTIRE PUT, so a single record that a tightened rule has
+/// retroactively invalidated makes a whole generation unmigratable — with no
+/// indication of which record is at fault. Counting records (all the dry-run used
+/// to do) cannot see that at all.
+///
+/// Uses `IndexState::verify`, not just per-record `check_structure`: `verify`
+/// additionally requires every signer to be authorized by the CURRENT key_auth and
+/// every record to be stored under its own subject id, and both are things a
+/// migration can get wrong.
+fn preflight_generation(state: &[u8], params: &IndexParams) -> Result<()> {
+    let st: IndexState = ciborium::de::from_reader(state)
+        .context("legacy state did not decode with the current types")?;
+    if st.verify(params).is_ok() {
+        return Ok(());
+    }
+    // Whole-state verify failed. Localise it: report every individual record that
+    // the current rules reject, so the operator learns WHICH entries block the
+    // migration instead of just that something does.
+    let mut failures = Vec::new();
+    for (sid, rec) in &st.records {
+        if let Err(e) = rec.body.check_structure() {
+            failures.push(format!("  {} — {e}", sid.as_str()));
+        } else if let Err(e) = rec.verify_sig() {
+            failures.push(format!("  {} — bad signature: {e}", sid.as_str()));
+        } else if rec.body.subject_id() != sid {
+            failures.push(format!(
+                "  {} — stored under the wrong subject id",
+                sid.as_str()
+            ));
+        }
+    }
+    let whole = st.verify(params).unwrap_err();
+    if failures.is_empty() {
+        bail!(
+            "this generation would be REJECTED by the contract, but no individual \
+             record is at fault — the problem is state-level: {whole}"
+        );
+    }
+    bail!(
+        "this generation would be REJECTED by the contract ({whole}). \
+         {} record(s) fail the current rules:\n{}",
+        failures.len(),
+        failures.join("\n")
+    );
 }
 
 /// Count live (non-tombstoned) entries only. Used by `push_state` and the
 /// migrate readback.
 fn count_live(state: &[u8]) -> usize {
-    count_records(state).0
+    count_records(state).map(|(live, _)| live).unwrap_or(0)
 }
 
 async fn raw_get(cli: &Cli, instance: &str, out: &Path) -> Result<()> {
@@ -667,7 +770,7 @@ async fn add(
     // path, so two links to different pages of ONE Delta site collapse here
     // rather than becoming two cards.
     if !allow_duplicate {
-        let read = fetch_state(cli, dir).await?;
+        let read = fetch_state(cli, dir, false).await?;
         if matches!(read, IndexRead::Unfindable) {
             eprintln!(
                 "warning: the node could not find the index, so the duplicate check \
@@ -701,6 +804,11 @@ async fn add(
     };
     let subject = entry.subject_id.as_str().to_string();
     let body = RecordBody::Live(entry);
+    // Validate locally BEFORE signing and sending. The contract enforces the same
+    // rules, but a rejection there arrives as an opaque `InvalidUpdateWithInfo`
+    // from the node; checking here names the offending field.
+    body.check_structure()
+        .map_err(|e| anyhow!("entry would be rejected by the contract: {e}"))?;
     let rec = SignedRecord {
         sig: sign(&body, &online),
         by: online.verifying_key(),
@@ -806,17 +914,24 @@ enum IndexRead {
     /// The node served a state. Boxed only to keep the enum small; a whole index
     /// state dwarfs the other two variants.
     Present(Box<IndexState>),
-    /// The node served an empty state (initialized but nothing in it).
+    /// The node served EMPTY BYTES, which means the contract exists but was never
+    /// initialized — `IndexState::initialized` always carries a key_auth, so an
+    /// initialized index never encodes to nothing. So this is the same "we know
+    /// nothing about the registry" class as `Unfindable`, not a benign empty index.
     Empty,
     /// The node could not find the contract. NOT proof it does not exist.
     Unfindable,
 }
 
-async fn fetch_state(cli: &Cli, dir: &Path) -> Result<IndexRead> {
+/// `fresh` subscribes, which makes the node fetch rather than answer from whatever
+/// stale copy it happens to hold. Required on any WRITE path: the node's local copy
+/// can lag the network (this CLI's own `push-state` exists because of that), and a
+/// stale read is how a registry edit silently discards apps it never saw.
+async fn fetch_state(cli: &Cli, dir: &Path, fresh: bool) -> Result<IndexRead> {
     let params = params_bytes(dir, &cli.slug)?;
     let key = NodeClient::contract_key(CONTRACT_WASM, &params);
     let mut client = NodeClient::connect(&cli.node).await?;
-    let Some(bytes) = client.get_optional(&key, false).await? else {
+    let Some(bytes) = client.get_optional(&key, fresh).await? else {
         return Ok(IndexRead::Unfindable);
     };
     if bytes.is_empty() {
@@ -846,7 +961,7 @@ async fn app_set(
         root_vk: root.verifying_key(),
         slug: cli.slug.clone(),
     };
-    let current = match fetch_state(cli, dir).await? {
+    let current = match fetch_state(cli, dir, true).await? {
         // Refusing here is the whole point of the tri-state. If the node cannot
         // find the index we do not know what registry is on the network, and
         // proceeding would sign a body built from nothing: the contract would
@@ -860,7 +975,14 @@ async fn app_set(
              Check `atlasctl apps` / `atlasctl show` and retry once the index is \
              reachable."
         ),
-        IndexRead::Empty => None,
+        // Refused for the same reason as `Unfindable`: empty bytes mean the index
+        // was never initialized, so we know nothing about what registry exists.
+        // (Writing anyway happened to be safe only because `apply_delta` refuses
+        // without a key_auth — accidental protection, not a reason to rely on it.)
+        IndexRead::Empty => bail!(
+            "this index is not initialized (the node served an empty state). Run \
+             `atlasctl init` first."
+        ),
         IndexRead::Present(state) => state.apps,
     };
     // NEVER let the root key sign bytes we have not verified. The fetched state
@@ -923,17 +1045,24 @@ fn next_registry_body(
     // stale read plus version+1 still wins the merge and silently drops an app
     // registered elsewhere. Once a registry exists, make the operator state the
     // version they believe they are superseding.
+    // ALWAYS required, including `--expect-version 0` for the first-ever registry.
+    // Only demanding it when `cur_version > 0` left the dangerous case open: a node
+    // holding a state with no registry (or an uninitialized one) reports version 0
+    // while the network is at v7, so the guard would not fire and the edit would be
+    // signed as v1 — losing every app the real registry held.
     match expect_version {
+        None => bail!(
+            "pass --expect-version {cur_version} to confirm the registry version you \
+             are superseding (this node reports {cur_version}). Required even for the \
+             first registry (--expect-version 0), because a node that simply has not \
+             seen the registry also reports 0."
+        ),
         Some(v) if v != cur_version => bail!(
-            "registry is at version {cur_version}, not {v} — re-run `atlasctl apps` \
-             and retry with the version you intend to supersede"
+            "registry is at version {cur_version} according to this node, not {v} — \
+             re-run `atlasctl apps` and retry with the version you intend to \
+             supersede. If they disagree, this node's copy may be stale."
         ),
-        None if cur_version > 0 => bail!(
-            "registry is at version {cur_version}; pass --expect-version {cur_version} \
-             to confirm you are editing that version (guards against a stale read \
-             silently dropping another app)"
-        ),
-        _ => {}
+        Some(_) => {}
     }
     let mut body = current.cloned().unwrap_or_default();
     // Stamped from the INDEX slug, never carried over from the fetched body, so a
@@ -994,7 +1123,7 @@ async fn apps(cli: &Cli, dir: &Path, json: bool) -> Result<()> {
         root_vk: root.verifying_key(),
         slug: cli.slug.clone(),
     };
-    let registry = match fetch_state(cli, dir).await? {
+    let registry = match fetch_state(cli, dir, false).await? {
         IndexRead::Unfindable => bail!("the node could not find this index"),
         IndexRead::Empty => None,
         IndexRead::Present(state) => state.apps,
@@ -1183,25 +1312,29 @@ mod tests {
     }
 
     #[test]
-    fn the_first_registry_starts_at_version_one_without_expect_version() {
-        let next =
-            next_registry_body(None, "default", "delta", Some(rec(ID_A, "Delta")), None).unwrap();
+    /// `--expect-version` is required even for the FIRST registry, and must be an
+    /// explicit 0. Only demanding it once a registry exists left the dangerous case
+    /// open: a node that has merely not SEEN the registry also reports 0, so the
+    /// guard would not fire and the edit would be signed as v1, losing every app the
+    /// real (v7, say) registry held.
+    fn the_first_registry_requires_an_explicit_expect_version_zero() {
+        let omitted = next_registry_body(None, "default", "delta", Some(rec(ID_A, "Delta")), None)
+            .expect_err("must refuse without --expect-version, even for a first write");
+        assert!(omitted.to_string().contains("--expect-version"));
+
+        let next = next_registry_body(None, "default", "delta", Some(rec(ID_A, "Delta")), Some(0))
+            .unwrap();
         assert_eq!(next.version, 1);
         assert_eq!(next.index_slug, "default");
     }
 
     #[test]
-    fn expect_version_is_required_and_must_match_once_a_registry_exists() {
+    fn expect_version_must_match_the_version_the_node_reports() {
         let cur = AppRegistryBody {
             version: 3,
             index_slug: "default".into(),
             ..Default::default()
         };
-        let omitted =
-            next_registry_body(Some(&cur), "default", "delta", Some(rec(ID_A, "D")), None)
-                .expect_err("must refuse without --expect-version");
-        assert!(omitted.to_string().contains("--expect-version"));
-
         let wrong = next_registry_body(
             Some(&cur),
             "default",
@@ -1418,12 +1551,21 @@ mod tests {
             live_record(SubjectId::random()),
             tomb_record(SubjectId::random()),
         ]);
-        assert_eq!(count_records(&bytes), (2, 1));
+        assert_eq!(count_records(&bytes).unwrap(), (2, 1));
+    }
+
+    /// An undecodable generation must be an ERROR. It used to read as
+    /// `(0, 0)` — printed as "holds 0 live / 0 tombstone record(s)", which looks
+    /// exactly like a harmlessly empty generation — and was then PUT anyway.
+    #[test]
+    fn an_undecodable_generation_is_an_error_not_empty() {
+        assert!(count_records(b"not cbor at all").is_err());
+        assert!(plan_generation(Ok(b"not cbor at all".to_vec())).is_err());
     }
 
     #[test]
     fn count_records_empty_bytes_is_zero() {
-        assert_eq!(count_records(&[]), (0, 0));
+        assert_eq!(count_records(&[]).unwrap(), (0, 0));
     }
 
     /// M1: a legacy GET *error* must surface as an `Err` (which the caller turns

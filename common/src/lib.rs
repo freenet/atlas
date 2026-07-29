@@ -15,8 +15,8 @@ mod types;
 
 pub use state::{contract_web_href, IndexDelta, IndexState, IndexSummary};
 pub use types::{
-    AppRecord, AppRegistry, AppRegistryBody, IndexEntry, IndexParams, KeyAuth, KeyAuthBody, Kind,
-    Locator, RecordBody, SignedRecord, SubjectId, Tombstone,
+    has_raw_control_char, AppRecord, AppRegistry, AppRegistryBody, IndexEntry, IndexParams,
+    KeyAuth, KeyAuthBody, Kind, Locator, RecordBody, SignedRecord, SubjectId, Tombstone,
 };
 
 /// Max records in a single index contract. Keeps the full state inside the

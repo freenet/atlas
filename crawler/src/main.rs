@@ -2099,14 +2099,15 @@ fn describe_llm(
         .ok_or_else(|| anyhow!("no content in openai response"))?;
     let parsed: serde_json::Value =
         serde_json::from_str(content).with_context(|| "llm json parse")?;
-    let title = parsed["title"].as_str().unwrap_or("").trim().to_string();
-    let snippet = parsed["snippet"].as_str().unwrap_or("").trim().to_string();
+    let title = collapse_ws(parsed["title"].as_str().unwrap_or(""));
+    let snippet = collapse_ws(parsed["snippet"].as_str().unwrap_or(""));
     let tags = parsed["tags"]
         .as_array()
         .map(|a| {
             a.iter()
                 .filter_map(|t| t.as_str())
-                .map(|t| t.to_lowercase())
+                .map(|t| collapse_ws(&t.to_lowercase()))
+                .filter(|t| !t.is_empty())
                 .take(5)
                 .collect::<Vec<_>>()
         })
@@ -2157,8 +2158,8 @@ fn describe_fallback(url: &str, html: &str) -> Described {
         .or_else(|| extract_meta(html, "og:description"))
         .unwrap_or_default();
     Described {
-        title: trim_len(&title, 200),
-        snippet: trim_len(&snippet, 480),
+        title: trim_len(&collapse_ws(&title), 200),
+        snippet: trim_len(&collapse_ws(&snippet), 480),
         tags: vec![],
         // No LLM available to classify; the fallback is only used for the
         // curated/seed sources, so treat as ok.
@@ -2342,6 +2343,31 @@ fn visible_text(html: &str) -> String {
 /// The bound must be in bytes because that is what the index contract enforces;
 /// counting chars instead would let 200 emoji (800 bytes) sail past a 200-byte
 /// limit and get the whole entry rejected on submission.
+/// Collapse any control character (and runs of whitespace) into single spaces.
+///
+/// `atlas_common`'s `check_structure` rejects control characters in `title`,
+/// `snippet` and `tags`, and that rule is enforced by the CONTRACT, so emitting one
+/// makes a page permanently un-indexable rather than merely ugly. Two ordinary
+/// sources produce them: a multi-line `<title>` element (only the ends get
+/// trimmed, so interior newlines survive) and an LLM that returns a snippet
+/// containing a newline.
+fn collapse_ws(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut prev_space = false;
+    for c in s.chars() {
+        if c.is_control() || c.is_whitespace() {
+            if !prev_space && !out.is_empty() {
+                out.push(' ');
+            }
+            prev_space = true;
+        } else {
+            out.push(c);
+            prev_space = false;
+        }
+    }
+    out.trim_end().to_string()
+}
+
 fn trim_len(s: &str, max: usize) -> String {
     if s.len() <= max {
         return s.to_string();
@@ -2355,6 +2381,24 @@ fn trim_len(s: &str, max: usize) -> String {
 
 #[cfg(test)]
 mod tests {
+
+    /// The contract rejects control characters in title/snippet/tags, so the writer
+    /// must never emit them — a multi-line `<title>` is ordinary HTML.
+    #[test]
+    fn collapse_ws_removes_every_control_character() {
+        assert_eq!(collapse_ws("\n  Foo\n  Bar\n"), "Foo Bar");
+        assert_eq!(collapse_ws("a\rb"), "a b");
+        assert_eq!(collapse_ws("a\u{1b}[31mb"), "a [31mb");
+        assert_eq!(collapse_ws("  lead and trail  "), "lead and trail");
+        assert_eq!(collapse_ws("already fine"), "already fine");
+        assert_eq!(collapse_ws(""), "");
+        for s in ["\n\r\t", "a\u{0}b", "x\u{85}y"] {
+            assert!(
+                !collapse_ws(s).chars().any(char::is_control),
+                "{s:?} still had a control char after collapsing"
+            );
+        }
+    }
     use super::*;
 
     const ID: &str = "771DvtPMwt2PumPyrFvsz7fpvU1gogcmb5qtS1yYEEH9";

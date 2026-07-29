@@ -39,9 +39,13 @@ const INDEX_ID: &str = env!(
 /// substitution discards the exit status). The build would succeed and the site
 /// would show "bad index id" forever, which is the same silent-failure shape this
 /// constant exists to prevent. Check the shape at compile time.
+/// Range, not exactly 43-or-44: a uniformly random 32-byte value base58-encodes to
+/// 44 chars ~94% of the time and 43 chars ~5.7%, but ~0.1% of legitimate ids are
+/// SHORTER, and hard-failing the build on one of those would blame the operator for
+/// a valid id. The point is to catch empty or obviously-truncated values.
 const _: () = assert!(
-    INDEX_ID.len() == 43 || INDEX_ID.len() == 44,
-    "ATLAS_INDEX_ID must be a 43-44 char base58 contract instance id"
+    INDEX_ID.len() >= 40 && INDEX_ID.len() <= 44,
+    "ATLAS_INDEX_ID must be a base58 contract instance id (40-44 chars); an empty value usually means the command substitution supplying it failed"
 );
 
 static STATE: GlobalSignal<Option<IndexState>> = Signal::global(|| None);

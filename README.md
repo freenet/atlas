@@ -78,7 +78,7 @@ resolved through a root-signed registry in the index state:
 ```bash
 atlasctl app-set --app delta --name Delta \
   --contract-id EqJ5YpEEV3XLqEvKWLQHFhGAac2qXzSUoE6k2zbdnXBr \
-  --expect-version <current>     # required once a registry exists
+  --expect-version <current>     # ALWAYS required (use 0 for the first registry)
 ```
 
 When an app republishes and its container address moves, re-point it with one

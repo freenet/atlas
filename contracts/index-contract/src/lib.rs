@@ -135,8 +135,21 @@ impl ContractInterface for AtlasIndex {
             from_reader::<IndexSummary, &[u8]>(summary.as_ref())
                 .map_err(|e| ContractError::Deser(e.to_string()))?
         };
+        let delta = st.delta(&summ);
+        // Emit ZERO BYTES when there is nothing to send. Serialising an all-empty
+        // `IndexDelta` yields a 3-key CBOR map (~26 bytes), and freenet-core judges
+        // convergence by `!delta.as_ref().is_empty()` (`ring/interest.rs`), so a
+        // non-empty encoding of "no changes" means the node can NEVER conclude that
+        // two peers have converged: every byte-differing summary pair escalates to a
+        // staleness probe that always answers "send", on every fan-out and every
+        // anti-entropy heartbeat, indefinitely.
+        //
+        // Symmetric with `update_state`, which already skips an empty delta.
+        if delta.is_logically_empty() {
+            return Ok(StateDelta::from(Vec::new()));
+        }
         let mut out = Vec::new();
-        into_writer(&st.delta(&summ), &mut out).map_err(|e| ContractError::Deser(e.to_string()))?;
+        into_writer(&delta, &mut out).map_err(|e| ContractError::Deser(e.to_string()))?;
         Ok(StateDelta::from(out))
     }
 }

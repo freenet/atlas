@@ -99,6 +99,18 @@ fn record_order(r: &SignedRecord) -> (u64, bool, [u8; 64]) {
     (r.body.version(), is_tomb, r.sig.to_bytes())
 }
 
+impl IndexDelta {
+    /// True when this delta carries nothing.
+    ///
+    /// The contract emits ZERO BYTES for such a delta rather than its ~26-byte CBOR
+    /// encoding, because freenet-core judges convergence by whether the delta bytes
+    /// are empty. Encoding "no changes" as non-empty makes convergence
+    /// unobservable, so every peer pair re-sends forever.
+    pub fn is_logically_empty(&self) -> bool {
+        self.key_auth.is_none() && self.records.is_empty() && self.apps.is_none()
+    }
+}
+
 impl IndexState {
     pub fn initialized(key_auth: KeyAuth) -> Self {
         IndexState {
@@ -926,11 +938,15 @@ mod tests {
             a.delta(&sb).apps.is_some(),
             "an equal-version peer with a different body must receive the registry"
         );
-        // …and an equal-version peer with the SAME body must NOT, so the
-        // empty-delta convergence verdict still works.
+        // …and an equal-version peer with the SAME body must NOT be re-sent it, so
+        // the delta for an already-converged peer carries nothing. (Whether the
+        // node then SEES that as convergence depends on the contract emitting zero
+        // bytes for a logically-empty delta, which is `get_state_delta`'s job and
+        // is asserted there, not here. An earlier version of this comment claimed
+        // this assertion pinned that, which it does not.)
         assert!(
-            a.delta(&sa).apps.is_none(),
-            "an identical peer must not be re-sent the registry"
+            a.delta(&sa).is_logically_empty(),
+            "an identical peer must be sent a logically-empty delta"
         );
     }
 

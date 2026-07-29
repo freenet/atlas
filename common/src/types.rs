@@ -203,6 +203,12 @@ fn check_path(path: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// True if the string contains a control character as written. No percent-decoding:
+/// see the note at the call site in `check_structure`.
+pub fn has_raw_control_char(s: &str) -> bool {
+    s.chars().any(char::is_control)
+}
+
 /// Printable-ASCII, length-bounded text for a field that reaches both a DOM text
 /// node and a JSON string value. Excluding control characters and the JSON
 /// metacharacters at validation time means neither sink has to escape.
@@ -302,17 +308,22 @@ impl RecordBody {
             }
             // `title` and `snippet` are LLM output derived from untrusted page
             // HTML, and `atlasctl show` prints them raw to a terminal, so a CR or
-            // an ANSI escape sequence in them is terminal injection. A control
-            // character has no legitimate place in either field. (Unlike `name`
-            // these are free-form human text, so only control characters are
-            // refused, not non-ASCII.)
-            if crate::path::has_control_char(&e.title) {
+            // an ANSI escape in them is terminal injection. A control character has
+            // no legitimate place in either field.
+            //
+            // Checked on the RAW characters, deliberately NOT via
+            // `path::has_control_char`, which percent-decodes first. Decoding is
+            // correct for a URL or a locator path and wrong for prose: a title
+            // reading "URL encoding: %0A is a newline" contains no control
+            // character, and decoding would reject it. Free-form text also keeps
+            // non-ASCII, unlike the curator-written `name`.
+            if has_raw_control_char(&e.title) {
                 return Err("title contains a control character".to_string());
             }
-            if crate::path::has_control_char(&e.snippet) {
+            if has_raw_control_char(&e.snippet) {
                 return Err("snippet contains a control character".to_string());
             }
-            if e.tags.iter().any(|t| crate::path::has_control_char(t)) {
+            if e.tags.iter().any(|t| has_raw_control_char(t)) {
                 return Err("a tag contains a control character".to_string());
             }
             if e.tags.len() > MAX_TAGS || e.tags.iter().any(|t| t.len() > MAX_TAG_LEN) {
@@ -665,6 +676,24 @@ mod tests {
 
     /// Call-site pin: the guards must be WIRED INTO `Locator::check`, not merely
     /// exist. Testing the helpers alone leaves the call site free to drop them.
+    /// Prose fields must be judged on their RAW characters. Percent-decoding them
+    /// (which is right for a URL) rejects legitimate text that merely mentions an
+    /// escape sequence.
+    #[test]
+    fn prose_control_chars_are_checked_without_percent_decoding() {
+        assert!(has_raw_control_char("a\nb"));
+        assert!(has_raw_control_char("a\rb"));
+        assert!(has_raw_control_char("a\u{1b}[31m"));
+        // …but a title that merely TALKS about an escape is fine.
+        assert!(!has_raw_control_char("URL encoding: %0A is a newline"));
+        assert!(!has_raw_control_char("100% natural, 50%2F50"));
+        // Non-ASCII prose is fine (unlike the curator-written `name`).
+        assert!(!has_raw_control_char("Café Münchén — naïve"));
+        // And the difference from the path guard is the whole point:
+        assert!(crate::path::has_control_char("a%0Ab"));
+        assert!(!has_raw_control_char("a%0Ab"));
+    }
+
     #[test]
     fn locator_check_rejects_every_escape_class() {
         let cases = [
