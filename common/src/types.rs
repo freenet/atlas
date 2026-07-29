@@ -460,7 +460,13 @@ pub struct AppRegistryBody {
     /// it wins on version and re-points every `AppResource` entry. `KeyAuth` has
     /// the same missing binding but is immune because it is immutable; a
     /// version-ordered mutable object replays and STICKS.
-    #[serde(default)]
+    ///
+    /// Deliberately NOT `#[serde(default)]`, unlike the fields added to
+    /// `IndexState`. No registry has ever been published, so there is no legacy
+    /// encoding to stay compatible with, and allowing the field to be absent
+    /// would let an old-format body decode with an empty slug — which would then
+    /// verify against an index whose slug is empty. Requiring it removes that
+    /// ambiguity class outright.
     pub index_slug: String,
     /// Slug -> record. A `BTreeMap` so the CBOR signing payload is deterministic.
     pub apps: BTreeMap<String, AppRecord>,
