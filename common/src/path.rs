@@ -1,24 +1,30 @@
 //! Path guards for locator validation.
 //!
 //! These are enforced by the index contract on untrusted peers, so they are the
-//! authoritative rules, not a best-effort filter. Two separate escape primitives
-//! matter, and neither finds the other:
+//! authoritative rules, not a best-effort filter. Three independent escape
+//! primitives matter, and no one of them finds the others:
 //!
 //! - **Traversal** (`..`), which walks out of the contract root.
-//! - **Absolute-path escape** (a leading `//`), which contains no dots at all.
-//!   The node splits `<key>/<path>` and hands the remainder to `Path::join`, and
-//!   `join` with an absolute path DISCARDS THE BASE, so a locator path of
-//!   `//home/user/.ssh/id_ed25519` reads that file rather than something under
-//!   the contract root.
+//! - **Absolute-path escape**, which contains no dots at all: a leading `//`, or
+//!   a Windows drive prefix (`/C:/...`). The node splits `<key>/<path>` and hands
+//!   the remainder to `Path::join`, and `join` with an absolute path DISCARDS THE
+//!   BASE, so `//home/user/.ssh/id_ed25519` reads that file rather than something
+//!   under the contract root.
+//! - **Overlong UTF-8** (`%c0%ae` for `.`), which is a dot segment to a parser
+//!   that decodes it and ordinary bytes to a guard that compares them.
 //!
-//! Both are checked after decoding percent-escapes, because `%2e%2e`, `..%2f`,
+//! All are checked after decoding percent-escapes, because `%2e%2e`, `..%2f`,
 //! `%252e%252e` and friends are the same attack wearing a coat. One decode pass
 //! is not enough: `%252e` decodes to `%2e`, which decodes to `.`.
 //!
 //! The crawler carries its own copies of these guards (`has_dot_segment`,
-//! `is_absolute_contract_path`) which predate this module and are equivalent.
-//! They are being switched over to these so the two cannot drift; until then,
-//! treat THIS module as canonical, since it is the one the contract enforces.
+//! `is_absolute_contract_path`), which predate this module. They are NOT
+//! equivalent and have already drifted in both directions: the crawler catches
+//! the Windows drive-prefix escape that this module originally missed, and folds
+//! its control-character check into a differently-shaped function. This module is
+//! the canonical one, because it is the one the CONTRACT enforces; the crawler is
+//! switched over to it in the follow-up that touches the crawler, at which point
+//! its copies are deleted.
 
 /// Max percent-decoding passes before an input is treated as hostile.
 ///
@@ -47,10 +53,18 @@ pub fn has_dot_segment(path: &str) -> bool {
 }
 
 /// True if the path escapes the contract root by being ABSOLUTE rather than by
-/// traversing, i.e. a second separator immediately follows the first.
+/// traversing. Two forms, neither containing a dot:
 ///
-/// An interior `//` (`/a//b`) is harmless: it stays under the base. A lone
-/// trailing slash is the ordinary root form. Only the leading case escapes.
+/// - A second separator immediately following the first (`//etc/passwd`). An
+///   interior `//` (`/a//b`) is harmless because it stays under the base, and a
+///   lone trailing slash is the ordinary root form, so only the leading case
+///   counts.
+/// - A Windows drive prefix (`/C:/Windows/win.ini`, and even `/C:foo`). On a
+///   Windows host `Path::join` discards the base for both, so this is the same
+///   file-read primitive. Checked because a locator validated here may be served
+///   by a node on any platform, and because the crawler's older copy of this
+///   guard already checked it — this module claims to be canonical, so it has to
+///   be at least as strict.
 ///
 /// Fails CLOSED on an input that will not converge.
 pub fn is_absolute_escape(path: &str) -> bool {
@@ -58,8 +72,30 @@ pub fn is_absolute_escape(path: &str) -> bool {
         None => true,
         Some(d) => {
             let sep = |b: u8| b == b'/' || b == b'\\';
-            matches!((d.first(), d.get(1)), (Some(&a), Some(&b)) if sep(a) && sep(b))
+            if matches!((d.first(), d.get(1)), (Some(&a), Some(&b)) if sep(a) && sep(b)) {
+                return true;
+            }
+            // Strip a single leading separator, then look for `<letter>:`.
+            let rest = match d.first() {
+                Some(&b) if sep(b) => &d[1..],
+                _ => &d[..],
+            };
+            matches!(rest, [d0, b':', ..] if d0.is_ascii_alphabetic())
         }
+    }
+}
+
+/// True if the decoded path is not valid UTF-8.
+///
+/// This is what closes the overlong-UTF-8 class: `%c0%ae` is an overlong encoding
+/// of `.`, and `%c1%9c` of `\`, so a parser that decodes them sees a dot segment
+/// while a byte-compare guard does not. Rather than enumerate the encodings,
+/// reject anything that is not well-formed UTF-8 — overlong forms never are, and a
+/// legitimate locator path has no reason to be invalid UTF-8 either.
+pub fn has_invalid_utf8(path: &str) -> bool {
+    match decode_bounded(path.as_bytes()) {
+        None => true,
+        Some(d) => core::str::from_utf8(&d).is_err(),
     }
 }
 
@@ -83,12 +119,9 @@ pub fn has_control_char(s: &str) -> bool {
 /// after eight passes is not worth reasoning about further, and refusing it is
 /// both cheaper and safer than deciding what it "really" says.
 ///
-/// NOTE on overlong UTF-8 (`%c0%ae` for `.`): this decodes to the bytes `c0 ae`,
-/// which is not `.`, so it is not treated as a dot segment. That is correct for
-/// our consumers, since browsers and the Rust gateway reject overlong sequences
-/// rather than folding them to ASCII. It WOULD be a bypass against a consumer
-/// that folds them (classically IIS), so if a locator is ever handed to one,
-/// reject non-ASCII decoded bytes here too.
+/// Note this decodes bytes, so an overlong UTF-8 form such as `%c0%ae` becomes
+/// `c0 ae` rather than `.` and is invisible to a byte-compare guard.
+/// [`has_invalid_utf8`] is what closes that class; `check_path` calls both.
 pub fn decode_bounded(input: &[u8]) -> Option<Vec<u8>> {
     let mut cur = percent_decode_once(input);
     for _ in 0..MAX_DECODE_PASSES {
@@ -188,11 +221,50 @@ mod tests {
             "//",
             "/\\x",
             "\\\\x",
+            // Windows drive prefixes. `Path::join` discards the base for both the
+            // rooted and the relative form, so each is the same file-read
+            // primitive as `//`, with no dots involved.
+            "/C:/Windows/win.ini",
+            "/C:foo",
+            "C:/x",
+            "/%43:/x",
+            "/c:/x",
+            // A single letter followed by `:` IS a drive spec, even mid-looking
+            // like an ordinary segment: `join("a:b/c")` discards the base too.
+            "/a:b/c",
         ] {
             assert!(is_absolute_escape(bad), "{bad:?} should be caught");
         }
-        for ok in ["/a//b", "/", "/a/", "/#x//y"] {
+        // A colon that cannot be a drive prefix must still be allowed: more than
+        // one leading letter, or a colon with no letter before it.
+        for ok in ["/a//b", "/", "/a/", "/#x//y", "/ab:/c", "/:x", "/1:/x"] {
             assert!(!is_absolute_escape(ok), "{ok:?} should be allowed");
+        }
+    }
+
+    /// Overlong UTF-8 is how a dot segment gets past a byte-compare guard on a
+    /// parser that decodes it (`%c0%ae` is an overlong `.`, `%c1%9c` an overlong
+    /// `\`). Rejecting all invalid UTF-8 kills the class without enumerating it.
+    #[test]
+    fn overlong_utf8_encodings_are_rejected() {
+        for bad in [
+            "/%c0%ae%c0%ae/x",
+            "/%e0%80%ae/x",
+            "/%c1%9c..%c1%9c",
+            "/%25c0%25ae/x",
+            "/%f0%80%80%ae/x",
+        ] {
+            assert!(has_invalid_utf8(bad), "{bad:?} should be caught");
+        }
+        // Legitimate multi-byte UTF-8 must survive.
+        for ok in [
+            "/ordinary",
+            "/caf%c3%a9",
+            "/#AmcVD92D3U/2/links",
+            "/%20",
+            "/café",
+        ] {
+            assert!(!has_invalid_utf8(ok), "{ok:?} should be allowed");
         }
     }
 
@@ -212,7 +284,13 @@ mod tests {
             let _ = has_dot_segment(s);
             let _ = is_absolute_escape(s);
             let _ = has_control_char(s);
+            let _ = has_invalid_utf8(s);
         }
+        // Behavioural assertions too, so a decoder that returns garbage on
+        // hostile input is not merely "did not panic".
+        assert!(has_dot_segment("%2e"), "a valid escape must still decode");
+        assert!(!has_dot_segment("%zz"), "an invalid escape is literal text");
+        assert!(!has_dot_segment("%2"), "a truncated escape is literal text");
     }
 
     /// Decoding must keep going past one pass, not stop at the first layer.
@@ -246,12 +324,5 @@ mod tests {
         let under = nest(MAX_DECODE_PASSES - 1);
         assert_eq!(decode_bounded(under.as_bytes()).unwrap(), b".");
         assert!(has_dot_segment(&under));
-    }
-
-    /// Overlong UTF-8 is deliberately NOT folded to `.` (see `decode_bounded`).
-    /// Pin the actual behaviour so the limitation is explicit rather than assumed.
-    #[test]
-    fn overlong_utf8_is_not_treated_as_a_dot_segment() {
-        assert!(!has_dot_segment("/%c0%ae%c0%ae/x"));
     }
 }

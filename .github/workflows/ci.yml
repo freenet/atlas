@@ -86,10 +86,15 @@ jobs:
       # and not a local one. Lint level does not affect codegen today, but the
       # whole point of this job is byte identity, and the next flag someone adds
       # to that env block might.
+      # Delete it first, so a build that fails to write the artifact shows up as a
+      # deletion in the diff below rather than as a silently-passing no-op if the
+      # script's output path ever drifts from the path being compared.
       - name: rebuild contract wasm
         env:
           RUSTFLAGS: ""
-        run: contracts/index-contract/build-wasm.sh
+        run: |
+          rm -f contracts/index-contract/atlas_index_contract.wasm
+          contracts/index-contract/build-wasm.sh
 
       - name: committed artifact matches source
         run: |
@@ -111,11 +116,20 @@ jobs:
       # preserved WASMs) and silently orphans the curated index at the old
       # address. So: if the artifact changed versus the merge base, the migration
       # registry and a preserved WASM must change in the same diff.
+      # PR-only: a direct push to main that re-keys bypasses this. That is
+      # acceptable only while branch protection requires PRs — if it ever does not,
+      # this needs a push-triggered form comparing against the previous commit.
       - name: a re-key must register the outgoing generation
         if: github.event_name == 'pull_request'
         run: |
+          # Explicit refspec: with a narrow fetch refspec (which some checkout
+          # configurations install) `git fetch origin <branch>` does NOT create
+          # refs/remotes/origin/<branch>, and `git rev-parse origin/<branch>` then
+          # fails — which would red every PR with a message about the WASM having
+          # changed. Name the destination ref so it exists either way.
           base="origin/${{ github.base_ref }}"
-          git fetch --depth=1 origin "${{ github.base_ref }}"
+          git fetch --depth=1 origin \
+            "+refs/heads/${{ github.base_ref }}:refs/remotes/origin/${{ github.base_ref }}"
           wasm=contracts/index-contract/atlas_index_contract.wasm
           if git diff --quiet "$base" HEAD -- "$wasm"; then
             echo "contract WASM unchanged versus $base — no re-key, nothing to register"
@@ -125,7 +139,18 @@ jobs:
           ok=1
           git diff --name-only "$base" HEAD -- cli/src/migration.rs | grep -q . \
             || { echo "::error::contract WASM changed but cli/src/migration.rs was not updated — prepend the OUTGOING code hash to LEGACY_INDEX_CODE_HASHES"; ok=0; }
-          git diff --name-only --diff-filter=A "$base" HEAD -- 'contracts/index-contract/legacy/*.wasm' | grep -q . \
-            || { echo "::error::contract WASM changed but no new file was added under contracts/index-contract/legacy/ — preserve the outgoing generation's WASM"; ok=0; }
-          [ "$ok" = 1 ] && echo "re-key ritual present"
-          exit $((1 - ok))
+          # Byte-compare, rather than merely requiring that SOME legacy file was
+          # added: the point is that the OUTGOING generation specifically was
+          # preserved. Chained with the unit test
+          # `every_registered_hash_matches_its_preserved_wasm` (preserved bytes ->
+          # registered hash), this closes wasm-identity -> hash-correctness with no
+          # gap in between.
+          git show "$base:$wasm" > /tmp/outgoing.wasm
+          found=0
+          for f in $(git diff --name-only --diff-filter=A "$base" HEAD -- 'contracts/index-contract/legacy/*.wasm'); do
+            if git show "HEAD:$f" | cmp -s - /tmp/outgoing.wasm; then found=1; echo "preserved outgoing WASM as $f"; fi
+          done
+          [ "$found" = 1 ] \
+            || { echo "::error::no added contracts/index-contract/legacy/*.wasm is byte-identical to the OUTGOING contract WASM — preserve the generation being retired"; ok=0; }
+          if [ "$ok" != 1 ]; then exit 1; fi
+          echo "re-key ritual present"

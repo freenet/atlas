@@ -188,6 +188,9 @@ fn check_path(path: &str) -> Result<(), String> {
     if crate::path::has_control_char(path) {
         return Err("path contains a control character".to_string());
     }
+    if crate::path::has_invalid_utf8(path) {
+        return Err("path is not valid UTF-8 once decoded (overlong encoding?)".to_string());
+    }
     if crate::path::has_dot_segment(path) {
         return Err("path contains a `.`/`..` segment (in any encoding)".to_string());
     }
@@ -422,7 +425,31 @@ impl AppRecord {
         if p_at < r_at {
             return Err("`{path}` must not precede `{resource}` in a link template".to_string());
         }
+        // `{path}` must be LAST, with nothing after it. Anything trailing is
+        // concatenated onto caller-controlled text and the two halves are then
+        // validated separately, so neither check sees the join. Concretely,
+        // template `/#{resource}{path}2e` plus the perfectly valid locator path
+        // `/.%` resolves to `/#<res>/.%2e`, which decodes to a `..` segment: the
+        // `%` came from the path and the `2e` from the template, and no check
+        // that looks at either alone can see it.
+        if !t.ends_with("{path}") {
+            return Err("`{path}` must be the last thing in a link template".to_string());
+        }
         check_path(t)?;
+        // Validate the RESOLVED suffix, not just the template. `check_path` on the
+        // template alone cannot see dots hidden inside a placeholder-bearing
+        // segment: `/{resource}/..{path}` has segments `""`, `"{resource}"` and
+        // `"..{path}"`, none of which equals `".."`, yet it resolves to
+        // `/<res>/..` and escapes the contract root. Resolving with a benign
+        // resource and an empty path exposes exactly that class.
+        let probe = self.resolve("1", "");
+        check_path(&probe)
+            .map_err(|e| format!("link template resolves to an invalid path ({probe:?}): {e}"))?;
+        if crate::path::is_absolute_escape(&probe) {
+            return Err(format!(
+                "link template resolves to a path that escapes the contract root ({probe:?})"
+            ));
+        }
         // Any placeholder other than the two we substitute would survive into
         // the emitted URL, so reject unknown ones instead of shipping a literal
         // `{foo}` to the gateway.
@@ -621,6 +648,35 @@ mod tests {
         }
     }
 
+    /// Call-site pin: the guards must be WIRED INTO `Locator::check`, not merely
+    /// exist. Testing the helpers alone leaves the call site free to drop them.
+    #[test]
+    fn locator_check_rejects_every_escape_class() {
+        let cases = [
+            ("/%c0%ae%c0%ae/x", "overlong utf-8 dot segment"),
+            ("/%e0%80%ae/x", "overlong utf-8"),
+            ("//home/user/.ssh/id_ed25519", "absolute escape"),
+            ("/C:/Windows/win.ini", "windows drive prefix"),
+            ("/..%2fsecret", "encoded traversal"),
+            ("/a%0Ab", "control character"),
+        ];
+        for (path, why) in cases {
+            assert!(
+                app_res("delta", "AmcVD92D3U", path).check().is_err(),
+                "AppResource path {path:?} should be rejected ({why})"
+            );
+            assert!(
+                Locator::Freenet {
+                    contract_id: ID.to_string(),
+                    path: path.to_string(),
+                }
+                .check()
+                .is_err(),
+                "Freenet path {path:?} should be rejected ({why})"
+            );
+        }
+    }
+
     #[test]
     fn dedup_key_collapses_pages_of_one_app_resource() {
         // Two links to different pages of ONE Delta site must be one subject.
@@ -692,6 +748,50 @@ mod tests {
         }
         assert!(record("/#{resource}{path}").check().is_ok());
         assert!(record("/{resource}{path}").check().is_ok());
+        // `{path}` must be last, and dots hidden in a placeholder segment must be
+        // caught by validating the RESOLVED suffix.
+        assert!(record("/#{resource}{path}2e").check().is_err());
+        assert!(record("/{resource}/..{path}").check().is_err());
+    }
+
+    /// No template that PASSES validation may combine with any locator path that
+    /// PASSES validation to produce an escape. This is the property the
+    /// individual rules exist to deliver, and checking the template and the path
+    /// separately cannot establish it — the two escapes this catches were both
+    /// found by asking this question rather than by enumerating bad templates.
+    #[test]
+    fn no_valid_template_and_valid_path_can_resolve_to_an_escape() {
+        let templates = [
+            "/#{resource}{path}",   // the real one
+            "/{resource}{path}",    // also legitimate
+            "/{resource}/..{path}", // dots hidden in a placeholder segment
+            "/{resource}/..{path}/..{path}",
+            "/#{resource}{path}2e", // `%` spliced across the boundary
+            "/{path}{resource}",
+            "/#{resource}",
+        ];
+        let paths = ["", "/", "/.%", "/a%", "/x", "/3/delta-sites", "/%2e", "//x"];
+        let mut checked = 0;
+        for t in templates {
+            let r = record(t);
+            if r.check().is_err() {
+                continue; // rejected outright, nothing to prove
+            }
+            for p in paths {
+                if app_res("delta", "AmcVD92D3U", p).check().is_err() {
+                    continue; // not a valid locator, so unreachable
+                }
+                checked += 1;
+                let s = r.resolve("AmcVD92D3U", p);
+                assert!(
+                    !crate::path::has_dot_segment(&s)
+                        && !crate::path::is_absolute_escape(&s)
+                        && !crate::path::has_invalid_utf8(&s),
+                    "template {t:?} + path {p:?} resolved to an escape: {s:?}"
+                );
+            }
+        }
+        assert!(checked > 0, "the combination table exercised nothing");
     }
 
     /// The `{path}`-before-`{resource}` rule exists to stop a `//` suffix. Pin

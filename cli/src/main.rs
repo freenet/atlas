@@ -11,8 +11,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, bail, Context, Result};
 use atlas_common::{
-    generate_key, sign, AppRecord, AppRegistry, IndexDelta, IndexEntry, IndexParams, IndexState,
-    KeyAuth, KeyAuthBody, Kind, Locator, RecordBody, SignedRecord, SubjectId, Tombstone,
+    generate_key, sign, AppRecord, AppRegistry, AppRegistryBody, IndexDelta, IndexEntry,
+    IndexParams, IndexState, KeyAuth, KeyAuthBody, Kind, Locator, RecordBody, SignedRecord,
+    SubjectId, Tombstone,
 };
 use clap::{Parser, Subcommand};
 use ed25519_dalek::{Signature, Signer, SigningKey};
@@ -435,8 +436,27 @@ async fn migrate(cli: &Cli, dir: &Path, dry_run: bool) -> Result<()> {
     if missing > 0 {
         println!(
             "\nNOTE: {missing} registered generation(s) reported NOT FOUND and were \
-             skipped as absent. If any of them was in fact published, re-run \
-             `atlasctl migrate` once it is reachable — merging is idempotent."
+             skipped as absent. NotFound is NOT proof of absence — the node also \
+             reports it when a GET exhausts its retries (an isolated or \
+             poorly-connected node returns it for a contract that exists), so if \
+             any of those was in fact published, re-run `atlasctl migrate` once it \
+             is reachable. Merging is idempotent."
+        );
+    }
+
+    // The dangerous shape is "skipped everything, merged nothing": that is
+    // indistinguishable from a node that cannot find any of the generations, and
+    // proceeding to rebuild the UI against an empty new index is exactly the
+    // stranding this command exists to prevent. Merging at least one generation
+    // proves the node can reach the old addresses, which makes a NotFound on
+    // another one credible.
+    if missing > 0 && merged == 0 {
+        bail!(
+            "inconclusive: every generation that could have held entries reported \
+             NOT FOUND, and nothing was merged. That is what an unreachable node \
+             looks like, not necessarily an empty history. Confirm connectivity \
+             (`atlasctl raw-get <legacy-id> --out /tmp/x`) and re-run; do NOT \
+             rebuild the UI against this index yet."
         );
     }
 
@@ -806,42 +826,13 @@ async fn app_set(
         cur.check_structure()
             .map_err(|e| anyhow!("refusing to build on a malformed registry: {e}"))?;
     }
-    let cur_version = current.as_ref().map_or(0, |a| a.body.version);
-    // A stale local replica is the realistic hazard, not a racing curator: a
-    // stale read plus version+1 still wins the merge and silently drops an app
-    // registered elsewhere. Once a registry exists, make the operator state the
-    // version they believe they are superseding.
-    match expect_version {
-        Some(v) if v != cur_version => bail!(
-            "registry is at version {cur_version}, not {v} — re-run `atlasctl apps` \
-             and retry with the version you intend to supersede"
-        ),
-        None if cur_version > 0 => bail!(
-            "registry is at version {cur_version}; pass --expect-version {cur_version} \
-             to confirm you are editing that version (guards against a stale read \
-             silently dropping another app)"
-        ),
-        _ => {}
-    }
-    let mut body = current.map(|a| a.body).unwrap_or_default();
-    // Binds the signature to THIS index, so it cannot be replayed into another
-    // index run by the same root key.
-    body.index_slug = cli.slug.clone();
-    match record {
-        Some(rec) => {
-            rec.check()
-                .map_err(|e| anyhow!("invalid app record: {e}"))?;
-            body.apps.insert(slug.to_string(), rec);
-        }
-        None => {
-            if body.apps.remove(slug).is_none() {
-                bail!("app `{slug}` is not registered");
-            }
-        }
-    }
-    body.version = cur_version
-        .checked_add(1)
-        .ok_or_else(|| anyhow!("registry version would overflow"))?;
+    let body = next_registry_body(
+        current.map(|a| a.body).as_ref(),
+        &cli.slug,
+        slug,
+        record,
+        expect_version,
+    )?;
     let registry = AppRegistry {
         sig: sign(&body, &root),
         body,
@@ -861,49 +852,105 @@ async fn app_set(
     Ok(())
 }
 
+/// The pure core of `app-set` / `app-unset`: given the registry currently on the
+/// network, produce the next one.
+///
+/// Split out from the async command so the read-modify-write is testable. The
+/// property that matters is that editing one app never drops another, which is the
+/// whole reason this reads before writing rather than overwriting.
+fn next_registry_body(
+    current: Option<&AppRegistryBody>,
+    index_slug: &str,
+    app: &str,
+    record: Option<AppRecord>,
+    expect_version: Option<u64>,
+) -> Result<AppRegistryBody> {
+    let cur_version = current.map_or(0, |b| b.version);
+    // A stale local replica is the realistic hazard, not a racing curator: a
+    // stale read plus version+1 still wins the merge and silently drops an app
+    // registered elsewhere. Once a registry exists, make the operator state the
+    // version they believe they are superseding.
+    match expect_version {
+        Some(v) if v != cur_version => bail!(
+            "registry is at version {cur_version}, not {v} — re-run `atlasctl apps` \
+             and retry with the version you intend to supersede"
+        ),
+        None if cur_version > 0 => bail!(
+            "registry is at version {cur_version}; pass --expect-version {cur_version} \
+             to confirm you are editing that version (guards against a stale read \
+             silently dropping another app)"
+        ),
+        _ => {}
+    }
+    let mut body = current.cloned().unwrap_or_default();
+    // Stamped from the INDEX slug, never carried over from the fetched body, so a
+    // registry lifted from another index cannot launder its binding through an
+    // edit here.
+    body.index_slug = index_slug.to_string();
+    match record {
+        Some(rec) => {
+            rec.check()
+                .map_err(|e| anyhow!("invalid app record: {e}"))?;
+            body.apps.insert(app.to_string(), rec);
+        }
+        None => {
+            if body.apps.remove(app).is_none() {
+                bail!("app `{app}` is not registered");
+            }
+        }
+    }
+    body.version = cur_version
+        .checked_add(1)
+        .ok_or_else(|| anyhow!("registry version would overflow"))?;
+    Ok(body)
+}
+
+/// Render the app registry as JSON for the crawler.
+///
+/// Hand-rolled so the CLI does not take a serde_json dependency purely for this.
+/// Safe ONLY because every interpolated field is charset-validated by
+/// `AppRecord::check` / `check_app_slug`: the slug is `[a-z0-9-]`, the contract id
+/// is base58, `name` is printable ASCII minus `"` and `\\`, and the template is
+/// restricted to URL-suffix characters. If any of those charsets is widened, this
+/// must switch to a real serializer. `apps_json_is_valid_json` pins the coupling.
+fn apps_json(registry: Option<&AppRegistry>) -> String {
+    let Some(registry) = registry else {
+        return "{\"version\":0,\"apps\":{}}".to_string();
+    };
+    let apps = registry
+        .body
+        .apps
+        .iter()
+        .map(|(slug, r)| {
+            format!(
+                "\"{slug}\":{{\"contract_id\":\"{}\",\"name\":\"{}\",\"link_template\":\"{}\"}}",
+                r.contract_id, r.name, r.link_template
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    format!(
+        "{{\"version\":{},\"apps\":{{{apps}}}}}",
+        registry.body.version
+    )
+}
+
 async fn apps(cli: &Cli, dir: &Path, json: bool) -> Result<()> {
     let registry = fetch_state(cli, dir).await?.and_then(|s| s.apps);
+    if json {
+        println!("{}", apps_json(registry.as_ref()));
+        return Ok(());
+    }
     let Some(registry) = registry else {
-        if json {
-            println!("{{\"version\":0,\"apps\":{{}}}}");
-        } else {
-            println!("(no app registry)");
-        }
+        println!("(no app registry)");
         return Ok(());
     };
-    if json {
-        // Hand-rolled so the CLI does not take a serde_json dependency purely for
-        // this. Safe only because every interpolated field is charset-validated
-        // by `AppRecord::check` / `check_app_slug`: the slug is `[a-z0-9-]`, the
-        // contract id is base58, `name` is printable ASCII minus `"` and `\\`,
-        // and the template is restricted to URL-suffix characters. So no value
-        // can contain a character that would need escaping or could break the
-        // document. If any of those charsets is ever widened, this must switch to
-        // a real JSON serializer.
-        let apps = registry
-            .body
-            .apps
-            .iter()
-            .map(|(slug, r)| {
-                format!(
-                    "\"{slug}\":{{\"contract_id\":\"{}\",\"name\":\"{}\",\"link_template\":\"{}\"}}",
-                    r.contract_id, r.name, r.link_template
-                )
-            })
-            .collect::<Vec<_>>()
-            .join(",");
+    println!("app registry version {}:", registry.body.version);
+    for (slug, r) in &registry.body.apps {
         println!(
-            "{{\"version\":{},\"apps\":{{{apps}}}}}",
-            registry.body.version
+            "  {slug}  {}  {}\n     template {}",
+            r.name, r.contract_id, r.link_template
         );
-    } else {
-        println!("app registry version {}:", registry.body.version);
-        for (slug, r) in &registry.body.apps {
-            println!(
-                "  {slug}  {}  {}\n     template {}",
-                r.name, r.contract_id, r.link_template
-            );
-        }
     }
     Ok(())
 }
@@ -1025,6 +1072,161 @@ mod tests {
     /// `app-set --slug delta` silently retargeted the whole command at a
     /// different index and failed with a confusing "contract not found". Only
     /// found by running it, so pin it.
+    fn rec(id: &str, name: &str) -> AppRecord {
+        AppRecord {
+            contract_id: id.to_string(),
+            name: name.to_string(),
+            link_template: "/#{resource}{path}".to_string(),
+        }
+    }
+    const ID_A: &str = "EqJ5YpEEV3XLqEvKWLQHFhGAac2qXzSUoE6k2zbdnXBr";
+    const ID_B: &str = "771DvtPMwt2PumPyrFvsz7fpvU1gogcmb5qtS1yYEEH9";
+
+    /// Editing one app must never drop another. This is the entire reason
+    /// `app-set` reads before writing, and it was previously untested.
+    #[test]
+    fn re_pointing_one_app_keeps_the_others() {
+        let mut cur = AppRegistryBody {
+            version: 4,
+            index_slug: "default".into(),
+            ..Default::default()
+        };
+        cur.apps.insert("delta".into(), rec(ID_A, "Delta"));
+        cur.apps.insert("river".into(), rec(ID_B, "River"));
+
+        let next = next_registry_body(
+            Some(&cur),
+            "default",
+            "delta",
+            Some(rec(ID_B, "Delta")),
+            Some(4),
+        )
+        .unwrap();
+        assert_eq!(next.version, 5);
+        assert_eq!(next.apps.len(), 2, "river must survive");
+        assert_eq!(next.apps["delta"].contract_id, ID_B, "delta re-pointed");
+        assert_eq!(next.apps["river"].contract_id, ID_B);
+        assert_eq!(next.apps["river"].name, "River", "river untouched");
+    }
+
+    #[test]
+    fn the_first_registry_starts_at_version_one_without_expect_version() {
+        let next =
+            next_registry_body(None, "default", "delta", Some(rec(ID_A, "Delta")), None).unwrap();
+        assert_eq!(next.version, 1);
+        assert_eq!(next.index_slug, "default");
+    }
+
+    #[test]
+    fn expect_version_is_required_and_must_match_once_a_registry_exists() {
+        let cur = AppRegistryBody {
+            version: 3,
+            index_slug: "default".into(),
+            ..Default::default()
+        };
+        let omitted =
+            next_registry_body(Some(&cur), "default", "delta", Some(rec(ID_A, "D")), None)
+                .expect_err("must refuse without --expect-version");
+        assert!(omitted.to_string().contains("--expect-version"));
+
+        let wrong = next_registry_body(
+            Some(&cur),
+            "default",
+            "delta",
+            Some(rec(ID_A, "D")),
+            Some(2),
+        )
+        .expect_err("must refuse a mismatched version");
+        let msg = wrong.to_string();
+        assert!(
+            msg.contains('3') && msg.contains('2'),
+            "should name both: {msg}"
+        );
+    }
+
+    /// The index binding is stamped from the INDEX slug, never carried over from
+    /// the fetched body, so an edit cannot launder a foreign registry's binding.
+    #[test]
+    fn the_index_binding_is_restamped_not_inherited() {
+        let cur = AppRegistryBody {
+            version: 1,
+            index_slug: "staging".into(),
+            ..Default::default()
+        };
+        let next = next_registry_body(
+            Some(&cur),
+            "default",
+            "delta",
+            Some(rec(ID_A, "D")),
+            Some(1),
+        )
+        .unwrap();
+        assert_eq!(next.index_slug, "default");
+    }
+
+    #[test]
+    fn unsetting_an_unregistered_app_is_an_error_and_keeps_siblings() {
+        let mut cur = AppRegistryBody {
+            version: 1,
+            index_slug: "default".into(),
+            ..Default::default()
+        };
+        cur.apps.insert("delta".into(), rec(ID_A, "Delta"));
+        assert!(next_registry_body(Some(&cur), "default", "river", None, Some(1)).is_err());
+        let next = next_registry_body(Some(&cur), "default", "delta", None, Some(1)).unwrap();
+        assert!(next.apps.is_empty());
+    }
+
+    #[test]
+    fn a_version_at_the_maximum_is_an_overflow_error_not_a_panic() {
+        let cur = AppRegistryBody {
+            version: u64::MAX,
+            index_slug: "default".into(),
+            ..Default::default()
+        };
+        let err = next_registry_body(
+            Some(&cur),
+            "default",
+            "delta",
+            Some(rec(ID_A, "D")),
+            Some(u64::MAX),
+        )
+        .expect_err("must not wrap");
+        assert!(err.to_string().contains("overflow"));
+    }
+
+    /// The hand-rolled JSON writer is safe only because the fields are
+    /// charset-validated. Pin that it really does emit parseable JSON, so widening
+    /// a charset without switching to a serializer fails here.
+    #[test]
+    fn apps_json_is_valid_json() {
+        assert_eq!(apps_json(None), r#"{"version":0,"apps":{}}"#);
+
+        let mut body = AppRegistryBody {
+            version: 7,
+            index_slug: "default".into(),
+            ..Default::default()
+        };
+        body.apps.insert("delta".into(), rec(ID_A, "Delta"));
+        body.apps.insert("river".into(), rec(ID_B, "River Chat"));
+        let root = atlas_common::generate_key();
+        let reg = AppRegistry {
+            sig: sign(&body, &root),
+            body,
+        };
+        let out = apps_json(Some(&reg));
+        // BTreeMap ordering makes this deterministic.
+        assert_eq!(
+            out,
+            format!(
+                r#"{{"version":7,"apps":{{"delta":{{"contract_id":"{ID_A}","name":"Delta","link_template":"/#{{resource}}{{path}}"}},"river":{{"contract_id":"{ID_B}","name":"River Chat","link_template":"/#{{resource}}{{path}}"}}}}}}"#
+            )
+        );
+        // Structural check independent of the exact bytes: balanced and quoted.
+        assert_eq!(out.matches('{').count(), out.matches('}').count());
+        assert_eq!(out.matches('"').count() % 2, 0);
+    }
+
     #[test]
     fn app_subcommands_do_not_shadow_the_global_index_slug() {
         use clap::CommandFactory;

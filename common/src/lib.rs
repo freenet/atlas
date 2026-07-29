@@ -9,7 +9,7 @@
 use ed25519_dalek::{Signature, SignatureError, Signer, SigningKey, VerifyingKey};
 use serde::Serialize;
 
-mod path;
+pub mod path;
 mod state;
 mod types;
 

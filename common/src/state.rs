@@ -214,10 +214,15 @@ impl IndexState {
             }
             None => None,
         };
-        // A registry-only delta is legitimate and carries no records, so do not
-        // demand a key_auth it has no use for. Requiring one made
-        // `atlasctl app-set` against a not-yet-initialized index fail with a
-        // message about records it never sent.
+        // A registry-only delta carries no records, so do not demand a key_auth it
+        // has no use for: the old code rejected it with a message about records it
+        // never sent, which is simply a wrong error.
+        //
+        // This does NOT make `app-set` work against an uninitialized index —
+        // `verify` still requires a key_auth (and the contract re-verifies the
+        // merged state), so such an index still refuses the update, just with an
+        // accurate message. Pinned by
+        // `a_registry_only_delta_is_admitted_but_an_uninitialized_index_fails_verify`.
         if delta.records.is_empty() {
             if let Some(r) = new_registry {
                 self.apps = Some(r);
@@ -720,6 +725,34 @@ mod tests {
                 .body
                 .version,
             1
+        );
+    }
+
+    /// Documents the real behaviour of a registry-only delta against a state with
+    /// no key_auth: `apply_delta` ADMITS it (it needs no key_auth), but `verify`
+    /// still refuses the resulting state, so the contract rejects the update. The
+    /// early return is about giving an accurate error, not about permitting it.
+    #[test]
+    fn a_registry_only_delta_is_admitted_but_an_uninitialized_index_fails_verify() {
+        let root = key();
+        let params = params(&root);
+        let mut st = IndexState::default();
+        st.apply_delta(
+            &IndexDelta {
+                key_auth: None,
+                records: vec![],
+                apps: Some(registry(&root, 1, ID_A)),
+            },
+            &params,
+        )
+        .expect("a registry-only delta needs no key_auth to be applied");
+        assert!(st.apps.is_some());
+        let err = st
+            .verify(&params)
+            .expect_err("a state with no key_auth must still fail verify");
+        assert!(
+            err.contains("key_auth"),
+            "the error must name the real problem, got: {err}"
         );
     }
 
