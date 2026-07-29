@@ -21,13 +21,25 @@ use freenet_stdlib::prelude::{ContractKey, Parameters};
 ///
 /// Prepend the OUTGOING code hash here every time the committed WASM is rebuilt
 /// in a way that changes its hash, BEFORE shipping the rebuild — otherwise the
-/// entries at the retired key are orphaned. `migration_registry_matches_legacy_wasm`
-/// pins that the newest entry equals the preserved legacy WASM's code hash.
+/// entries at the retired key are orphaned, AND preserve that generation's WASM
+/// under `contracts/index-contract/legacy/`.
+/// `every_registered_hash_matches_its_preserved_wasm` pins both halves.
 ///
+/// - `C6vpLoy2sdzbw9crd9wiAtUJQdeofN4NrANbqAGcLGTU`
+///   freenet-stdlib 0.8.3 generation, retired by the app-registry change (which
+///   touched `common/`, so the contract re-keyed). NOTE: this generation was
+///   never published. The 0.8.3 bump re-keyed the index but its migration was
+///   never run, so the live curated entries were still sitting at the 0.6.0
+///   address when this entry was added. It is registered anyway so the chain
+///   stays complete: probing an address that never received a PUT is a cheap
+///   no-op, whereas omitting a generation that did would strand it.
 /// - `GDt9A4DteAP6SYPmFXzoTScQuPfwufMaoZxxJaDDB1Yt`
-///   freenet-stdlib 0.6.0 generation, retired by the 0.8.3 bump. Its WASM is
-///   preserved at `contracts/index-contract/legacy/`.
-pub const LEGACY_INDEX_CODE_HASHES: &[&str] = &["GDt9A4DteAP6SYPmFXzoTScQuPfwufMaoZxxJaDDB1Yt"];
+///   freenet-stdlib 0.6.0 generation, retired by the 0.8.3 bump. This is where
+///   the live curated entries actually were.
+pub const LEGACY_INDEX_CODE_HASHES: &[&str] = &[
+    "C6vpLoy2sdzbw9crd9wiAtUJQdeofN4NrANbqAGcLGTU",
+    "GDt9A4DteAP6SYPmFXzoTScQuPfwufMaoZxxJaDDB1Yt",
+];
 
 /// Re-derive the legacy index keys (newest-first) for the given params bytes.
 /// A malformed constant is skipped rather than aborting the whole probe.
@@ -43,12 +55,17 @@ mod tests {
     use super::*;
     use freenet_stdlib::prelude::{ContractCode, ContractInstanceId};
 
-    // The retired 0.6.0 WASM, preserved so the registered code hash can be
-    // verified against the real bytes it claims to describe.
+    // The retired WASMs, preserved so each registered code hash can be verified
+    // against the real bytes it claims to describe. Newest-first, matching the
+    // order of `LEGACY_INDEX_CODE_HASHES`.
+    const LEGACY_V083_WASM: &[u8] = include_bytes!(
+        "../../contracts/index-contract/legacy/atlas_index_contract-v0.8.3-stdlib.wasm"
+    );
     const LEGACY_V06_WASM: &[u8] = include_bytes!(
         "../../contracts/index-contract/legacy/atlas_index_contract-v0.6.0-stdlib.wasm"
     );
-    // The current (0.8.3) WASM the CLI embeds.
+    const PRESERVED_LEGACY_WASMS: &[&[u8]] = &[LEGACY_V083_WASM, LEGACY_V06_WASM];
+    // The current WASM the CLI embeds.
     const CURRENT_WASM: &[u8] =
         include_bytes!("../../contracts/index-contract/atlas_index_contract.wasm");
 
@@ -60,23 +77,53 @@ mod tests {
         p
     }
 
-    /// The registered legacy code hash must be exactly the retired WASM's hash,
-    /// so the derived legacy key equals the address the live 0.6 index sits at.
-    /// Guards against a wrong/typo'd constant silently pointing the migration at
-    /// a non-existent contract.
+    /// EVERY registered legacy code hash must be exactly its retired WASM's
+    /// hash, so each derived legacy key equals a real prior address. Guards
+    /// against a wrong/typo'd constant silently pointing the migration at a
+    /// non-existent contract, and against a new generation being registered
+    /// without preserving the WASM that backs the claim.
     #[test]
-    fn migration_registry_matches_legacy_wasm() {
+    fn every_registered_hash_matches_its_preserved_wasm() {
         let params = test_params();
-        let from_registry = &legacy_index_keys(&params)[0];
-        let from_wasm = ContractKey::from_params_and_code(
-            Parameters::from(params.clone()),
-            ContractCode::from(LEGACY_V06_WASM.to_vec()),
+        let derived = legacy_index_keys(&params);
+        assert_eq!(
+            derived.len(),
+            LEGACY_INDEX_CODE_HASHES.len(),
+            "a registered hash failed to parse into a key"
         );
         assert_eq!(
-            from_registry.id(),
-            from_wasm.id(),
-            "registered legacy code hash does not reproduce the 0.6 WASM's key"
+            PRESERVED_LEGACY_WASMS.len(),
+            LEGACY_INDEX_CODE_HASHES.len(),
+            "every registered generation must have its WASM preserved under \
+             contracts/index-contract/legacy/ (newest-first, same order)"
         );
+        for (i, (key, wasm)) in derived.iter().zip(PRESERVED_LEGACY_WASMS).enumerate() {
+            let from_wasm = ContractKey::from_params_and_code(
+                Parameters::from(params.clone()),
+                ContractCode::from(wasm.to_vec()),
+            );
+            assert_eq!(
+                key.id(),
+                from_wasm.id(),
+                "LEGACY_INDEX_CODE_HASHES[{i}] does not reproduce its preserved WASM's key"
+            );
+        }
+    }
+
+    /// The registered generations must be DISTINCT. Registering the same hash
+    /// twice, or pasting the wrong one, would silently shrink the probe set the
+    /// migration walks.
+    #[test]
+    fn registered_generations_are_distinct() {
+        let params = test_params();
+        let mut ids: Vec<String> = legacy_index_keys(&params)
+            .iter()
+            .map(|k| k.id().to_string())
+            .collect();
+        let before = ids.len();
+        ids.sort();
+        ids.dedup();
+        assert_eq!(before, ids.len(), "duplicate legacy generation registered");
     }
 
     /// The 0.8 rebuild must actually re-key: the current key must differ from

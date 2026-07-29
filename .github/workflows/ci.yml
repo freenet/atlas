@@ -1,0 +1,89 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+
+jobs:
+  check:
+    name: fmt, clippy, test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # rust-toolchain.toml pins the channel, components and the wasm target, so
+      # the action installs exactly what the contract build needs.
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: none
+      - run: rustup show active-toolchain || rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+
+      - name: cargo fmt
+        run: cargo fmt --all -- --check
+
+      # The contract and the UI target wasm32 and are covered by their own jobs;
+      # linting them for the host target would fail on wasm-only deps.
+      - name: cargo clippy (native crates)
+        run: cargo clippy --workspace --exclude atlas-ui --exclude atlas-index-contract --all-targets
+
+      - name: cargo test (native crates)
+        run: cargo test --workspace --exclude atlas-ui --exclude atlas-index-contract
+
+  wasm:
+    name: wasm builds
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: none
+      - run: rustup show active-toolchain || rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+
+      - name: contract clippy
+        run: cargo clippy -p atlas-index-contract --target wasm32-unknown-unknown
+
+      - name: ui check
+        run: cargo check -p atlas-ui --target wasm32-unknown-unknown
+
+  contract-key:
+    name: committed contract WASM is current
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: none
+      - run: rustup show active-toolchain || rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+
+      # The index's on-network address is hash(compiled_wasm, params), and
+      # cli/build.rs embeds the COMMITTED wasm. If a source change under common/
+      # or contracts/ lands without refreshing that artifact, atlasctl silently
+      # targets the OLD address while the deployed contract is the new one (or
+      # vice versa). This job rebuilds and diffs, so the re-key is visible in the
+      # PR rather than discovered after a publish.
+      #
+      # It does NOT assert byte-reproducibility against another machine — only
+      # that the artifact matches THIS source tree, built with the same
+      # remap-path-prefix flags the release script uses.
+      - name: rebuild contract wasm
+        run: contracts/index-contract/build-wasm.sh
+
+      - name: committed artifact matches source
+        run: |
+          if ! git diff --quiet -- contracts/index-contract/atlas_index_contract.wasm; then
+            echo "::error::The committed contract WASM does not match this source tree."
+            echo "Run contracts/index-contract/build-wasm.sh and commit the result."
+            echo "NOTE: if the hash changed, the index RE-KEYS. Prepend the outgoing"
+            echo "code hash to LEGACY_INDEX_CODE_HASHES in cli/src/migration.rs and plan"
+            echo "an 'atlasctl migrate' before publishing."
+            git diff --stat -- contracts/index-contract/atlas_index_contract.wasm
+            exit 1
+          fi
+          echo "committed WASM matches source"
