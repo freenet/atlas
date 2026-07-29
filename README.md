@@ -76,7 +76,7 @@ by a contract id. Those entries use an `app:<slug>/<resource>` locator and are
 resolved through a root-signed registry in the index state:
 
 ```bash
-atlasctl app-set --slug delta --name Delta \
+atlasctl app-set --app delta --name Delta \
   --contract-id EqJ5YpEEV3XLqEvKWLQHFhGAac2qXzSUoE6k2zbdnXBr \
   --expect-version <current>     # required once a registry exists
 ```

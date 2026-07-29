@@ -63,6 +63,9 @@ enum Cmd {
         locator: String,
         #[arg(long)]
         featured: bool,
+        /// Add even if an entry with the same dedup key is already listed.
+        #[arg(long)]
+        allow_duplicate: bool,
     },
     /// Tombstone a subject by id (needs the current version to supersede it).
     Remove {
@@ -80,8 +83,13 @@ enum Cmd {
     /// version+1 (root-signed).
     AppSet {
         /// App slug, `[a-z0-9-]` (e.g. `delta`).
+        ///
+        /// Named `--app`, NOT `--slug`: `--slug` is the global INDEX slug, and a
+        /// subcommand flag of the same name shadowed it, so `app-set --slug delta`
+        /// silently pointed the whole command at a different index and failed with
+        /// a confusing "contract not found".
         #[arg(long)]
-        slug: String,
+        app: String,
         /// The app's CURRENT web-container contract instance id.
         #[arg(long)]
         contract_id: String,
@@ -100,8 +108,9 @@ enum Cmd {
     /// Remove an app from the registry. Entries naming it stay in the index but
     /// become unresolvable, so prefer re-pointing over removing.
     AppUnset {
+        /// App slug (see the note on `app-set --app`).
         #[arg(long)]
-        slug: String,
+        app: String,
         #[arg(long)]
         expect_version: Option<u64>,
     },
@@ -205,13 +214,27 @@ async fn main() -> Result<()> {
             tags,
             locator,
             featured,
-        } => add(&cli, &dir, kind, title, snippet, tags, locator, *featured).await,
+            allow_duplicate,
+        } => {
+            add(
+                &cli,
+                &dir,
+                kind,
+                title,
+                snippet,
+                tags,
+                locator,
+                *featured,
+                *allow_duplicate,
+            )
+            .await
+        }
         Cmd::Remove {
             subject,
             cur_version,
         } => remove(&cli, &dir, subject, *cur_version).await,
         Cmd::AppSet {
-            slug,
+            app,
             contract_id,
             name,
             link_template,
@@ -220,7 +243,7 @@ async fn main() -> Result<()> {
             app_set(
                 &cli,
                 &dir,
-                slug,
+                app,
                 Some(AppRecord {
                     contract_id: contract_id.clone(),
                     name: name.clone(),
@@ -231,9 +254,9 @@ async fn main() -> Result<()> {
             .await
         }
         Cmd::AppUnset {
-            slug,
+            app,
             expect_version,
-        } => app_set(&cli, &dir, slug, None, *expect_version).await,
+        } => app_set(&cli, &dir, app, None, *expect_version).await,
         Cmd::Apps { json } => apps(&cli, &dir, *json).await,
         Cmd::Show { subscribe } => show(&cli, &dir, *subscribe).await,
         Cmd::Key => {
@@ -600,8 +623,29 @@ async fn add(
     tags: &str,
     locator: &str,
     featured: bool,
+    allow_duplicate: bool,
 ) -> Result<()> {
     let online = load_key(&dir.join("online.key"))?;
+    let locator = parse_locator(locator)?;
+    // Refuse a second listing for the same subject. Subject ids are random, so
+    // nothing else stops `add` minting a fresh one for a locator already in the
+    // index — and for an app-hosted locator `dedup_key` deliberately ignores the
+    // path, so two links to different pages of ONE Delta site collapse here
+    // rather than becoming two cards.
+    if !allow_duplicate {
+        if let Some(state) = fetch_state(cli, dir).await? {
+            let key = locator.dedup_key();
+            if let Some(existing) = state.live_entries().find(|e| e.locator.dedup_key() == key) {
+                bail!(
+                    "already listed as subject {} ({}), locator {}\n\
+                     pass --allow-duplicate to add it anyway, or `atlasctl remove` the existing one",
+                    existing.subject_id.as_str(),
+                    existing.title,
+                    existing.locator.to_uri()
+                );
+            }
+        }
+    }
     let entry = IndexEntry {
         subject_id: SubjectId::random(),
         version: 1,
@@ -609,7 +653,7 @@ async fn add(
         title: title.to_string(),
         snippet: snippet.to_string(),
         tags: split_tags(tags),
-        locator: parse_locator(locator)?,
+        locator,
         featured,
         added_at: now_secs(),
     };
@@ -713,7 +757,11 @@ async fn fetch_state(cli: &Cli, dir: &Path) -> Result<Option<IndexState>> {
     let params = params_bytes(dir, &cli.slug)?;
     let key = NodeClient::contract_key(CONTRACT_WASM, &params);
     let mut client = NodeClient::connect(&cli.node).await?;
-    let bytes = client.get(&key, false).await?;
+    // `get_optional`, not `get`: a not-yet-initialized index is a legitimate
+    // starting state for `app-set`, not a failure.
+    let Some(bytes) = client.get_optional(&key, false).await? else {
+        return Ok(None);
+    };
     if bytes.is_empty() {
         return Ok(None);
     }
@@ -971,6 +1019,77 @@ fn b58(bytes: &[u8]) -> String {
 mod tests {
     use super::*;
     use atlas_common::{IndexEntry, Kind, Locator};
+
+    /// The app-slug flag must NOT be named `slug`: `--slug` is a GLOBAL arg for
+    /// the INDEX slug, and a subcommand flag of the same name shadowed it, so
+    /// `app-set --slug delta` silently retargeted the whole command at a
+    /// different index and failed with a confusing "contract not found". Only
+    /// found by running it, so pin it.
+    #[test]
+    fn app_subcommands_do_not_shadow_the_global_index_slug() {
+        use clap::CommandFactory;
+        let cmd = Cli::command();
+        for name in ["app-set", "app-unset"] {
+            let sub = cmd
+                .get_subcommands()
+                .find(|c| c.get_name() == name)
+                .unwrap_or_else(|| panic!("{name} subcommand missing"));
+            let shadows = sub
+                .get_arguments()
+                .any(|a| a.get_id() == "slug" && !a.is_global_set());
+            assert!(
+                !shadows,
+                "{name} defines its own `--slug`, which shadows the global index slug"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_locator_accepts_the_app_form_and_round_trips() {
+        for uri in [
+            "app:delta/AmcVD92D3U",
+            "app:delta/AmcVD92D3U/3/delta-sites",
+            "app:delta/AmcVD92D3U#frag",
+            "app:delta/AmcVD92D3U?q=1",
+        ] {
+            let loc = parse_locator(uri).unwrap_or_else(|e| panic!("{uri}: {e}"));
+            assert_eq!(loc.to_uri(), uri, "round-trip failed for {uri}");
+            match &loc {
+                Locator::AppResource { app, resource, .. } => {
+                    assert_eq!(app, "delta");
+                    assert_eq!(resource, "AmcVD92D3U");
+                }
+                other => panic!("{uri} parsed as {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn parse_locator_rejects_malformed_app_uris() {
+        for bad in [
+            "app:delta",            // no `/`
+            "app:delta/",           // empty resource
+            "app:delta/#x",         // empty resource
+            "app:/AmcVD92D3U",      // empty slug
+            "app:Delta/AmcVD92D3U", // uppercase slug
+            "app:delta/has space",
+            "app:delta/AmcVD92D3U/../x", // traversal
+            "ftp://example.com",
+        ] {
+            assert!(parse_locator(bad).is_err(), "{bad:?} should be rejected");
+        }
+    }
+
+    /// The dedup key an app-hosted locator is stored under must ignore the path,
+    /// which is what makes two pages of one Delta site a single listing.
+    #[test]
+    fn app_locators_for_one_site_share_a_dedup_key() {
+        let a = parse_locator("app:delta/AmcVD92D3U/1/home").unwrap();
+        let b = parse_locator("app:delta/AmcVD92D3U/3/delta-sites").unwrap();
+        let other = parse_locator("app:delta/Fe5jaFmRnp/1/about").unwrap();
+        assert_eq!(a.dedup_key(), b.dedup_key());
+        assert_ne!(a.dedup_key(), other.dedup_key());
+    }
 
     fn live_record(sid: SubjectId) -> SignedRecord {
         let key = generate_key();
