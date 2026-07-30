@@ -683,8 +683,12 @@ impl Pending {
     }
 
     /// Record a transient failure. Returns true once the locator has burned
-    /// `MAX_ATTEMPTS` and should be given up on (and marked seen, so it is never
-    /// reconsidered).
+    /// `MAX_ATTEMPTS` and should be given up on.
+    ///
+    /// Giving up means QUARANTINE, not seen. This doc used to say "and marked
+    /// seen, so it is never reconsidered", which is exactly the instruction that
+    /// lost real sites: failing to REACH a locator is not a decision about it.
+    /// The caller must hand it to [`Quarantine::hold`].
     fn record_failure(&mut self, loc: &str) -> bool {
         let Some((_, e)) = self.entries.iter_mut().find(|(l, _)| l == loc) else {
             return true;
@@ -961,7 +965,8 @@ impl Quarantine {
         } else {
             let _ = fs::remove_file(&tmp);
             eprintln!(
-                "warn: could not persist quarantine {} — given-up links may be retried early",
+                "warn: could not persist quarantine {} — locators given up on THIS run \
+                 are lost (they are already out of the pending queue)",
                 self.path.display()
             );
         }
@@ -1033,6 +1038,58 @@ fn main() -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Put every released locator back to work, and put back into quarantine any the
+/// queue refuses.
+///
+/// Extracted from `run_once` so it can be tested directly. It USED to be inlined,
+/// and the unit test reproduced it — which pinned nothing: the reproduction and
+/// the original could drift, and the one-token mutation that matters
+/// (re-holding at `now_secs()` instead of the original `at`) passed the whole
+/// suite while starving the locator by a fresh cooldown on every run.
+///
+/// Returns `(requeued, held_back)`.
+fn requeue_released(
+    released: Vec<ReleasedLocator>,
+    seen: &HashSet<String>,
+    pending: &mut Pending,
+    quarantine: &mut Quarantine,
+) -> (usize, usize) {
+    let mut requeued = 0usize;
+    let mut held_back = 0usize;
+    for (at, loc, kind, author) in released {
+        // Already decided about: drop it, the release was a no-op.
+        if seen.contains(&loc) {
+            continue;
+        }
+        if pending.add(&loc, kind, &author) {
+            requeued += 1;
+        } else if !pending.contains(&loc) {
+            // The queue REFUSED it (author cap, or full and nothing evictable).
+            // It has already been dropped from the quarantine file, so leaving it
+            // here would lose the locator entirely — the exact failure this type
+            // exists to prevent, reintroduced through the release path. Put it
+            // back at its ORIGINAL timestamp, so the next run releases it again
+            // rather than restarting the whole cooldown.
+            quarantine.hold(&loc, kind, &author, at);
+            held_back += 1;
+        }
+        // `add` also returns false when the locator is ALREADY queued, which is
+        // not a loss — that is the `pending.contains` arm above.
+    }
+    (requeued, held_back)
+}
+
+/// What discovery must NOT re-capture: everything already decided about, plus
+/// everything still cooling down in quarantine.
+///
+/// Without the quarantine half, discovery re-queues on the very next run exactly
+/// what phase 2 just gave up on, so the hold is a no-op and the locator burns
+/// budget every run. `seen` itself stays the record of what has been DECIDED,
+/// and is what phase 2 appends to.
+fn capture_filter(seen: &HashSet<String>, quarantine: &Quarantine) -> HashSet<String> {
+    seen.iter().cloned().chain(quarantine.held()).collect()
 }
 
 fn run_once(
@@ -1113,39 +1170,14 @@ fn run_once(
     // be rediscovered, because a River room's history is bounded and the message
     // that carried the link may be gone by now.
     let (mut quarantine, released) = Quarantine::load(quarantine_path, now_secs());
-    let mut requeued = 0usize;
-    let mut held_back = 0usize;
-    for (at, loc, kind, author) in released {
-        // Already decided about: drop it, the release was a no-op.
-        if seen.contains(&loc) {
-            continue;
-        }
-        if pending.add(&loc, kind, &author) {
-            requeued += 1;
-        } else if !pending.contains(&loc) {
-            // The queue REFUSED it (author cap, or full and nothing evictable).
-            // It has already been dropped from the quarantine file, so leaving it
-            // here would lose the locator entirely — the exact failure this type
-            // exists to prevent, reintroduced through the release path. Put it
-            // back, at its ORIGINAL timestamp so it is retried on the next run
-            // rather than waiting out another cooldown.
-            quarantine.hold(&loc, kind, &author, at);
-            held_back += 1;
-        }
-        // add() also returns false when the locator is ALREADY queued, which is
-        // not a loss — that is the `pending.contains` arm above.
-    }
+    let (requeued, held_back) = requeue_released(released, &seen, &mut pending, &mut quarantine);
     if requeued > 0 {
         eprintln!("released {requeued} locator(s) from quarantine for retry");
     }
     if held_back > 0 {
         eprintln!("warn: {held_back} released locator(s) did not fit the queue — kept quarantined");
     }
-    // Discovery must not immediately re-queue what phase 2 just gave up on, so
-    // capture is filtered against seen AND the still-held quarantine. `seen`
-    // itself stays the record of what has been DECIDED, and is what phase 2
-    // appends to.
-    let capture_filter: HashSet<String> = seen.iter().cloned().chain(quarantine.held()).collect();
+    let capture_filter = capture_filter(&seen, &quarantine);
     // Loaded once per run: which apps the curator has registered, so an app-hosted
     // link can be recognised as a resource rather than as its container.
     let registry = AppRegistryView::load(cli);
@@ -4486,29 +4518,17 @@ mod tests {
             0,
             "a released locator must no longer suppress capture"
         );
-    }
 
-    /// A given-up locator survives its hold and comes back queueable.
-    #[test]
-    fn a_quarantined_locator_comes_back_for_retry() {
-        let q_file = TmpFile::new("giveup-quarantine");
-        let loc = format!("freenet:{ID}/");
-        let at = 2_000_000_000u64;
-
-        let mut pending = Pending::load(TmpFile::new("giveup-pending").path());
-        pending.add(&loc, "site", "@hub");
-        let (mut q, _) = Quarantine::load(q_file.path(), at);
-
-        let mut gave_up = false;
-        for _ in 0..MAX_ATTEMPTS {
-            gave_up = pending.record_failure(&loc);
-        }
-        assert!(gave_up, "must give up after MAX_ATTEMPTS");
-        q.hold(&loc, "site", "@hub", at);
+        // The release must be PERSISTED. Without `dirty` being set on release the
+        // file is never rewritten, so the same locator is released again on every
+        // run for ever and the file grows without bound.
+        let (mut q, _) = Quarantine::load(f.path(), at + QUARANTINE_SECS);
         q.save();
-
-        let (_, released) = Quarantine::load(q_file.path(), at + QUARANTINE_SECS);
-        assert_eq!(released.len(), 1, "it must come back for a retry later");
+        let (q, again) = Quarantine::load(f.path(), at + QUARANTINE_SECS);
+        assert!(
+            again.is_empty() && q.held().count() == 0,
+            "a released locator must be gone from the file, not re-released each run"
+        );
     }
 
     /// A release the queue cannot accept must go BACK into quarantine, not
@@ -4517,10 +4537,9 @@ mod tests {
     /// lose the locator from BOTH files — the exact loss this type exists to
     /// prevent, reintroduced through the release path.
     ///
-    /// This pins the loop in `run_once` by reproducing it, because that function
-    /// needs a node and an LLM to call. The mechanism it depends on —
-    /// `Pending::add` returning false on a full author bucket — is real, not
-    /// mocked.
+    /// Calls the REAL `requeue_released`, so the timestamp it re-holds at is
+    /// genuinely asserted. An earlier version of this test reproduced the loop
+    /// instead, which pinned nothing.
     #[test]
     fn a_release_the_queue_refuses_is_kept_quarantined() {
         let q_file = TmpFile::new("release-refused-q");
@@ -4541,72 +4560,82 @@ mod tests {
 
         let (mut q, released) = Quarantine::load(q_file.path(), at + QUARANTINE_SECS);
         assert_eq!(released.len(), 1, "the hold has expired, so it is released");
-        let seen: HashSet<String> = HashSet::new();
-        for (orig_at, loc, kind, author) in released {
-            if seen.contains(&loc) {
-                continue;
-            }
-            if !pending.add(&loc, kind, &author) && !pending.contains(&loc) {
-                q.hold(&loc, kind, &author, orig_at);
-            }
-        }
+        let (requeued, held_back) =
+            requeue_released(released, &HashSet::new(), &mut pending, &mut q);
+        assert_eq!(
+            (requeued, held_back),
+            (0, 1),
+            "a full bucket must refuse it"
+        );
         assert!(
             !pending.contains(&loc),
             "test premise: the full bucket must actually refuse it"
         );
         q.save();
 
-        // It must still be quarantined, at its ORIGINAL timestamp so the next run
-        // releases it again rather than restarting the 7-day cooldown.
+        // Still quarantined, at its ORIGINAL timestamp so the next run releases
+        // it again rather than restarting the seven-day cooldown.
         let (_, again) = Quarantine::load(q_file.path(), at + QUARANTINE_SECS);
         assert_eq!(
             again.len(),
             1,
             "a refused release must be kept, not lost from both files"
         );
-        assert_eq!(again[0].0, at, "it must keep its original timestamp");
+        assert_eq!(
+            again[0].0, at,
+            "re-holding at `now` would starve it by a fresh cooldown every run"
+        );
     }
 
-    /// The companion pin to the test above. That test reproduces `run_once`'s
-    /// release loop; this one asserts the REAL loop still does the thing, so the
-    /// two cannot drift apart silently.
+    /// A release the queue ACCEPTS must leave quarantine for good, and one we
+    /// have already decided about must simply be dropped.
     #[test]
-    fn the_release_loop_puts_back_what_the_queue_refuses() {
-        let src = include_str!("main.rs");
-        let production = src
-            .split("\nmod tests")
-            .next()
-            .expect("source must have a pre-test region");
-        let anchor = "for (at, loc, kind, author) in released {";
-        let at = production
-            .find(anchor)
-            .expect("the quarantine release loop must still exist");
-        let body_start = at + anchor.len() - 1;
-        let mut depth = 0usize;
-        let mut end = body_start;
-        for (i, c) in production[body_start..].char_indices() {
-            match c {
-                '{' => depth += 1,
-                '}' => {
-                    depth -= 1;
-                    if depth == 0 {
-                        end = body_start + i + 1;
-                        break;
-                    }
-                }
-                _ => {}
-            }
-        }
-        let loop_body = &production[body_start..end];
+    fn requeue_released_places_what_it_can_and_drops_what_is_decided() {
+        let mut pending = Pending::load(TmpFile::new("requeue-ok-p").path());
+        let (mut q, _) = Quarantine::load(TmpFile::new("requeue-ok-q").path(), 0);
+        let fresh = "https://fresh.example/1".to_string();
+        let decided = "https://decided.example/1".to_string();
+        let seen: HashSet<String> = [decided.clone()].into_iter().collect();
+
+        let (requeued, held_back) = requeue_released(
+            vec![
+                (1, fresh.clone(), "external", "ALICE".to_string()),
+                (1, decided.clone(), "external", "ALICE".to_string()),
+            ],
+            &seen,
+            &mut pending,
+            &mut q,
+        );
+        assert_eq!((requeued, held_back), (1, 0));
         assert!(
-            loop_body.contains("quarantine.hold("),
-            "a released locator the queue refuses must be put BACK in quarantine, \
-             or it is lost from both files"
+            pending.contains(&fresh),
+            "a placeable release must be queued"
         );
         assert!(
-            loop_body.contains("pending.contains("),
-            "the re-hold must be skipped when add() returned false merely because \
-             the locator was ALREADY queued, or it would be double-tracked"
+            !pending.contains(&decided),
+            "an already-decided locator must not be re-queued"
+        );
+        assert_eq!(q.held().count(), 0, "neither may stay quarantined");
+    }
+
+    /// The hold is only meaningful if discovery is actually filtered by it.
+    /// Without the quarantine half, discovery re-queues on the next run exactly
+    /// what phase 2 just gave up on, and the locator burns budget every run.
+    #[test]
+    fn capture_filter_suppresses_held_but_not_released_locators() {
+        let (mut q, _) = Quarantine::load(TmpFile::new("capfilter-q").path(), 0);
+        let held = "https://held.example/1".to_string();
+        let indexed = "https://indexed.example/1".to_string();
+        let free = "https://free.example/1".to_string();
+        q.hold(&held, "external", "ALICE", 1_000);
+        let seen: HashSet<String> = [indexed.clone()].into_iter().collect();
+
+        let f = capture_filter(&seen, &q);
+        assert!(f.contains(&held), "a held locator must not be re-captured");
+        assert!(f.contains(&indexed), "seen must still suppress capture");
+        assert!(
+            !f.contains(&free),
+            "an unrelated locator must stay capturable"
         );
     }
 
@@ -4619,7 +4648,9 @@ mod tests {
     /// excluded from the index for good by three HTTP 500s.
     ///
     /// Scoped to the source BEFORE `mod tests` so the needles cannot match this
-    /// test's own text, which would make the pin unfailable.
+    /// test's own text, and COMMENT-STRIPPED so prose cannot satisfy them: a
+    /// refactor that moved the call into a helper and left "// calls
+    /// quarantine.hold(…)" behind would otherwise keep the pin green.
     #[test]
     fn the_give_up_branch_quarantines_and_does_not_blacklist() {
         let src = include_str!("main.rs");
@@ -4630,6 +4661,22 @@ mod tests {
         assert!(
             !production.contains("fn the_give_up_branch_quarantines"),
             "the scan region must exclude the test module, or the pin matches itself"
+        );
+
+        // Any new write to the append-only seen file, ANYWHERE in the crawler,
+        // fails this. Scoping the check to one branch let the blacklist come back
+        // through a helper. Today: the definition, plus the single call in the
+        // `Ok` arm where a locator has genuinely been DECIDED about.
+        assert_eq!(
+            strip_comments(production).matches("append_seen(").count(),
+            2,
+            "exactly one call site may write to the permanent seen file (the `Ok` \
+             arm); a new one is a blacklist coming back by another name"
+        );
+        assert!(
+            production.contains("quarantine.save()"),
+            "the quarantine must be persisted, or a give-up is lost from pending, \
+             quarantine and seen alike"
         );
 
         let anchor = "if pending.record_failure(&loc) {";
@@ -4646,7 +4693,9 @@ mod tests {
             match c {
                 '{' => depth += 1,
                 '}' => {
-                    depth -= 1;
+                    depth = depth
+                        .checked_sub(1)
+                        .expect("anchor must end at the opening brace of the branch");
                     if depth == 0 {
                         end = body_start + i + 1;
                         break;
@@ -4659,17 +4708,47 @@ mod tests {
             end > body_start,
             "the give-up branch must be brace-balanced"
         );
-        let branch = &production[body_start..end];
+        let branch = strip_comments(&production[body_start..end]);
 
         assert!(
             branch.contains("quarantine.hold("),
             "a transient give-up must quarantine the locator for a later retry"
         );
         assert!(
-            !branch.contains("append_seen"),
+            !branch.contains("seen.insert"),
             "a transient give-up must NOT be written to the permanent seen file — \
              it is never re-read for retry, so that loses the site for good"
         );
+
+        // The give-up branch lives in the TRANSIENT catch-all of the
+        // `match index_locator(…)`, which must stay the LAST arm of THAT match. A
+        // new `Err(e) if …` guard inserted below the catch-all would make give-up
+        // unreachable while every needle above still matched. Scoped to the
+        // enclosing match: unrelated `Err(e) if` arms elsewhere in the file are
+        // none of this pin's business.
+        let match_start = production[..at]
+            .rfind("match index_locator(")
+            .expect("the give-up branch must sit in the index_locator match");
+        let arm = production[match_start..at].rfind("Err(e) =>").expect(
+            "the give-up branch must sit in the unguarded catch-all Err arm, not a \
+             guarded one",
+        );
+        assert!(
+            !production[match_start + arm..at].contains("Err(e) if "),
+            "the transient catch-all must remain the last Err arm of this match, \
+             or give-up is unreachable"
+        );
+    }
+
+    /// Strip `//` line comments so a source pin cannot be satisfied by prose.
+    fn strip_comments(src: &str) -> String {
+        src.lines()
+            .map(|l| match l.find("//") {
+                Some(i) => &l[..i],
+                None => l,
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
     }
 
     #[test]
