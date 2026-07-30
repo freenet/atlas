@@ -31,19 +31,21 @@ use freenet_stdlib::prelude::{ContractKey, Parameters};
 ///
 ///   **This generation IS published and holds the NEWEST state.** Probed
 ///   2026-07-29 it had 36 records / 29 live entries, MORE than the 0.6.0 address
-///   (30 / 23). The 0.8.3 migration did run; what never happened was the UI
-///   rebuild, so the published site kept reading 0.6.0 and froze six entries
-///   behind. Skipping this generation in a migration therefore loses more than
-///   skipping 0.6.0 would.
+///   (30 / 23), so skipping it in a migration loses more than skipping 0.6.0
+///   would. The 0.8.3 migration ran and the UI was rebuilt against it.
 ///
-///   (An earlier version of this comment asserted the opposite — that it was
-///   never published. It was wrong, and the mistake is instructive: registering a
-///   generation on the belief that it holds nothing, then treating a NotFound on
-///   it as confirmation, is a way to lose exactly the entries you were migrating.
-///   Probe before you conclude.)
+///   (This comment has been wrong twice, in opposite directions, which is the
+///   useful part. First it asserted this generation was never published — wrong,
+///   and dangerous, because registering a generation on the belief that it holds
+///   nothing and then reading a NotFound as confirmation is how you lose exactly
+///   the entries you were migrating. Then the correction over-reached and claimed
+///   the published UI had been left reading 0.6.0; that was inferred from a stale
+///   default in the UI source without checking the deployed bytes, and the bytes
+///   say otherwise. Probe before you conclude, in both directions.)
 /// - `GDt9A4DteAP6SYPmFXzoTScQuPfwufMaoZxxJaDDB1Yt`
 ///   freenet-stdlib 0.6.0 generation, retired by the 0.8.3 bump. Still holds the
-///   pre-bump snapshot, and is what the published UI has been reading.
+///   pre-bump snapshot, so it is worth merging, but it is NOT what the published UI
+///   reads.
 pub const LEGACY_INDEX_CODE_HASHES: &[&str] = &[
     "C6vpLoy2sdzbw9crd9wiAtUJQdeofN4NrANbqAGcLGTU",
     "GDt9A4DteAP6SYPmFXzoTScQuPfwufMaoZxxJaDDB1Yt",

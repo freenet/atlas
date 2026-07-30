@@ -55,9 +55,9 @@ atlasctl show
 # 3. Register any app-hosted containers (see "app registry" below).
 atlasctl apps
 
-# 4. Rebuild the UI against the NEW index id. There is deliberately no default:
-#    the build fails if this is unset, because a stale default is what froze the
-#    site last time.
+# 4. Rebuild the UI against the NEW index id. There is deliberately no default, so
+#    forgetting this fails the build instead of silently publishing a UI pinned to
+#    the retired generation.
 ATLAS_INDEX_ID=$(atlasctl key) dx build --release -p atlas-ui
 
 # 5. Publish the web container (its address does NOT move; only its content).

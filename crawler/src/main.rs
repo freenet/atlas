@@ -976,7 +976,7 @@ fn run_once(
             // re-keys on every WASM upgrade). Polled on EVERY tick, budget or
             // not — see `crawl_river_room` for why that is load-bearing.
             let owner_vk = owner_vk.trim().to_string();
-            captured += crawl_river_room(cli, &owner_vk, &seen, &mut pending);
+            captured += crawl_river_room(cli, &owner_vk, &seen, &mut pending, &registry);
         } else {
             // A curated locator from the operator's own file. Normalized before
             // it is queued, like every other locator: queuing the raw line meant
@@ -1585,6 +1585,60 @@ fn skip_hub_link(
     }
 }
 
+/// The outbound links a hub page contributes: extracted from every rendered page,
+/// mapped onto registered apps, and filtered down to genuinely outbound ones.
+///
+/// Extracted from `crawl_hub` so the COMPOSITION is testable, not just its parts.
+/// `hub_subject_of` and `skip_hub_link` were individually pinned while the wiring
+/// between them was not, and that wiring is where the bug lived: two mutations of it
+/// (dropping the mapping, or using the unmapped hub identity) each reintroduced the
+/// original "no Delta site is ever captured" behaviour with the suite still green.
+fn hub_outbound_links(
+    hub: &str,
+    hub_subject: &str,
+    htmls: &[&str],
+    registry: &AppRegistryView,
+    seen: &HashSet<String>,
+    pending: &Pending,
+) -> Vec<(String, &'static str)> {
+    let mut links: Vec<(String, &'static str)> = Vec::new();
+    let mut have: HashSet<String> = HashSet::new();
+    for html in htmls {
+        for (loc, kind) in extract_locators(html) {
+            // Map BEFORE deduping, or the same site reached from two pages under two
+            // different page paths counts twice.
+            let loc = registry.map_locator(&loc).unwrap_or(loc);
+            if have.insert(loc.clone()) {
+                links.push((loc, kind));
+            }
+        }
+    }
+    // Taken from the MAPPED subject, which is the correct expression, though note it
+    // is not independently load-bearing: for an app locator `locator_identity` is the
+    // locator itself, so identity equality reduces to `loc == hub_subject`, which
+    // `skip_hub_link` already checks. What the unmapped form would actually miss is
+    // the app SHELL, and that is covered explicitly below. Verified by mutation:
+    // swapping this to `locator_identity(hub)` changes no test outcome, whereas
+    // removing the container check or the mapping does.
+    let hub_identity = locator_identity(hub_subject);
+    // The container the hub's app is served from, so links back to the app shell
+    // (which carry no resource and therefore do not map) are still in-app.
+    let hub_container = freenet_id(hub).map(str::to_string);
+    links
+        .into_iter()
+        .filter(|(loc, _)| {
+            !skip_hub_link(
+                hub_subject,
+                hub_identity,
+                hub_container.as_deref(),
+                loc,
+                seen,
+                pending,
+            )
+        })
+        .collect()
+}
+
 /// Poll a hub (link-repository) page and CAPTURE its outbound site links into
 /// the pending queue. Discovery only, like [`crawl_river_room`] — nothing is
 /// described or billed here.
@@ -1656,37 +1710,9 @@ fn crawl_hub(
     // divs) is otherwise invisible past its first page — which is why the sources
     // file had to name one specific page, and why the page listing Delta sites was
     // never read at all.
-    let mut links = extract_locators(&page.html);
-    for extra in &page.extra_pages {
-        for l in extract_locators(extra) {
-            if !links.contains(&l) {
-                links.push(l);
-            }
-        }
-    }
-    let links: Vec<(String, &'static str)> = links
-        .into_iter()
-        .map(|(loc, kind)| match registry.map_locator(&loc) {
-            Some(mapped) => (mapped, kind),
-            None => (loc, kind),
-        })
-        .collect();
-    let hub_identity = locator_identity(&hub_subject);
-    // The container the hub's app is served from, so links back to the app shell
-    // (which carry no resource and therefore do not map) are still in-app.
-    let hub_container = freenet_id(hub).map(str::to_string);
-    for (loc, kind) in links {
-        if skip_hub_link(
-            &hub_subject,
-            hub_identity,
-            hub_container.as_deref(),
-            &loc,
-            seen,
-            pending,
-        ) {
-            continue;
-        }
-
+    let mut htmls: Vec<&str> = vec![page.html.as_str()];
+    htmls.extend(page.extra_pages.iter().map(String::as_str));
+    for (loc, kind) in hub_outbound_links(hub, &hub_subject, &htmls, registry, seen, pending) {
         if pending.add(&loc, kind, HUB_AUTHOR) {
             captured += 1;
         }
@@ -1844,6 +1870,7 @@ fn crawl_river_room(
     owner_vk_b58: &str,
     seen: &HashSet<String>,
     pending: &mut Pending,
+    registry: &AppRegistryView,
 ) -> usize {
     let owner_vk = match parse_owner_vk(owner_vk_b58) {
         Ok(vk) => vk,
@@ -1880,7 +1907,7 @@ fn crawl_river_room(
         }
     };
 
-    let links = extract_message_urls(&state, &owner_vk);
+    let links = extract_message_urls(&state, &owner_vk, registry);
     let mut captured = 0;
     for (loc, kind, author) in &links {
         if seen.contains(loc) || pending.contains(loc) {
@@ -1911,6 +1938,7 @@ fn crawl_river_room(
 fn extract_message_urls(
     state: &ChatRoomStateV1,
     owner_vk: &VerifyingKey,
+    registry: &AppRegistryView,
 ) -> Vec<(String, &'static str, String)> {
     let messages = &state.recent_messages;
     let members = state.members.members_by_member_id();
@@ -1939,6 +1967,14 @@ fn extract_message_urls(
         };
         let author = msg.message.author.to_string();
         for (loc, kind) in scan_urls(&text) {
+            // Map onto a registered app, same as hub links and curated lines. Without
+            // this a Delta URL posted in the room is indexed under its container and
+            // becomes a SECOND entry for a site the hub crawl files under `app:delta/…`
+            // — the dedup collapse this work exists to prevent, via a different door.
+            let (loc, kind) = match registry.map_locator(&loc) {
+                Some(mapped) => (mapped, kind),
+                None => (loc, kind),
+            };
             if seen.insert(loc.clone()) {
                 out.push((loc, kind, author.clone()));
             }
@@ -2151,7 +2187,19 @@ impl AppRegistryView {
         ))
     }
 
-    /// The resource handle of an app-hosted locator, for page enumeration.
+    /// The resource handle of an app-hosted locator, for page enumeration — but only
+    /// for an app whose URLs actually look paginable this way.
+    ///
+    /// Enumeration drives `#<resource>/<n>`, which is Delta's convention: fragment
+    /// routing with a numeric page segment. Neither half is derivable from the
+    /// registry's `{resource}{path}` template, so enabling it for every mapped app
+    /// meant a registered app with a different URL shape (a River room, say) would get
+    /// a dozen meaningless hash changes at ~2.7s each — most of the render watchdog
+    /// spent for nothing, and likely tipping it over.
+    ///
+    /// Gated on the prefix ending in `#` as a proxy for "routes in the fragment".
+    /// That is still a heuristic; the registry declaring its pagination shape is the
+    /// real fix, filed alongside the resource-shape issue.
     fn resource_of(&self, loc: &str) -> Option<String> {
         let mapped = if loc.starts_with("app:") {
             loc.to_string()
@@ -2159,7 +2207,15 @@ impl AppRegistryView {
             self.map_locator(loc)?
         };
         let rest = mapped.strip_prefix("app:")?;
-        let (_, resource) = rest.split_once('/')?;
+        let (slug, resource) = rest.split_once('/')?;
+        // Only for a fragment-routed app: see the note above.
+        if !self
+            .apps
+            .iter()
+            .any(|a| a.slug == slug && a.prefix.ends_with('#'))
+        {
+            return None;
+        }
         // Validate even when the input was already an `app:` locator. This value is
         // passed as a child-process argument, and an operator-written sources line
         // like `hub app:delta/--shot` would otherwise reach render.js's argv parser.
@@ -2221,6 +2277,33 @@ fn normalize_mapped(href: &str, registry: &AppRegistryView) -> Option<(String, &
 fn normalize_href(href: &str) -> Option<(String, &'static str)> {
     if href.len() > MAX_LOCATOR_LEN {
         return None;
+    }
+    // `app:<slug>/<resource>` is a locator this crawler now MINTS, so it has to be
+    // one this function accepts.
+    //
+    // Missing this arm was silent data loss: `Pending::load` re-validates every
+    // stored locator through here, so each reload dropped every queued app locator
+    // and logged `dropped N queued locator(s) that no longer validate` — the queue's
+    // own alarm. The sites survived only because the hub re-crawl happened to
+    // re-capture them in the same run; a hub whose interval had not elapsed, or whose
+    // render failed, lost them entirely.
+    if let Some(rest) = href.strip_prefix("app:") {
+        let (slug, resource) = rest.split_once('/')?;
+        if slug.is_empty()
+            || slug.len() > 32
+            || !slug
+                .chars()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+        {
+            return None;
+        }
+        if resource.len() < MIN_APP_RESOURCE_LEN
+            || resource.len() > 64
+            || !resource.chars().all(is_base58)
+        {
+            return None;
+        }
+        return Some((format!("app:{slug}/{resource}"), "site"));
     }
     // Control characters (a newline in a hub's href, say) would inject an extra
     // row into the tab-separated pending file, letting an attacker mint author
@@ -3182,6 +3265,111 @@ mod tests {
     /// An app's own route words are base58 too, so without a length floor every
     /// `#about` / `#new` / `#settings` link became a separate "site" — each costing
     /// an LLM call and a permanent index entry.
+    /// The whole composition, over HTML shaped like the real hub pages: an unmapped
+    /// hub locator plus two rendered pages must yield exactly the OTHER sites.
+    ///
+    /// This is the test that was missing. `hub_subject_of` and `skip_hub_link` were
+    /// each pinned, but the wiring between them was not — and two mutations of that
+    /// wiring (dropping the mapping, or taking the identity from the unmapped hub)
+    /// each restored the original "no Delta site is ever captured" bug with the whole
+    /// suite green.
+    #[test]
+    fn a_delta_hub_yields_other_sites_and_nothing_else() {
+        let reg = delta_registry();
+        let tmp = TmpFile::new("compose");
+        let pending = Pending::load(tmp.path());
+        let seen: HashSet<String> = HashSet::new();
+
+        // As it appears in the sources file: a container URL with a fragment route.
+        let hub = format!("freenet:{DELTA}/#AmcVD92D3U/3/delta-sites");
+        let hub_subject = hub_subject_of(&hub, &reg);
+
+        // Page 1: the hub's own nav plus the app shell. Page 2: other Delta sites and
+        // one ordinary web contract. Shapes taken from the real rendered pages.
+        let page1 = format!(
+            r#"<a href="/v1/contract/web/{DELTA}/">Delta</a>
+               <a href="/v1/contract/web/{DELTA}/#AmcVD92D3U/7/river-lore">River Lore</a>
+               <a href="/v1/contract/web/{DELTA}/#about">About</a>"#
+        );
+        let page2 = format!(
+            r#"<a href="/v1/contract/web/{DELTA}/#DWn4bEFfoo/">ato's log</a>
+               <a href="/v1/contract/web/{DELTA}/#Fe5jaFmRnp/1/about">David's Place</a>
+               <a href="/v1/contract/web/{DELTA}/#DWn4bEFfoo/9/other">ato again</a>
+               <a href="/v1/contract/web/{RIVER}/">River</a>"#
+        );
+
+        let got = hub_outbound_links(
+            &hub,
+            &hub_subject,
+            &[page1.as_str(), page2.as_str()],
+            &reg,
+            &seen,
+            &pending,
+        );
+        let mut locs: Vec<String> = got.into_iter().map(|(l, _)| l).collect();
+        locs.sort();
+
+        assert_eq!(
+            locs,
+            vec![
+                "app:delta/DWn4bEFfoo".to_string(),
+                "app:delta/Fe5jaFmRnp".to_string(),
+                format!("freenet:{RIVER}/"),
+            ],
+            "expected exactly the two other Delta sites (deduped across pages) and \
+             the plain web contract"
+        );
+    }
+
+    /// `Pending::load` re-validates every stored locator through `normalize_href`, so
+    /// a locator shape the crawler MINTS but that function rejects is silently
+    /// destroyed on every reload. That happened: all 20 queued Delta sites were
+    /// dropped each run, logged only as `dropped N queued locator(s) that no longer
+    /// validate`, and survived only because the hub re-crawl re-captured them in the
+    /// same run.
+    #[test]
+    fn app_locators_survive_the_pending_reload_revalidation() {
+        for loc in [
+            "app:delta/AmcVD92D3U",
+            "app:delta/DWn4bEFfoo",
+            "app:river/AmcVD92D3Umore",
+        ] {
+            let (norm, kind) =
+                normalize_href(loc).unwrap_or_else(|| panic!("{loc} must survive re-validation"));
+            assert_eq!(norm, loc, "re-validation must be idempotent");
+            assert_eq!(kind, "site");
+        }
+        // …and malformed app locators are still refused.
+        for bad in [
+            "app:delta",            // no resource
+            "app:delta/",           // empty resource
+            "app:delta/short",      // below the handle floor
+            "app:DELTA/AmcVD92D3U", // slug charset
+            "app:/AmcVD92D3U",      // empty slug
+            "app:delta/has space",
+            "app:delta/0OIl0OIl0O", // non-base58
+        ] {
+            assert!(normalize_href(bad).is_none(), "{bad:?} must be refused");
+        }
+    }
+
+    /// End-to-end through the real queue: an app locator must still be there after a
+    /// save/load cycle. `pending_survives_a_restart` only used https and freenet
+    /// locators, which is why the drop went unnoticed.
+    #[test]
+    fn pending_survives_a_restart_with_app_locators() {
+        let f = TmpFile::new("pending-app");
+        {
+            let mut p = Pending::load(f.path());
+            assert!(p.add("app:delta/AmcVD92D3U", "site", HUB_AUTHOR));
+            assert!(p.add("app:delta/DWn4bEFfoo", "site", HUB_AUTHOR));
+            p.save();
+        }
+        let reloaded = Pending::load(f.path());
+        assert!(reloaded.contains("app:delta/AmcVD92D3U"));
+        assert!(reloaded.contains("app:delta/DWn4bEFfoo"));
+    }
+
     #[test]
     fn short_route_words_are_not_mistaken_for_resource_handles() {
         let reg = delta_registry();

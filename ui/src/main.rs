@@ -17,13 +17,17 @@ use wasm_bindgen_futures::spawn_local;
 /// The index contract instance id, baked in at build time. REQUIRED: there is
 /// deliberately no default.
 ///
-/// A default is what froze the live site. The index re-keys on any `common/`
-/// change, and `atlasctl` derives its target from the committed WASM, so after a
-/// re-key the curator writes to the new address while a UI built with a stale
-/// default keeps reading the old one. The result is not an error the operator
-/// notices: the site renders the pre-re-key snapshot indefinitely and simply
-/// never shows anything new. That happened at the stdlib-0.8.3 bump and left the
-/// published UI six entries behind for over a week.
+/// A default is a trap here. The index re-keys on any `common/` change, and
+/// `atlasctl` derives its target from the committed WASM, so after a re-key the
+/// curator writes to the new address while a UI built with a stale default keeps
+/// reading the old one. The failure is silent: the site renders the pre-re-key
+/// snapshot indefinitely and simply stops showing anything new, with nothing
+/// erroring.
+///
+/// (The published UI has NOT actually regressed this way — the 0.8.3 publish did
+/// pass the migrated id via this env var. An earlier version of this comment
+/// asserted it had, inferring a live bug from the stale default without checking the
+/// deployed bytes. The trap was real; the regression was not.)
 ///
 /// `env!` turns forgetting it into a build failure instead. Get the value from
 /// `atlasctl key`.
