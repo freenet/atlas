@@ -361,6 +361,14 @@ fn host_bucket(loc: &str) -> String {
     let host = url::Url::parse(loc)
         .ok()
         .and_then(|u| u.host_str().map(|h| h.to_ascii_lowercase()));
+    // An app-hosted locator is its own publisher: `Url::parse` accepts `app:` as a
+    // non-special scheme with an opaque path and no host, so every one of them used
+    // to share the single `@unparsed` bucket with genuinely malformed URLs — capping
+    // ALL Delta sites at `per_host_max` per run collectively, and letting a flood of
+    // junk URLs crowd them out entirely.
+    if loc.starts_with("app:") {
+        return loc.to_string();
+    }
     let Some(host) = host else {
         // A locator that does not parse gets ONE shared bucket, never a bucket
         // of its own. Keying on the raw string would let junk like
@@ -997,6 +1005,7 @@ fn run_once(
 
     // ---- Phase 2: description. Billed, rationed, and fair. ----
     let mut added = 0usize;
+    let mut unresolvable = 0usize;
     let mut author_used: HashMap<String, usize> = HashMap::new();
     let mut authors_served: HashSet<String> = HashSet::new();
     let order = pending.drain_order();
@@ -1059,6 +1068,18 @@ fn run_once(
             // `atlasctl add` because the node was restarting. Keep it queued and
             // try again on a later run rather than discarding a good link (and
             // the money already spent describing it) over a blip.
+            // A locator whose app the registry does not know is a CONFIGURATION
+            // state, not a bad link: leave it queued, un-penalised, and do not
+            // count an attempt. Otherwise a transient registry read failure
+            // permanently discards every queued app locator after three runs.
+            Err(e) if is_unresolvable_app(&e) || is_deterministic_refusal(&e) => {
+                eprintln!("  deferring {loc}: {e}");
+                unresolvable += 1;
+            }
+            // Transient: a fetch timeout, a 5xx, an LLM hiccup, a failed
+            // `atlasctl add` because the node was restarting. Keep it queued and
+            // try again on a later run rather than discarding a good link (and
+            // the money already spent describing it) over a blip.
             Err(e) => {
                 eprintln!("  skip {loc}: {e:#}");
                 if pending.record_failure(&loc) {
@@ -1073,6 +1094,19 @@ fn run_once(
     pending.report_refusals();
     pending.save();
 
+    if registry.apps.is_empty() {
+        eprintln!(
+            "NOTE: the app registry is EMPTY, so app-hosted links (Delta sites) are \
+             NOT being recognised — they are indexed by container id, which is the \
+             behaviour this crawler was changed to fix. Check `atlasctl apps`."
+        );
+    }
+    if unresolvable > 0 {
+        eprintln!(
+            "{unresolvable} locator(s) deferred because their app is not registered \
+             (left queued, no budget charged)"
+        );
+    }
     let attempts = budget.attempts;
     let spent_now = spent_before + attempts;
     eprintln!(
@@ -1121,11 +1155,19 @@ fn index_locator(
 ///
 /// The content-safety rating is computed from the page TEXT, so a page with almost
 /// no text is rated on almost nothing — and an image-only site is exactly the case
-/// the gate most needs to catch. Measured against a real app shell: Delta's chrome
-/// alone renders ~288 characters with no page content at all, so "the frame is not
-/// empty" is a very low bar. Refusing here is also NOT marked final by the caller,
-/// so a page that is thin because it had not finished loading gets another chance.
-const MIN_DESCRIBABLE_CHARS: usize = 220;
+/// the gate most needs to catch.
+///
+/// Calibrated ABOVE the chrome baseline, which the previous value was not: measured,
+/// a Delta resource that renders only the app shell yields ~288 visible characters
+/// with no page content at all, and the threshold was 220. That is below the floor,
+/// so it could never fire for the app this change is about — an empty or unrouted
+/// Delta resource cleared it and got described. `page.text` is the frame's
+/// innerText, chrome included, so the number has to clear the chrome.
+///
+/// 420 leaves roughly 130 characters of actual content above a Delta shell. It is a
+/// heuristic, and deliberately a cheap one; the honest fix is to strip the app chrome
+/// before rating, which needs per-app knowledge the registry does not carry yet.
+const MIN_DESCRIBABLE_CHARS: usize = 420;
 
 /// Describe an already-fetched page and add it to the index, applying the
 /// content-safety gate. Split out from `index_locator` so a hub crawl can index
@@ -1153,10 +1195,12 @@ fn index_page(
     // both the likeliest NSFW vector and the one the text rating is blindest to.
     let visible = page.text.trim().chars().count();
     if visible < MIN_DESCRIBABLE_CHARS {
-        bail!(
-            "only {visible} visible characters (min {MIN_DESCRIBABLE_CHARS}) — too \
-             little to describe or to rate for safety"
-        );
+        // `TooThin`, not a plain error: this verdict is DETERMINISTIC for a given
+        // page, so charging it a retry means three runs with a broken renderer (node
+        // missing, a playwright upgrade, chromium OOM) silently blacklist the entire
+        // backlog forever. A refusal the crawler will reach again identically must
+        // not consume attempts.
+        return Err(TooThin { visible }.into());
     }
     let desc = match key {
         // An LLM failure on untrusted content must NOT fall back to the
@@ -1427,6 +1471,66 @@ fn render_page(
     })
 }
 
+/// "This page had too little text to describe or to rate."
+///
+/// Deterministic for a given page, so — like [`UnresolvableApp`] — it must not
+/// consume one of the three attempts. The previous code's doc comment claimed a thin
+/// page "gets another chance"; it got exactly two more and was then permanently
+/// marked seen.
+#[derive(Debug)]
+struct TooThin {
+    visible: usize,
+}
+
+impl std::fmt::Display for TooThin {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "only {} visible characters (min {MIN_DESCRIBABLE_CHARS}) — too little to \
+             describe or to rate for safety",
+            self.visible
+        )
+    }
+}
+
+impl std::error::Error for TooThin {}
+
+/// "This locator names an app the registry does not know."
+///
+/// A distinct error type because it must NOT be treated like a fetch failure. The
+/// two were indistinguishable, so a transient registry read failure (a restarting
+/// node, or `atlasctl` briefly unavailable) charged the spend ledger, consumed one
+/// of three attempts, and after the third marked the locator seen FOREVER. Nineteen
+/// queued Delta sites would have burned 57 daily budget slots to permanently discard
+/// exactly the links this work exists to capture.
+///
+/// It is a configuration state: retry it for free, indefinitely.
+#[derive(Debug)]
+struct UnresolvableApp;
+
+impl std::fmt::Display for UnresolvableApp {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "names an app the registry does not know (configuration, not content)"
+        )
+    }
+}
+
+impl std::error::Error for UnresolvableApp {}
+
+/// True if this error means "not resolvable yet", so the caller must not charge it.
+fn is_unresolvable_app(e: &anyhow::Error) -> bool {
+    e.chain()
+        .any(|c| c.downcast_ref::<UnresolvableApp>().is_some())
+}
+
+/// True if this error is a DETERMINISTIC refusal, so retrying it cannot help and
+/// charging it an attempt would eventually blacklist a page for good.
+fn is_deterministic_refusal(e: &anyhow::Error) -> bool {
+    e.chain().any(|c| c.downcast_ref::<TooThin>().is_some())
+}
+
 /// The SUBJECT a hub page should be listed and compared under.
 ///
 /// A hub arrives as a specific page of a specific resource
@@ -1451,6 +1555,7 @@ fn hub_subject_of(hub: &str, registry: &AppRegistryView) -> String {
 fn skip_hub_link(
     hub: &str,
     hub_identity: &str,
+    hub_container: Option<&str>,
     loc: &str,
     seen: &HashSet<String>,
     pending: &Pending,
@@ -1466,7 +1571,18 @@ fn skip_hub_link(
     // sites on Ivvor's "Delta Sites" page were dropped. An app-hosted identity is
     // `(app, resource)`, so a different site is no longer confused with this one,
     // while another PAGE of the same site still is (the path is dropped on mapping).
-    hub_identity == locator_identity(loc)
+    if hub_identity == locator_identity(loc) {
+        return true;
+    }
+    // Also skip an UNMAPPED link back into the hub app's own container: the app
+    // shell itself (`/v1/contract/web/<container>/`, a logo or home link) has no
+    // resource, so it does not map, and its identity is the container id rather than
+    // the hub's `app:slug/res`. Without this it is queued and described as a
+    // separate "site" — the app itself, listed once per hub that links to it.
+    match (hub_container, freenet_id(loc)) {
+        (Some(c), Some(l)) => c == l,
+        _ => false,
+    }
 }
 
 /// Poll a hub (link-repository) page and CAPTURE its outbound site links into
@@ -1556,8 +1672,18 @@ fn crawl_hub(
         })
         .collect();
     let hub_identity = locator_identity(&hub_subject);
+    // The container the hub's app is served from, so links back to the app shell
+    // (which carry no resource and therefore do not map) are still in-app.
+    let hub_container = freenet_id(hub).map(str::to_string);
     for (loc, kind) in links {
-        if skip_hub_link(&hub_subject, hub_identity, &loc, seen, pending) {
+        if skip_hub_link(
+            &hub_subject,
+            hub_identity,
+            hub_container.as_deref(),
+            &loc,
+            seen,
+            pending,
+        ) {
             continue;
         }
 
@@ -2000,7 +2126,7 @@ impl AppRegistryView {
         let after = path.strip_prefix(&app.prefix)?;
         let end = after.find(|c: char| !is_base58(c)).unwrap_or(after.len());
         let resource = &after[..end];
-        if resource.is_empty() || resource.len() > 64 {
+        if resource.len() < MIN_APP_RESOURCE_LEN || resource.len() > 64 {
             return None;
         }
         Some(format!("app:{}/{}", app.slug, resource))
@@ -2034,9 +2160,37 @@ impl AppRegistryView {
         };
         let rest = mapped.strip_prefix("app:")?;
         let (_, resource) = rest.split_once('/')?;
+        // Validate even when the input was already an `app:` locator. This value is
+        // passed as a child-process argument, and an operator-written sources line
+        // like `hub app:delta/--shot` would otherwise reach render.js's argv parser.
+        if resource.len() < MIN_APP_RESOURCE_LEN
+            || resource.len() > 64
+            || !resource.chars().all(is_base58)
+        {
+            return None;
+        }
         Some(resource.to_string())
     }
 }
+
+/// Minimum length for a string to be believed to be an app RESOURCE handle.
+///
+/// Without a floor, any base58 run after the app's prefix became a "site": a Delta
+/// href of `#about`, `#new` or `#settings` is all base58, so each of the app's own
+/// route words would be queued, described (paid for) and indexed as a separate
+/// listing. Index pollution scaling with the app's route vocabulary.
+///
+/// Real handles are derived from an owner key and are long: Delta's are exactly 10
+/// base58 characters. 10 is the shortest real handle among registered apps.
+///
+/// The tradeoff is explicit: 8 was tried first and is too low, because `settings` is
+/// exactly 8 characters and every character of it is base58. Route words genuinely
+/// collide with short handles, so a length floor cannot be both tight and general —
+/// an app whose handles were 8 characters would be rejected by this. The registry
+/// should DECLARE the resource shape per app instead of the crawler guessing; that
+/// needs a schema change to a root-signed structure, so it is filed rather than
+/// rushed in here.
+const MIN_APP_RESOURCE_LEN: usize = 10;
 
 fn is_base58(c: char) -> bool {
     matches!(c, '1'..='9' | 'A'..='H' | 'J'..='N' | 'P'..='Z' | 'a'..='k' | 'm'..='z')
@@ -2793,6 +2947,7 @@ mod tests {
             skip_hub_link(
                 &hub_subject,
                 &hub_identity,
+                None,
                 &own_other_page,
                 &seen,
                 &pending
@@ -2806,7 +2961,14 @@ mod tests {
             .map_locator(&format!("freenet:{DELTA}/#DWn4bEFfoo/"))
             .unwrap();
         assert!(
-            !skip_hub_link(&hub_subject, &hub_identity, &other_site, &seen, &pending),
+            !skip_hub_link(
+                &hub_subject,
+                &hub_identity,
+                None,
+                &other_site,
+                &seen,
+                &pending
+            ),
             "a different site in the same app must be kept"
         );
 
@@ -2845,7 +3007,7 @@ mod tests {
             .map_locator(&format!("freenet:{DELTA}/#DWn4bEFfoo/"))
             .unwrap();
         assert!(
-            !skip_hub_link(&hub, &hub_identity, &other, &seen, &pending),
+            !skip_hub_link(&hub, &hub_identity, None, &other, &seen, &pending),
             "a different site in the same app must NOT be skipped — this is the bug \
              that dropped all 19 Delta sites"
         );
@@ -2854,9 +3016,23 @@ mod tests {
         let same = reg
             .map_locator(&format!("freenet:{DELTA}/#AmcVD92D3U/7/river-lore"))
             .unwrap();
-        assert!(skip_hub_link(&hub, &hub_identity, &same, &seen, &pending));
+        assert!(skip_hub_link(
+            &hub,
+            &hub_identity,
+            None,
+            &same,
+            &seen,
+            &pending
+        ));
         // The hub itself.
-        assert!(skip_hub_link(&hub, &hub_identity, &hub, &seen, &pending));
+        assert!(skip_hub_link(
+            &hub,
+            &hub_identity,
+            None,
+            &hub,
+            &seen,
+            &pending
+        ));
 
         // A plain web contract hub keeps the old rule: same contract id is in-app.
         let whub = format!("freenet:{RIVER}/a");
@@ -2864,6 +3040,7 @@ mod tests {
         assert!(skip_hub_link(
             &whub,
             &wid,
+            None,
             &format!("freenet:{RIVER}/b"),
             &seen,
             &pending
@@ -2871,6 +3048,7 @@ mod tests {
         assert!(!skip_hub_link(
             &whub,
             &wid,
+            None,
             &format!("freenet:{DELTA}/x"),
             &seen,
             &pending
@@ -2992,13 +3170,88 @@ mod tests {
             }],
         };
         assert_eq!(
-            reg.map_locator(&format!("freenet:{RIVER}/w/abc123/deep"))
+            reg.map_locator(&format!("freenet:{RIVER}/w/abc123XYZmnp/deep"))
                 .unwrap(),
-            "app:widget/abc123"
+            "app:widget/abc123XYZmnp"
         );
         assert!(reg
-            .map_locator(&format!("freenet:{RIVER}/#abc123"))
+            .map_locator(&format!("freenet:{RIVER}/#abc123XYZmnp"))
             .is_none());
+    }
+
+    /// An app's own route words are base58 too, so without a length floor every
+    /// `#about` / `#new` / `#settings` link became a separate "site" — each costing
+    /// an LLM call and a permanent index entry.
+    #[test]
+    fn short_route_words_are_not_mistaken_for_resource_handles() {
+        let reg = delta_registry();
+        for word in ["new", "about", "home", "settings", "links"] {
+            assert!(
+                reg.map_locator(&format!("freenet:{DELTA}/#{word}"))
+                    .is_none(),
+                "{word:?} is a route word, not a site handle"
+            );
+        }
+        // A real handle (Delta's are 10 base58 chars) still maps.
+        assert_eq!(
+            reg.map_locator(&format!("freenet:{DELTA}/#AmcVD92D3U"))
+                .unwrap(),
+            "app:delta/AmcVD92D3U"
+        );
+    }
+
+    /// The app SHELL itself carries no resource, so it does not map and its identity
+    /// is the container id. Without the container check it was queued and described
+    /// as a separate site — the app listed once per hub that links to it.
+    #[test]
+    fn a_link_to_the_apps_own_shell_is_still_in_app_navigation() {
+        let reg = delta_registry();
+        let tmp = TmpFile::new("shell");
+        let pending = Pending::load(tmp.path());
+        let seen: HashSet<String> = HashSet::new();
+        let raw_hub = format!("freenet:{DELTA}/#AmcVD92D3U/3/delta-sites");
+        let hub_subject = hub_subject_of(&raw_hub, &reg);
+        let hub_identity = locator_identity(&hub_subject).to_string();
+        let container = freenet_id(&raw_hub).map(str::to_string);
+
+        for shell in [format!("freenet:{DELTA}/"), format!("freenet:{DELTA}/#")] {
+            assert!(
+                skip_hub_link(
+                    &hub_subject,
+                    &hub_identity,
+                    container.as_deref(),
+                    &shell,
+                    &seen,
+                    &pending
+                ),
+                "the app shell {shell:?} must not be indexed as a site"
+            );
+        }
+        // A different app's container is still outbound.
+        assert!(!skip_hub_link(
+            &hub_subject,
+            &hub_identity,
+            container.as_deref(),
+            &format!("freenet:{RIVER}/"),
+            &seen,
+            &pending
+        ));
+    }
+
+    /// Every app locator used to share the single `@unparsed` bucket with malformed
+    /// URLs, so all Delta sites were collectively capped at `per_host_max` per run
+    /// and a flood of junk could crowd them out entirely.
+    #[test]
+    fn each_app_resource_is_its_own_rate_limit_bucket() {
+        let a = host_bucket("app:delta/AmcVD92D3U");
+        let b = host_bucket("app:delta/DWn4bEFfoo");
+        assert_ne!(a, b, "two sites must not share a bucket");
+        assert_ne!(a, "@unparsed");
+        assert_ne!(
+            host_bucket("https://x^1"),
+            a,
+            "junk must not share it either"
+        );
     }
 
     #[test]
