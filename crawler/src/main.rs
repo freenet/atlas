@@ -1016,6 +1016,30 @@ fn main() -> Result<()> {
         .quarantine
         .clone()
         .unwrap_or_else(|| key_dir.join("crawler-quarantine.txt"));
+    // Two of these pointing at the same file is not a harmless misconfiguration.
+    // The quarantine and the pending queue share a line shape but NOT a first
+    // column (a unix timestamp vs an attempt count), so if they collide, every
+    // reloaded entry reads as having burned ~2e9 attempts — far past
+    // MAX_ATTEMPTS — and the whole queue is given up on at once. Both writers
+    // also compute the same `sibling_tmp` name within one process, so the atomic
+    // renames race. Cheaper to refuse than to debug.
+    let paths = [
+        ("--seen", &seen_path),
+        ("--spend", &spend_path),
+        ("--pending", &pending_path),
+        ("--quarantine", &quarantine_path),
+    ];
+    for (i, (name_a, a)) in paths.iter().enumerate() {
+        for (name_b, b) in &paths[i + 1..] {
+            if a == b {
+                anyhow::bail!(
+                    "{name_a} and {name_b} both point at {} — they hold different \
+                     formats and would corrupt each other",
+                    a.display()
+                );
+            }
+        }
+    }
     let mut state = CrawlState::default();
 
     loop {
@@ -4494,8 +4518,8 @@ mod tests {
         let (q, released) = Quarantine::load(f.path(), at + QUARANTINE_SECS - 1);
         assert!(released.is_empty(), "must not release before the cooldown");
         assert_eq!(
-            q.held().collect::<Vec<_>>(),
-            vec!["https://flaky.example/1".to_string()],
+            q.held().collect::<HashSet<_>>(),
+            HashSet::from(["https://flaky.example/1".to_string()]),
             "a held locator must suppress capture so discovery cannot re-queue it"
         );
 
@@ -4749,6 +4773,40 @@ mod tests {
             })
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    #[test]
+    fn quarantine_trim_bounds_the_file_and_drops_the_oldest() {
+        let f = TmpFile::new("quarantine-trim");
+        // Timestamps ascending, so entry 0 is the oldest. All well inside the
+        // cooldown, so nothing is released and the trim is what bounds the file.
+        let now = 9_000_000_000u64;
+        let body: String = (0..MAX_QUARANTINE + 2)
+            .map(|i| {
+                format!(
+                    "{}\texternal\tALICE\thttps://q.example/{i}\n",
+                    now - 100 + i as u64
+                )
+            })
+            .collect();
+        fs::write(f.path(), body).unwrap();
+
+        let (q, released) = Quarantine::load(f.path(), now);
+        assert!(released.is_empty(), "nothing has aged out yet");
+        assert_eq!(
+            q.held().count(),
+            MAX_QUARANTINE,
+            "the file must be bounded at MAX_QUARANTINE"
+        );
+        let held: HashSet<String> = q.held().collect();
+        assert!(
+            !held.contains("https://q.example/0") && !held.contains("https://q.example/1"),
+            "the OLDEST entries are the ones dropped"
+        );
+        assert!(
+            held.contains(&format!("https://q.example/{}", MAX_QUARANTINE + 1)),
+            "the newest entry must survive the trim"
+        );
     }
 
     #[test]
