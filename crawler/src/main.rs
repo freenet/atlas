@@ -864,7 +864,9 @@ struct Quarantine {
     /// Locators still cooling down: suppressed from capture so discovery does
     /// not immediately re-queue what we just gave up on.
     held: HashSet<String>,
-    /// `(quarantined_at, locator, kind, author)`, oldest first.
+    /// `(quarantined_at, locator, kind, author)`. Sorted oldest-first on load;
+    /// a re-hold appends out of order, which the next load's sort corrects. Only
+    /// the trim depends on the order, and it runs immediately after that sort.
     entries: Vec<(u64, String, &'static str, String)>,
     dirty: bool,
 }
@@ -880,6 +882,7 @@ impl Quarantine {
             dirty: false,
         };
         let mut released: Vec<ReleasedLocator> = Vec::new();
+        let mut dropped = 0usize;
         let Ok(body) = fs::read_to_string(path) else {
             return (q, released);
         };
@@ -891,10 +894,14 @@ impl Quarantine {
             let (Some(ts), Some(_kind), Some(author), Some(loc)) =
                 (parts.next(), parts.next(), parts.next(), parts.next())
             else {
+                dropped += 1;
+                q.dirty = true;
                 continue;
             };
             let loc = loc.trim();
             if loc.is_empty() {
+                dropped += 1;
+                q.dirty = true;
                 continue;
             }
             // Re-validate on the way in and take `kind` from the re-validation,
@@ -902,6 +909,7 @@ impl Quarantine {
             // so an entry captured under an earlier build's guards must not be
             // re-queued without being re-checked.
             let Some((canon, kind)) = normalize_href(loc) else {
+                dropped += 1;
                 q.dirty = true;
                 continue;
             };
@@ -910,7 +918,23 @@ impl Quarantine {
             // cost of releasing early is a few billed attempts, the cost of
             // failing closed is losing the link permanently — which is the bug
             // this type exists to fix.
-            let at: u64 = ts.trim().parse().unwrap_or(0);
+            //
+            // A FUTURE timestamp must be clamped for the same reason. Without
+            // the clamp `now.saturating_sub(at)` is 0 for as long as `at > now`,
+            // so the entry never releases, stays in `held` (invisible to
+            // discovery), and is the LAST thing the trim reaches — the exact
+            // permanent exclusion this whole type exists to remove, reachable by
+            // nothing worse than a container that ran before its clock synced.
+            let parsed: u64 = ts.trim().parse().unwrap_or(0);
+            let at = parsed.min(now);
+            if at != parsed {
+                // Persist the correction. Clamping only in memory is not enough:
+                // the file would keep the future stamp, every later load would
+                // re-clamp it to that load's `now`, and the cooldown would never
+                // start elapsing — the locator is held for ever, which is the
+                // failure being fixed.
+                q.dirty = true;
+            }
             if now.saturating_sub(at) >= QUARANTINE_SECS {
                 released.push((at, canon, kind, author.to_string()));
                 q.dirty = true;
@@ -923,11 +947,28 @@ impl Quarantine {
         q.entries.sort_by_key(|(at, _, _, _)| *at);
         let over = q.entries.len().saturating_sub(MAX_QUARANTINE);
         if over > 0 {
-            for (_, loc, _, _) in q.entries.drain(..over) {
+            // Drop the NEWEST, not the oldest. A trimmed entry is gone from every
+            // file, so the question is which loss is recoverable — and
+            // `Pending::evict_one` already answers it for the identical tradeoff:
+            // the oldest entry is the one most likely to have aged out of its
+            // room's history, so losing it is permanent, while a recently-held
+            // one is the likeliest to still be rediscoverable. Trimming the
+            // oldest would also bite exactly the permanently-refused entries,
+            // which re-hold at their original (old) timestamps every run and so
+            // accumulate at that end.
+            let keep = q.entries.len() - over;
+            for (_, loc, _, _) in q.entries.drain(keep..) {
                 q.held.remove(&loc);
             }
             q.dirty = true;
-            eprintln!("warn: quarantine held {over} entr(ies) over the {MAX_QUARANTINE} limit — trimmed on load");
+            eprintln!(
+                "warn: quarantine held {over} entr(ies) over the {MAX_QUARANTINE} limit — \
+                 dropped the {over} most recently held (recoverable by rediscovery; \
+                 the oldest are kept because their source may have aged out)"
+            );
+        }
+        if dropped > 0 {
+            eprintln!("warn: dropped {dropped} quarantined locator(s) that no longer validate");
         }
         (q, released)
     }
@@ -1342,9 +1383,12 @@ fn run_once(
                 pending.remove(&loc);
             }
             // A locator whose app the registry does not know is a CONFIGURATION
-            // state, not a bad link: leave it queued, un-penalised, and do not
-            // count an attempt. Otherwise a transient registry read failure
+            // state, not a bad link: leave it queued and do not burn one of its
+            // three retries. Otherwise a transient registry read failure
             // permanently discards every queued app locator after three runs.
+            // (The spend ledger has already been charged for the attempt by
+            // `budget.try_take` above — this arm spares the RETRY counter, not
+            // the budget.)
             Err(e) if is_unresolvable_app(&e) => {
                 eprintln!("  deferring {loc}: {e}");
                 unresolvable += 1;
@@ -1393,16 +1437,21 @@ fn run_once(
              behaviour this crawler was changed to fix. Check `atlasctl apps`."
         );
     }
+    // Both lines say "no retry burned", NOT "no budget charged". `budget.try_take`
+    // runs BEFORE `index_locator` and has already appended to the spend ledger by
+    // the time either outcome is known, so these attempts ARE in the "N attempted"
+    // figure below. What these arms spare the locator is its own retry counter, so
+    // it is never quarantined for being thin or for an unregistered app.
     if unresolvable > 0 {
         eprintln!(
             "{unresolvable} locator(s) deferred because their app is not registered \
-             (left queued, no budget charged)"
+             (left queued, no retry burned)"
         );
     }
     if refused > 0 {
         eprintln!(
             "{refused} locator(s) deferred as too thin or placeholder \
-             (left queued, no budget charged)"
+             (left queued, no retry burned)"
         );
     }
     let attempts = budget.attempts;
@@ -4775,8 +4824,12 @@ mod tests {
             .join("\n")
     }
 
+    /// The trim must bound the file, and must drop the NEWEST — matching the
+    /// reasoning `Pending::evict_one` already commits to for the same tradeoff.
+    /// A trimmed entry is gone from every file, so the recoverable loss is the
+    /// recently-held one; the oldest is likeliest to have aged out of its source.
     #[test]
-    fn quarantine_trim_bounds_the_file_and_drops_the_oldest() {
+    fn quarantine_trim_bounds_the_file_and_drops_the_newest() {
         let f = TmpFile::new("quarantine-trim");
         // Timestamps ascending, so entry 0 is the oldest. All well inside the
         // cooldown, so nothing is released and the trim is what bounds the file.
@@ -4800,12 +4853,13 @@ mod tests {
         );
         let held: HashSet<String> = q.held().collect();
         assert!(
-            !held.contains("https://q.example/0") && !held.contains("https://q.example/1"),
-            "the OLDEST entries are the ones dropped"
+            held.contains("https://q.example/0") && held.contains("https://q.example/1"),
+            "the OLDEST entries must be kept — their source may have aged out, so \
+             dropping them is the permanent loss"
         );
         assert!(
-            held.contains(&format!("https://q.example/{}", MAX_QUARANTINE + 1)),
-            "the newest entry must survive the trim"
+            !held.contains(&format!("https://q.example/{}", MAX_QUARANTINE + 1)),
+            "the most recently held entries are the ones dropped"
         );
     }
 
@@ -4821,6 +4875,45 @@ mod tests {
             "an invalid locator must not be released"
         );
         assert_eq!(q.held().count(), 0);
+    }
+
+    /// A timestamp in the FUTURE must not strand the locator. `saturating_sub`
+    /// clamps to 0 while `at > now`, so without the clamp the entry never
+    /// releases, stays in `held` (so discovery cannot re-capture it), and is the
+    /// last thing the trim reaches — recreating the permanent exclusion this
+    /// type exists to remove. Reachable by a container that ran before NTP.
+    #[test]
+    fn quarantine_future_timestamp_does_not_strand_the_locator() {
+        let f = TmpFile::new("quarantine-future");
+        let now = 1_785_000_000u64;
+        // Held "five years from now", then the clock is corrected.
+        fs::write(
+            f.path(),
+            format!(
+                "{}\texternal\tALICE\thttps://a.example/1\n",
+                now + 157_000_000
+            ),
+        )
+        .unwrap();
+
+        let (mut q, released) = Quarantine::load(f.path(), now);
+        assert!(
+            released.is_empty(),
+            "clamped to now, it starts its cooldown rather than releasing instantly"
+        );
+        assert_eq!(q.held().count(), 1, "it is held, not lost");
+        // The clamp must be PERSISTED, or every later load re-clamps to that
+        // load's own `now` and the cooldown never elapses.
+        q.save();
+
+        // …and it actually comes back, which is the part that fails without the
+        // clamp: unclamped, `now - at` stays 0 forever and it never releases.
+        let (_, later) = Quarantine::load(f.path(), now + QUARANTINE_SECS);
+        assert_eq!(
+            later.len(),
+            1,
+            "a future timestamp must not hold the locator indefinitely"
+        );
     }
 
     #[test]
