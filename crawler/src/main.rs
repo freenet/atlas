@@ -991,9 +991,18 @@ impl Quarantine {
     /// Persist if changed, atomically — a crash mid-write must not truncate the
     /// file into "nothing is quarantined", which would re-queue every held
     /// locator at once and spend the day's budget on known-bad links.
-    fn save(&mut self) {
+    /// Returns false if the file could not be written.
+    ///
+    /// The caller MUST treat that as fatal for the run and stop before saving the
+    /// pending queue. `record_failure` has already removed this run's given-up
+    /// locators from the queue in memory, so persisting the queue after a failed
+    /// quarantine write would record their removal while nothing recorded where
+    /// they went — losing them from every file, which is the failure this whole
+    /// type exists to prevent.
+    #[must_use]
+    fn save(&mut self) -> bool {
         if !self.dirty {
-            return;
+            return true;
         }
         let body: String = self
             .entries
@@ -1003,13 +1012,16 @@ impl Quarantine {
         let tmp = sibling_tmp(&self.path);
         if fs::write(&tmp, &body).is_ok() && fs::rename(&tmp, &self.path).is_ok() {
             self.dirty = false;
+            true
         } else {
             let _ = fs::remove_file(&tmp);
             eprintln!(
-                "warn: could not persist quarantine {} — locators given up on THIS run \
-                 are lost (they are already out of the pending queue)",
+                "error: could not persist quarantine {} — abandoning this run before \
+                 the pending queue is saved, so the locators given up on this run \
+                 stay in the queue on disk rather than vanishing",
                 self.path.display()
             );
+            false
         }
     }
 }
@@ -1425,7 +1437,10 @@ fn run_once(
             }
         }
     }
-    quarantine.save();
+    // Before `pending.save()`, and fatal if it fails: see `Quarantine::save`.
+    if !quarantine.save() {
+        anyhow::bail!("quarantine could not be persisted; pending queue left untouched");
+    }
     pending.advance_cursor(authors_served.len(), bucket_count);
     pending.report_refusals();
     pending.save();
@@ -4561,7 +4576,7 @@ mod tests {
             let (mut q, released) = Quarantine::load(f.path(), at);
             assert!(released.is_empty(), "an empty file releases nothing");
             q.hold("https://flaky.example/1", "external", "ALICE", at);
-            q.save();
+            assert!(q.save());
         }
         // One second short of the cooldown: still held, nothing released.
         let (q, released) = Quarantine::load(f.path(), at + QUARANTINE_SECS - 1);
@@ -4596,7 +4611,7 @@ mod tests {
         // file is never rewritten, so the same locator is released again on every
         // run for ever and the file grows without bound.
         let (mut q, _) = Quarantine::load(f.path(), at + QUARANTINE_SECS);
-        q.save();
+        assert!(q.save());
         let (q, again) = Quarantine::load(f.path(), at + QUARANTINE_SECS);
         assert!(
             again.is_empty() && q.held().count() == 0,
@@ -4622,7 +4637,7 @@ mod tests {
         {
             let (mut q, _) = Quarantine::load(q_file.path(), at);
             q.hold(&loc, "external", "ALICE", at);
-            q.save();
+            assert!(q.save());
         }
 
         // Fill ALICE's bucket so the release cannot be placed.
@@ -4644,7 +4659,7 @@ mod tests {
             !pending.contains(&loc),
             "test premise: the full bucket must actually refuse it"
         );
-        q.save();
+        assert!(q.save());
 
         // Still quarantined, at its ORIGINAL timestamp so the next run releases
         // it again rather than restarting the seven-day cooldown.
@@ -4747,7 +4762,7 @@ mod tests {
              arm); a new one is a blacklist coming back by another name"
         );
         assert!(
-            production.contains("quarantine.save()"),
+            production.contains("!quarantine.save()"),
             "the quarantine must be persisted, or a give-up is lost from pending, \
              quarantine and seen alike"
         );
@@ -4863,6 +4878,22 @@ mod tests {
         );
     }
 
+    /// An unwritable quarantine must REPORT failure, so `run_once` can abandon
+    /// the run before `pending.save()` records the removal of locators whose new
+    /// home was never written. Silent failure here loses them from every file.
+    #[test]
+    fn quarantine_write_failure_is_reported() {
+        // A path inside a non-existent, non-creatable directory: writes fail.
+        let bad = PathBuf::from("/proc/atlas-crawler-nonexistent/quarantine.txt");
+        let (mut q, released) = Quarantine::load(&bad, 1_785_000_000);
+        assert!(released.is_empty(), "an unreadable file releases nothing");
+        q.hold("https://a.example/1", "external", "ALICE", 1_785_000_000);
+        assert!(
+            !q.save(),
+            "a failed write must be reported, not swallowed as a warning"
+        );
+    }
+
     #[test]
     fn quarantine_drops_entries_that_no_longer_validate() {
         let f = TmpFile::new("quarantine-revalidate");
@@ -4904,7 +4935,7 @@ mod tests {
         assert_eq!(q.held().count(), 1, "it is held, not lost");
         // The clamp must be PERSISTED, or every later load re-clamps to that
         // load's own `now` and the cooldown never elapses.
-        q.save();
+        assert!(q.save());
 
         // …and it actually comes back, which is the part that fails without the
         // clamp: unclamped, `now - at` stays 0 forever and it never releases.
