@@ -28,11 +28,14 @@ LLM.
 
 The index contract's address is `hash(compiled_wasm, params)`, so **any change
 under `common/` or `contracts/` re-keys the live index**. The UI has to be told
-the new address, and the curated entries have to be carried across. Getting the
-order wrong has already cost us once: the stdlib-0.8.3 bump re-keyed the index
-and the UI was never rebuilt, so from 2026-07-21 the published site quietly
-served a frozen pre-re-key snapshot, six entries behind. Nothing errors in that
-state; new listings just stop appearing.
+the new address, and the curated entries have to be carried across.
+
+Getting the order wrong is silent, which is why it is written down. If the UI is
+published without being rebuilt against the new index id, it keeps reading the
+retired generation: the site renders the pre-re-key snapshot indefinitely and
+simply stops showing new listings. Nothing errors. `ATLAS_INDEX_ID` is therefore
+required at build time with no default, so a forgotten rebuild fails loudly
+instead.
 
 Run these **in order**. Steps 1-3 leave the UI reading the still-populated old
 address, so there is no window where the site shows an empty index.
