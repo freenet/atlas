@@ -95,18 +95,30 @@ watchdog.unref();
 // full body exactly as before.
 const CONTENT_SELECTORS = ['main', '[role=main]', 'article', '#content', '.content'];
 
+// When true, refuse to fall back to the whole body if no content region has
+// substance.
+//
+// The fallback is correct for an ordinary web page, which need not mark up a content
+// region — but it is exactly wrong for an APP shell, where the body IS the chrome.
+// That is how a site whose `<main>` had not rendered yet still got described from
+// Delta's sidebar (which lists every visited site by name), producing a title lifted
+// from an unrelated site. With this set, such a page yields no text at all and the
+// caller's minimum-content guard defers it for free instead of describing chrome.
+const requireContent = args.includes('--require-content');
+
 async function contentText(frame) {
   try {
-    return await frame.evaluate((sels) => {
-      for (const s of sels) {
-        const el = document.querySelector(s);
-        const t = el && el.innerText ? el.innerText.trim() : '';
-        // Require some substance: an empty or near-empty <main> means the app has
-        // not rendered into it yet, and the body text is the better signal.
-        if (t.length > 80) return t;
-      }
-      return document.body ? document.body.innerText : '';
-    }, CONTENT_SELECTORS);
+    return await frame.evaluate(
+      ({ sels, strict }) => {
+        for (const s of sels) {
+          const el = document.querySelector(s);
+          const t = el && el.innerText ? el.innerText.trim() : '';
+          if (t.length > 80) return t;
+        }
+        return strict ? '' : document.body ? document.body.innerText : '';
+      },
+      { sels: CONTENT_SELECTORS, strict: requireContent }
+    );
   } catch (_) {
     return '';
   }

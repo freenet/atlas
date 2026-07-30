@@ -1309,6 +1309,7 @@ fn get_page_enumerating(
 ) -> Result<Page> {
     // An app-hosted locator carries no address of its own; resolve it through the
     // registry to the container URL that actually serves it.
+    let is_app = loc.starts_with("app:");
     let resolved = if loc.starts_with("app:") {
         registry
             .resolve_for_fetch(loc)
@@ -1324,7 +1325,9 @@ fn get_page_enumerating(
             // creates the sandboxed app iframe, which the renderer reads back.
             let path = if path.is_empty() { "/" } else { path };
             let shell_url = gateway_url(gw, id, path)?;
-            match render_page(&cli.node_bin, renderer, &shell_url, enumerate) {
+            // `is_app` is decided from the ORIGINAL locator, before resolution: a
+            // resolved app locator looks like any other container URL.
+            match render_page(&cli.node_bin, renderer, &shell_url, enumerate, is_app) {
                 Ok(p) => return Ok(p),
                 Err(e) => {
                     eprintln!("  render failed ({e:#}), falling back to static fetch");
@@ -1378,6 +1381,7 @@ fn render_page(
     renderer: &Path,
     url: &str,
     enumerate: Option<(&str, usize)>,
+    require_content: bool,
 ) -> Result<Page> {
     // Bound the child's output: the renderer serializes the page's full DOM and
     // a hostile contract can inflate that without limit.
@@ -1395,6 +1399,14 @@ fn render_page(
     cmd.arg(renderer).arg(url);
     if let Some((resource, max)) = enumerate {
         cmd.arg("--enumerate").arg(resource).arg(max.to_string());
+    }
+    // For an app-hosted resource, the frame body is the app's CHROME, so falling back
+    // to it when the content region is empty means describing the app instead of the
+    // site — and Delta's chrome lists every visited site by name, so the description
+    // came back as some other site's title. Refuse the fallback here and let the
+    // minimum-content guard defer the page for free.
+    if require_content {
+        cmd.arg("--require-content");
     }
     let mut child = cmd
         .stdin(std::process::Stdio::null())
