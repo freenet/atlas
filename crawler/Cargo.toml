@@ -11,6 +11,10 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow = "1"
+# For the canonical path guards (`atlas_common::path`), which the contract enforces.
+# The crawler keeps its own older copies; the differential test in `main.rs` pins
+# that the canonical pair is never the weaker of the two.
+atlas-common = { workspace = true, features = ["rng"] }
 clap = { version = "4", features = ["derive"] }
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
 serde = { workspace = true }

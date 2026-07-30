@@ -22,9 +22,11 @@
 //! equivalent and have already drifted in both directions: the crawler catches
 //! the Windows drive-prefix escape that this module originally missed, and folds
 //! its control-character check into a differently-shaped function. This module is
-//! the canonical one, because it is the one the CONTRACT enforces; the crawler is
-//! switched over to it in the follow-up that touches the crawler, at which point
-//! its copies are deleted.
+//! the canonical one, because it is the one the CONTRACT enforces. Deduplicating
+//! them is tracked separately; meanwhile the crawler carries a differential test
+//! (`common_path_guards_are_at_least_as_strict_as_the_crawler_copies`) pinning the
+//! property that matters: THIS module must never be weaker than the crawler copy,
+//! or a path the crawler refuses could still be signed into the index by hand.
 
 /// Max percent-decoding passes before an input is treated as hostile.
 ///

@@ -154,6 +154,7 @@ name = "atlas-crawler"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "atlas-common",
  "bs58",
  "ciborium",
  "clap",

@@ -144,6 +144,11 @@ struct Cli {
     /// a single spamming account consuming a whole run.
     #[arg(long, default_value_t = 3)]
     per_author_max: usize,
+    /// Max pages to walk when a hub is an app-hosted resource (a Delta site's page
+    /// list, say). Each extra page is a cheap in-session hash navigation, not a
+    /// fresh render, so this is bounded for tidiness rather than cost.
+    #[arg(long, default_value_t = 12)]
+    hub_max_pages: usize,
     /// If set, loop every N seconds instead of running once. Cheap sources
     /// (River rooms) are polled every tick, so this can be small; expensive hub
     /// re-rendering is rate-limited separately by `--hub-interval`.
@@ -923,6 +928,9 @@ fn run_once(
     // can be evicted before we could afford to describe it. So we always record
     // what exists, then decide separately what we can afford to describe.
     let mut pending = Pending::load(pending_path);
+    // Loaded once per run: which apps the curator has registered, so an app-hosted
+    // link can be recognised as a resource rather than as its container.
+    let registry = AppRegistryView::load(cli);
     let mut trusted: HashSet<String> = HashSet::new();
     let mut captured = 0usize;
     for raw in sources.lines() {
@@ -950,7 +958,7 @@ fn run_once(
                 continue;
             }
             state.last_hub_crawl.insert(hub.clone(), Instant::now());
-            captured += crawl_hub(cli, &client, &gw, &hub, &seen, &mut pending);
+            captured += crawl_hub(cli, &client, &gw, &hub, &seen, &mut pending, &registry);
         } else if let Some(owner_vk) = line
             .strip_prefix("river-room ")
             .or_else(|| line.strip_prefix("river-room:"))
@@ -968,7 +976,7 @@ fn run_once(
             // was stored in a form nothing else would ever produce, so it could
             // not be matched against `seen` and did not survive a reload
             // unchanged. A curated line may be `freenet:<id>` as well as https.
-            let (loc, kind) = match normalize_href(line) {
+            let (loc, kind) = match normalize_mapped(line, &registry) {
                 Some((loc, kind)) => (loc, kind),
                 None => (line.to_string(), "external"),
             };
@@ -1035,6 +1043,7 @@ fn run_once(
             &loc,
             kind,
             is_trusted,
+            &registry,
         ) {
             // Indexed, or deliberately refused by the content-safety gate.
             // Both are final: mark seen and stop tracking it.
@@ -1082,6 +1091,10 @@ fn run_once(
 struct Page {
     html: String,
     text: String,
+    /// Additional pages of the SAME app-hosted resource, discovered by walking the
+    /// app's internal routes in one browser session. Their HTML is mined for links;
+    /// the resource itself is still described from the entry page.
+    extra_pages: Vec<String>,
 }
 
 /// Index one locator (`https://...` or `freenet:<id><path>`): fetch its content,
@@ -1098,10 +1111,21 @@ fn index_locator(
     loc: &str,
     kind: &str,
     trusted: bool,
+    registry: &AppRegistryView,
 ) -> Result<bool> {
-    let page = get_page(cli, client, gw, loc)?;
+    let page = get_page(cli, client, gw, loc, registry)?;
     index_page(cli, client, key, model, loc, kind, trusted, &page)
 }
+
+/// Minimum visible characters before a page is worth describing.
+///
+/// The content-safety rating is computed from the page TEXT, so a page with almost
+/// no text is rated on almost nothing — and an image-only site is exactly the case
+/// the gate most needs to catch. Measured against a real app shell: Delta's chrome
+/// alone renders ~288 characters with no page content at all, so "the frame is not
+/// empty" is a very low bar. Refusing here is also NOT marked final by the caller,
+/// so a page that is thin because it had not finished loading gets another chance.
+const MIN_DESCRIBABLE_CHARS: usize = 220;
 
 /// Describe an already-fetched page and add it to the index, applying the
 /// content-safety gate. Split out from `index_locator` so a hub crawl can index
@@ -1123,6 +1147,17 @@ fn index_page(
     trusted: bool,
     page: &Page,
 ) -> Result<bool> {
+    // Too little text to judge. Bail rather than ask an LLM to rate ~nothing and
+    // then publish whatever it says: the rating IS the safety gate, and a gate fed
+    // no evidence is not a gate. Notably this is the image-only-site case, which is
+    // both the likeliest NSFW vector and the one the text rating is blindest to.
+    let visible = page.text.trim().chars().count();
+    if visible < MIN_DESCRIBABLE_CHARS {
+        bail!(
+            "only {visible} visible characters (min {MIN_DESCRIBABLE_CHARS}) — too \
+             little to describe or to rate for safety"
+        );
+    }
     let desc = match key {
         // An LLM failure on untrusted content must NOT fall back to the
         // unrated title/meta description: the fallback hardcodes an "ok"
@@ -1207,7 +1242,36 @@ fn gateway_url(gw: &str, id: &str, rest: &str) -> Result<String> {
 /// WASM/SPA content and links render), otherwise we fetch the sandbox HTML
 /// statically (which for a WASM site is just the loader). The local gateway is a
 /// loopback to our own node — intentional, not an SSRF target.
-fn get_page(cli: &Cli, client: &reqwest::blocking::Client, gw: &str, loc: &str) -> Result<Page> {
+fn get_page(
+    cli: &Cli,
+    client: &reqwest::blocking::Client,
+    gw: &str,
+    loc: &str,
+    registry: &AppRegistryView,
+) -> Result<Page> {
+    get_page_enumerating(cli, client, gw, loc, registry, None)
+}
+
+/// As [`get_page`], but may also walk an app-hosted resource's other pages in the
+/// same browser session (`enumerate = Some((resource, max_pages))`).
+fn get_page_enumerating(
+    cli: &Cli,
+    client: &reqwest::blocking::Client,
+    gw: &str,
+    loc: &str,
+    registry: &AppRegistryView,
+    enumerate: Option<(&str, usize)>,
+) -> Result<Page> {
+    // An app-hosted locator carries no address of its own; resolve it through the
+    // registry to the container URL that actually serves it.
+    let resolved = if loc.starts_with("app:") {
+        registry
+            .resolve_for_fetch(loc)
+            .ok_or_else(|| anyhow!("cannot fetch {loc}: its app is not in the registry"))?
+    } else {
+        loc.to_string()
+    };
+    let loc = resolved.as_str();
     if let Some(rest) = loc.strip_prefix("freenet:") {
         let (id, path) = split_freenet(rest);
         if let Some(renderer) = &cli.renderer {
@@ -1215,7 +1279,7 @@ fn get_page(cli: &Cli, client: &reqwest::blocking::Client, gw: &str, loc: &str) 
             // creates the sandboxed app iframe, which the renderer reads back.
             let path = if path.is_empty() { "/" } else { path };
             let shell_url = gateway_url(gw, id, path)?;
-            match render_page(&cli.node_bin, renderer, &shell_url) {
+            match render_page(&cli.node_bin, renderer, &shell_url, enumerate) {
                 Ok(p) => return Ok(p),
                 Err(e) => {
                     eprintln!("  render failed ({e:#}), falling back to static fetch");
@@ -1245,18 +1309,31 @@ fn get_page(cli: &Cli, client: &reqwest::blocking::Client, gw: &str, loc: &str) 
             &gateway_url(gw, id, &format!("{path_only}{sep}__sandbox=1"))?,
         )?;
         let text = visible_text(&html);
-        Ok(Page { html, text })
+        Ok(Page {
+            html,
+            text,
+            extra_pages: Vec::new(),
+        })
     } else {
         ssrf_check(loc)?;
         let html = fetch(client, loc)?;
         let text = visible_text(&html);
-        Ok(Page { html, text })
+        Ok(Page {
+            html,
+            text,
+            extra_pages: Vec::new(),
+        })
     }
 }
 
 /// Drive the headless render helper for one URL, returning the rendered app
 /// frame's HTML and visible text. The page content is untrusted data.
-fn render_page(node_bin: &str, renderer: &Path, url: &str) -> Result<Page> {
+fn render_page(
+    node_bin: &str,
+    renderer: &Path,
+    url: &str,
+    enumerate: Option<(&str, usize)>,
+) -> Result<Page> {
     // Bound the child's output: the renderer serializes the page's full DOM and
     // a hostile contract can inflate that without limit.
     //
@@ -1269,9 +1346,12 @@ fn render_page(node_bin: &str, renderer: &Path, url: &str) -> Result<Page> {
     // it is not a pipe this process owns, while still surfacing the failures
     // that never reach stdout — a bad --renderer path, a missing module, a node
     // syntax error — which discarding stderr entirely would leave undiagnosable.
-    let mut child = Command::new(node_bin)
-        .arg(renderer)
-        .arg(url)
+    let mut cmd = Command::new(node_bin);
+    cmd.arg(renderer).arg(url);
+    if let Some((resource, max)) = enumerate {
+        cmd.arg("--enumerate").arg(resource).arg(max.to_string());
+    }
+    let mut child = cmd
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::inherit())
@@ -1307,6 +1387,16 @@ fn render_page(node_bin: &str, renderer: &Path, url: &str) -> Result<Page> {
             v["error"].as_str().unwrap_or("unknown")
         );
     }
+    // REJECT a non-2xx render. "The frame is not empty" is not the same as "this is
+    // a page": the gateway answers an absent contract with a 500 whose body reads
+    // `Contract not cached yet: <id>`, and a browser renders that as perfectly
+    // ordinary text. Two live Atlas entries are descriptions of exactly that error
+    // ("Freenet Node Contract Response") for contracts that are reachable today, so
+    // a transient miss permanently poisoned them.
+    let http_status = v["status"].as_u64().unwrap_or(0) as u16;
+    if http_status != 0 && !(200..300).contains(&http_status) {
+        bail!("render got http {http_status} — not a page worth indexing");
+    }
     let html = v["html"].as_str().unwrap_or("").to_string();
     let text = v["text"].as_str().unwrap_or("").to_string();
     // Fall back to stripping the rendered HTML if the browser gave no innerText.
@@ -1318,7 +1408,65 @@ fn render_page(node_bin: &str, renderer: &Path, url: &str) -> Result<Page> {
     if html.trim().is_empty() && text.trim().is_empty() {
         bail!("renderer returned empty page");
     }
-    Ok(Page { html, text })
+    let extra_pages: Vec<String> = v["pages"]
+        .as_array()
+        .map(|ps| {
+            ps.iter()
+                .skip(1) // [0] is the entry page, already captured above
+                .filter_map(|p| p["html"].as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default();
+    if !extra_pages.is_empty() {
+        eprintln!("  enumerated {} additional page(s)", extra_pages.len());
+    }
+    Ok(Page {
+        html,
+        text,
+        extra_pages,
+    })
+}
+
+/// The SUBJECT a hub page should be listed and compared under.
+///
+/// A hub arrives as a specific page of a specific resource
+/// (`freenet:<container>/#<res>/<page>`). Both the listing and the in-app-navigation
+/// comparison need the mapped form: listing the raw locator would file the site
+/// under whichever page the sources file happened to name AND leave it distinct from
+/// the `app:slug/res` locator any self-link produces (two entries for one site),
+/// while an unmapped identity is the CONTAINER id, which can never equal a mapped
+/// link's identity, so nothing would be recognised as in-app navigation at all.
+///
+/// Extracted so a test pins the production expression rather than a copy of it.
+fn hub_subject_of(hub: &str, registry: &AppRegistryView) -> String {
+    registry.map_locator(hub).unwrap_or_else(|| hub.to_string())
+}
+
+/// Should a link found on a hub page be skipped rather than queued?
+///
+/// Extracted so the decision is testable. Keeping it inline meant the only tests
+/// touched `locator_identity` in isolation, and reverting this comparison to the
+/// original `freenet_id(loc) == freenet_id(hub)` — the bug that dropped every Delta
+/// site — left the whole suite green.
+fn skip_hub_link(
+    hub: &str,
+    hub_identity: &str,
+    loc: &str,
+    seen: &HashSet<String>,
+    pending: &Pending,
+) -> bool {
+    if loc == hub || seen.contains(loc) || pending.contains(loc) {
+        return true;
+    }
+    // Only links back to the hub's own IDENTITY are in-app navigation.
+    //
+    // This is the line that made Atlas index zero Delta sites. Every Delta site is
+    // served by the same container, so comparing CONTRACT IDS made every outbound
+    // Delta link on a Delta hub page look like navigation within the hub: all 19
+    // sites on Ivvor's "Delta Sites" page were dropped. An app-hosted identity is
+    // `(app, resource)`, so a different site is no longer confused with this one,
+    // while another PAGE of the same site still is (the path is dropped on mapping).
+    hub_identity == locator_identity(loc)
 }
 
 /// Poll a hub (link-repository) page and CAPTURE its outbound site links into
@@ -1335,6 +1483,7 @@ fn crawl_hub(
     hub: &str,
     seen: &HashSet<String>,
     pending: &mut Pending,
+    registry: &AppRegistryView,
 ) -> usize {
     // Normalized ONCE, BEFORE the fetch, and used for everything after: the
     // fetch itself, the queued locator, the self-comparison, and the
@@ -1346,9 +1495,24 @@ fn crawl_hub(
     // loopback URL that `ssrf_check` rejects, so the run ended before reaching
     // the normalization. Converting it to a `freenet:` locator first is what
     // makes a gateway-form hub line work at all.
+    // NOTE: normalize only, WITHOUT mapping onto an app. A hub is crawled at a
+    // specific URL (a particular page of a particular site), and mapping would drop
+    // the path — which is exactly what we want for a link we are cataloguing and
+    // exactly wrong for one we are about to fetch.
     let hub_canon = normalize_href(hub).map(|(l, _)| l);
     let hub = hub_canon.as_deref().unwrap_or(hub);
-    let page = match get_page(cli, client, gw, hub) {
+    // Enumerate the site's other pages when the hub is app-hosted. An app whose
+    // internal navigation is not `<a href>` cannot be walked by following links, so
+    // without this the crawl sees exactly the one page it was pointed at.
+    let enumerate = registry.resource_of(hub).map(|r| (r, cli.hub_max_pages));
+    let page = match get_page_enumerating(
+        cli,
+        client,
+        gw,
+        hub,
+        registry,
+        enumerate.as_ref().map(|(r, m)| (r.as_str(), *m)),
+    ) {
         Ok(p) => p,
         Err(e) => {
             eprintln!("hub {hub}: fetch failed: {e:#}");
@@ -1356,21 +1520,47 @@ fn crawl_hub(
         }
     };
     let mut captured = 0;
-    // A hub is itself a resource worth listing, so capture it too.
-    if !seen.contains(hub) && pending.add(hub, "site", HUB_AUTHOR) {
+    // The hub's own SUBJECT, which for an app-hosted hub is the site rather than the
+    // particular page we fetched.
+    //
+    // Both uses below need the mapped form. Listing the hub under its raw
+    // `freenet:<container>/#<res>/<page>` locator would file Ivvor's site under the
+    // page that happened to be in the sources file, AND leave it distinct from the
+    // `app:delta/<res>` locator produced by any self-link on the page — two entries
+    // for one site, which is exactly the dedup collapse this work exists to fix.
+    // The identity comparison has the same problem: an unmapped hub identity is the
+    // CONTAINER id, which can never equal a mapped link's `app:slug/resource`, so
+    // nothing would be recognised as in-app navigation at all.
+    let hub_subject = hub_subject_of(hub, registry);
+    if !seen.contains(&hub_subject) && pending.add(&hub_subject, "site", HUB_AUTHOR) {
         captured += 1;
     }
-    let links = extract_locators(&page.html);
-    let hub_id = freenet_id(hub);
+    // Extract from EVERY page the render produced, not just the entry point. An app
+    // whose internal navigation is not `<a href>` (Delta's page list is clickable
+    // divs) is otherwise invisible past its first page — which is why the sources
+    // file had to name one specific page, and why the page listing Delta sites was
+    // never read at all.
+    let mut links = extract_locators(&page.html);
+    for extra in &page.extra_pages {
+        for l in extract_locators(extra) {
+            if !links.contains(&l) {
+                links.push(l);
+            }
+        }
+    }
+    let links: Vec<(String, &'static str)> = links
+        .into_iter()
+        .map(|(loc, kind)| match registry.map_locator(&loc) {
+            Some(mapped) => (mapped, kind),
+            None => (loc, kind),
+        })
+        .collect();
+    let hub_identity = locator_identity(&hub_subject);
     for (loc, kind) in links {
-        // Skip the hub itself and links back into the hub's own contract
-        // (in-app navigation, assets) — only outbound sites.
-        if loc == hub || seen.contains(&loc) || pending.contains(&loc) {
+        if skip_hub_link(&hub_subject, hub_identity, &loc, seen, pending) {
             continue;
         }
-        if hub_id.is_some() && freenet_id(&loc) == hub_id {
-            continue;
-        }
+
         if pending.add(&loc, kind, HUB_AUTHOR) {
             captured += 1;
         }
@@ -1693,6 +1883,186 @@ fn extract_locators(html: &str) -> Vec<(String, &'static str)> {
 /// are limited only by the 512 KB page cap, so a single giant href could
 /// otherwise blow up one request into tens of thousands of tokens.
 const MAX_LOCATOR_LEN: usize = 512;
+
+// ---------------------------------------------------------------------------
+// App registry: recognising app-hosted resources
+// ---------------------------------------------------------------------------
+
+/// One registered app, as the crawler needs it: where its container lives and how
+/// to pull a resource handle back out of a URL under it.
+#[derive(Clone, Debug)]
+struct AppView {
+    slug: String,
+    contract_id: String,
+    /// Literal text between the contract id and the resource handle, taken from
+    /// the registry's link template (`/#{resource}{path}` -> `/#`).
+    prefix: String,
+}
+
+/// The apps the curator has registered, loaded once per run.
+///
+/// Without this the crawler cannot tell a Delta SITE from the Delta APP: every
+/// Delta site is served by the same web container, so they all normalise to one
+/// `freenet:<container-id>` locator with the site buried in an opaque fragment.
+#[derive(Clone, Debug, Default)]
+struct AppRegistryView {
+    apps: Vec<AppView>,
+}
+
+impl AppRegistryView {
+    /// Ask `atlasctl` for the registry. A failure is NOT fatal: the crawler still
+    /// works, it just cannot recognise app-hosted links, so say so loudly and carry
+    /// on rather than stalling a run over it.
+    fn load(cli: &Cli) -> Self {
+        let mut cmd = Command::new(&cli.atlasctl);
+        cmd.args(["--node", &cli.node]);
+        if let Some(kd) = &cli.key_dir {
+            cmd.args(["--key-dir", &kd.to_string_lossy()]);
+        }
+        cmd.args(["apps", "--json"]);
+        let out = match cmd.output() {
+            Ok(o) if o.status.success() => o.stdout,
+            Ok(o) => {
+                eprintln!(
+                    "warning: could not read the app registry ({}); app-hosted links \
+                     will be indexed by container id instead of per-resource",
+                    String::from_utf8_lossy(&o.stderr).trim()
+                );
+                return Self::default();
+            }
+            Err(e) => {
+                eprintln!("warning: could not run atlasctl apps: {e}");
+                return Self::default();
+            }
+        };
+        let parsed: serde_json::Value = match serde_json::from_slice(&out) {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("warning: app registry json did not parse: {e}");
+                return Self::default();
+            }
+        };
+        let mut apps = Vec::new();
+        if let Some(map) = parsed["apps"].as_object() {
+            for (slug, rec) in map {
+                let (Some(contract_id), Some(template)) =
+                    (rec["contract_id"].as_str(), rec["link_template"].as_str())
+                else {
+                    continue;
+                };
+                // Derive the recognizer from the TEMPLATE rather than hard-coding
+                // one per app: the literal text before `{resource}` is exactly what
+                // a URL for that app has between the contract id and the handle.
+                let Some((prefix, rest)) = template.split_once("{resource}") else {
+                    continue;
+                };
+                // Only the shape this can reverse unambiguously: the handle must be
+                // followed by the free-form path and nothing else, so the handle
+                // ends at the first separator.
+                if rest != "{path}" {
+                    eprintln!(
+                        "warning: app `{slug}` has link template {template:?}, which \
+                         this crawler cannot reverse; its links will not be recognised"
+                    );
+                    continue;
+                }
+                apps.push(AppView {
+                    slug: slug.to_string(),
+                    contract_id: contract_id.to_string(),
+                    prefix: prefix.to_string(),
+                });
+            }
+        }
+        if !apps.is_empty() {
+            eprintln!(
+                "app registry: {}",
+                apps.iter()
+                    .map(|a| format!("{}={}", a.slug, a.contract_id))
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            );
+        }
+        Self { apps }
+    }
+
+    /// Rewrite a `freenet:<id><path>` locator into `app:<slug>/<resource>` when it
+    /// points at a registered app's container.
+    ///
+    /// The PATH IS DROPPED on purpose. The subject is the site, not whichever page
+    /// happened to link to it, so dropping the page makes two links to different
+    /// pages of one site converge on a single locator — which in turn makes the
+    /// existing `seen` / pending dedup do the right thing with no format change.
+    /// A deep link is still expressible by hand via `atlasctl add`.
+    fn map_locator(&self, loc: &str) -> Option<String> {
+        let rest = loc.strip_prefix("freenet:")?;
+        let (id, path) = split_freenet(rest);
+        let app = self.apps.iter().find(|a| a.contract_id == id)?;
+        let after = path.strip_prefix(&app.prefix)?;
+        let end = after.find(|c: char| !is_base58(c)).unwrap_or(after.len());
+        let resource = &after[..end];
+        if resource.is_empty() || resource.len() > 64 {
+            return None;
+        }
+        Some(format!("app:{}/{}", app.slug, resource))
+    }
+}
+
+impl AppRegistryView {
+    /// Turn `app:<slug>/<resource>` back into the `freenet:<id><prefix><resource>`
+    /// form that `get_page` knows how to fetch.
+    ///
+    /// Needed because the crawler now QUEUES app locators, and a queued locator has
+    /// to be retrievable. Returns `None` when the app is not registered, which is
+    /// the right outcome: without the registry we do not know where that app lives,
+    /// so the locator is not fetchable and must not be described.
+    fn resolve_for_fetch(&self, loc: &str) -> Option<String> {
+        let rest = loc.strip_prefix("app:")?;
+        let (slug, resource) = rest.split_once('/')?;
+        let app = self.apps.iter().find(|a| a.slug == slug)?;
+        Some(format!(
+            "freenet:{}{}{}",
+            app.contract_id, app.prefix, resource
+        ))
+    }
+
+    /// The resource handle of an app-hosted locator, for page enumeration.
+    fn resource_of(&self, loc: &str) -> Option<String> {
+        let mapped = if loc.starts_with("app:") {
+            loc.to_string()
+        } else {
+            self.map_locator(loc)?
+        };
+        let rest = mapped.strip_prefix("app:")?;
+        let (_, resource) = rest.split_once('/')?;
+        Some(resource.to_string())
+    }
+}
+
+fn is_base58(c: char) -> bool {
+    matches!(c, '1'..='9' | 'A'..='H' | 'J'..='N' | 'P'..='Z' | 'a'..='k' | 'm'..='z')
+}
+
+/// The identity two locators are "the same thing" under, for skip/dedup decisions.
+///
+/// For an app-hosted locator that is `app:<slug>/<resource>`, so two Delta sites are
+/// DIFFERENT even though they share a container. For a `freenet:` locator it is the
+/// contract id, preserving the existing "links back into the hub's own contract are
+/// in-app navigation" rule.
+fn locator_identity(loc: &str) -> &str {
+    if loc.starts_with("app:") {
+        return loc;
+    }
+    freenet_id(loc).unwrap_or(loc)
+}
+
+/// Normalize an href and then map it onto a registered app if it belongs to one.
+fn normalize_mapped(href: &str, registry: &AppRegistryView) -> Option<(String, &'static str)> {
+    let (loc, kind) = normalize_href(href)?;
+    match registry.map_locator(&loc) {
+        Some(app_loc) => Some((app_loc, kind)),
+        None => Some((loc, kind)),
+    }
+}
 
 fn normalize_href(href: &str) -> Option<(String, &'static str)> {
     if href.len() > MAX_LOCATOR_LEN {
@@ -2381,6 +2751,314 @@ fn trim_len(s: &str, max: usize) -> String {
 
 #[cfg(test)]
 mod tests {
+
+    const DELTA: &str = "EqJ5YpEEV3XLqEvKWLQHFhGAac2qXzSUoE6k2zbdnXBr";
+    const RIVER: &str = "raAqMhMG7KUpXBU2SxgCQ3Vh4PYjttxdSWd9ftV7RLv";
+
+    fn delta_registry() -> AppRegistryView {
+        AppRegistryView {
+            apps: vec![AppView {
+                slug: "delta".into(),
+                contract_id: DELTA.into(),
+                prefix: "/#".into(),
+            }],
+        }
+    }
+
+    /// The hub arrives UNMAPPED (a specific page of a specific site), so its subject
+    /// and identity must be derived by mapping. This is the case that actually
+    /// distinguishes the fix, and the one my first two attempts at a test missed:
+    /// with the hub already mapped, "another page of the same site" is the same
+    /// string, so the earlier `loc == hub` check short-circuited and the identity
+    /// comparison was never reached.
+    #[test]
+    fn an_unmapped_hub_maps_to_its_site_for_both_listing_and_skipping() {
+        let reg = delta_registry();
+        let tmp = TmpFile::new("hubsubject");
+        let pending = Pending::load(tmp.path());
+        let seen: HashSet<String> = HashSet::new();
+
+        // Exactly what `crawl_hub` receives from the sources file.
+        let raw_hub = format!("freenet:{DELTA}/#AmcVD92D3U/3/delta-sites");
+        let hub_subject = hub_subject_of(&raw_hub, &reg);
+        // The hub is listed as the SITE, not as the page named in the sources file.
+        assert_eq!(hub_subject, "app:delta/AmcVD92D3U");
+        let hub_identity = locator_identity(&hub_subject).to_string();
+
+        // Another page of the hub's own site: in-app navigation.
+        let own_other_page = reg
+            .map_locator(&format!("freenet:{DELTA}/#AmcVD92D3U/7/river-lore"))
+            .unwrap();
+        assert!(
+            skip_hub_link(
+                &hub_subject,
+                &hub_identity,
+                &own_other_page,
+                &seen,
+                &pending
+            ),
+            "another page of the hub's OWN site must be skipped, or the site is \
+             listed twice"
+        );
+
+        // A different site: kept.
+        let other_site = reg
+            .map_locator(&format!("freenet:{DELTA}/#DWn4bEFfoo/"))
+            .unwrap();
+        assert!(
+            !skip_hub_link(&hub_subject, &hub_identity, &other_site, &seen, &pending),
+            "a different site in the same app must be kept"
+        );
+
+        // Had the identity NOT been mapped it would be the container id, which can
+        // never equal a mapped link's `app:slug/resource`, so nothing would be
+        // recognised as in-app navigation.
+        let unmapped_identity = locator_identity(&raw_hub);
+        assert_eq!(unmapped_identity, DELTA);
+        assert_ne!(
+            unmapped_identity,
+            locator_identity(&own_other_page),
+            "this mismatch is why the hub identity has to be mapped"
+        );
+    }
+
+    /// THE bug that made Atlas index zero Delta sites, tested through the actual
+    /// SKIP DECISION rather than through `locator_identity` in isolation.
+    ///
+    /// The first version of this test only compared identities, so reverting
+    /// `skip_hub_link` to the original contract-id comparison left it green. Pin the
+    /// decision the crawler really makes.
+    #[test]
+    fn the_hub_skip_keeps_other_sites_in_the_same_app() {
+        let reg = delta_registry();
+        let tmp = TmpFile::new("skiphub");
+        let pending = Pending::load(tmp.path());
+        let seen: HashSet<String> = HashSet::new();
+
+        let hub = reg
+            .map_locator(&format!("freenet:{DELTA}/#AmcVD92D3U/3/delta-sites"))
+            .unwrap();
+        let hub_identity = locator_identity(&hub).to_string();
+
+        // A DIFFERENT Delta site must be kept, even though it shares the container.
+        let other = reg
+            .map_locator(&format!("freenet:{DELTA}/#DWn4bEFfoo/"))
+            .unwrap();
+        assert!(
+            !skip_hub_link(&hub, &hub_identity, &other, &seen, &pending),
+            "a different site in the same app must NOT be skipped — this is the bug \
+             that dropped all 19 Delta sites"
+        );
+
+        // Another page of the hub's OWN site is in-app navigation: skip it.
+        let same = reg
+            .map_locator(&format!("freenet:{DELTA}/#AmcVD92D3U/7/river-lore"))
+            .unwrap();
+        assert!(skip_hub_link(&hub, &hub_identity, &same, &seen, &pending));
+        // The hub itself.
+        assert!(skip_hub_link(&hub, &hub_identity, &hub, &seen, &pending));
+
+        // A plain web contract hub keeps the old rule: same contract id is in-app.
+        let whub = format!("freenet:{RIVER}/a");
+        let wid = locator_identity(&whub).to_string();
+        assert!(skip_hub_link(
+            &whub,
+            &wid,
+            &format!("freenet:{RIVER}/b"),
+            &seen,
+            &pending
+        ));
+        assert!(!skip_hub_link(
+            &whub,
+            &wid,
+            &format!("freenet:{DELTA}/x"),
+            &seen,
+            &pending
+        ));
+    }
+
+    /// THE bug that made Atlas index zero Delta sites.
+    ///
+    /// Every Delta site is served by the same container, so on a Delta hub page every
+    /// outbound Delta link shared the hub's contract id and was skipped as "in-app
+    /// navigation". All 19 sites listed on Ivvor's "Delta Sites" page were dropped
+    /// this way. With app-hosted identities a link to a DIFFERENT site is no longer
+    /// confused with a link to this one.
+    #[test]
+    fn a_link_to_another_site_in_the_same_app_is_not_treated_as_in_app_navigation() {
+        let reg = delta_registry();
+        let hub = format!("freenet:{DELTA}/#AmcVD92D3U/3/delta-sites");
+        let hub_mapped = reg.map_locator(&hub).unwrap();
+        assert_eq!(hub_mapped, "app:delta/AmcVD92D3U");
+
+        // Another Delta site: same contract id, different resource.
+        let other = reg
+            .map_locator(&format!("freenet:{DELTA}/#DWn4bEFfoo/"))
+            .unwrap();
+        assert_eq!(other, "app:delta/DWn4bEFfoo");
+        assert_ne!(
+            locator_identity(&hub_mapped),
+            locator_identity(&other),
+            "two sites in one app must have distinct identities"
+        );
+
+        // …while a link back to a DIFFERENT PAGE of the hub's OWN site still is
+        // in-app navigation, because the path is dropped.
+        let same_site = reg
+            .map_locator(&format!("freenet:{DELTA}/#AmcVD92D3U/7/river-lore"))
+            .unwrap();
+        assert_eq!(
+            locator_identity(&hub_mapped),
+            locator_identity(&same_site),
+            "another page of the same site must be the same identity"
+        );
+
+        // And the pre-existing rule is unchanged for plain web contracts.
+        let a = format!("freenet:{RIVER}/x");
+        let b = format!("freenet:{RIVER}/y");
+        assert_eq!(locator_identity(&a), locator_identity(&b));
+    }
+
+    /// The path is dropped when mapping, so two links to different pages of one site
+    /// converge on ONE locator — which is what makes the existing `seen`/pending
+    /// dedup produce a single listing per site with no format change.
+    #[test]
+    fn mapping_drops_the_page_so_one_site_is_one_locator() {
+        let reg = delta_registry();
+        for href in [
+            format!("freenet:{DELTA}/#Fe5jaFmRnp/1/about"),
+            format!("freenet:{DELTA}/#Fe5jaFmRnp/"),
+            format!("freenet:{DELTA}/#Fe5jaFmRnp"),
+            format!("freenet:{DELTA}/#Fe5jaFmRnp/9/whatever"),
+        ] {
+            assert_eq!(
+                reg.map_locator(&href).unwrap(),
+                "app:delta/Fe5jaFmRnp",
+                "{href} should map to the site, not the page"
+            );
+        }
+    }
+
+    #[test]
+    fn only_registered_containers_are_mapped() {
+        let reg = delta_registry();
+        // Not the Delta container: left alone.
+        assert!(reg
+            .map_locator(&format!("freenet:{RIVER}/#AmcVD92D3U/"))
+            .is_none());
+        // Right container, but no resource after the prefix.
+        assert!(reg.map_locator(&format!("freenet:{DELTA}/")).is_none());
+        assert!(reg.map_locator(&format!("freenet:{DELTA}/#")).is_none());
+        // Right container, wrong prefix shape (no `#`).
+        assert!(reg
+            .map_locator(&format!("freenet:{DELTA}/AmcVD92D3U"))
+            .is_none());
+        // Not a freenet locator at all.
+        assert!(reg.map_locator("https://example.com").is_none());
+        // An empty registry maps nothing, so the crawler degrades to the old
+        // behaviour rather than failing.
+        let empty = AppRegistryView::default();
+        assert!(empty
+            .map_locator(&format!("freenet:{DELTA}/#AmcVD92D3U/"))
+            .is_none());
+    }
+
+    /// A queued `app:` locator has to be fetchable again, or every Delta site would
+    /// fail at description time.
+    #[test]
+    fn an_app_locator_round_trips_to_a_fetchable_url() {
+        let reg = delta_registry();
+        let mapped = reg
+            .map_locator(&format!("freenet:{DELTA}/#AmcVD92D3U/3/x"))
+            .unwrap();
+        assert_eq!(
+            reg.resolve_for_fetch(&mapped).unwrap(),
+            format!("freenet:{DELTA}/#AmcVD92D3U")
+        );
+        assert_eq!(reg.resource_of(&mapped).unwrap(), "AmcVD92D3U");
+        // Unregistered app: not fetchable, and must say so rather than guess.
+        assert!(reg.resolve_for_fetch("app:river/abc").is_none());
+    }
+
+    /// The recognizer is derived from the registry's link template, not hard-coded
+    /// per app, so a differently-shaped app works without a crawler change.
+    #[test]
+    fn the_recognizer_comes_from_the_link_template() {
+        let reg = AppRegistryView {
+            apps: vec![AppView {
+                slug: "widget".into(),
+                contract_id: RIVER.into(),
+                prefix: "/w/".into(),
+            }],
+        };
+        assert_eq!(
+            reg.map_locator(&format!("freenet:{RIVER}/w/abc123/deep"))
+                .unwrap(),
+            "app:widget/abc123"
+        );
+        assert!(reg
+            .map_locator(&format!("freenet:{RIVER}/#abc123"))
+            .is_none());
+    }
+
+    #[test]
+    fn normalize_mapped_maps_gateway_urls_too() {
+        let reg = delta_registry();
+        let (loc, kind) =
+            normalize_mapped(&format!("/v1/contract/web/{DELTA}/#DWn4bEFfoo/"), &reg).unwrap();
+        assert_eq!(loc, "app:delta/DWn4bEFfoo");
+        assert_eq!(kind, "site");
+        // A non-app link is passed through unchanged.
+        let (loc2, _) = normalize_mapped(&format!("/v1/contract/web/{RIVER}/"), &reg).unwrap();
+        assert_eq!(loc2, format!("freenet:{RIVER}/"));
+    }
+
+    /// The crawler keeps its own copies of the path guards, and `atlas_common::path`
+    /// is the CANONICAL pair (it is the one the contract enforces). Deduplicating
+    /// them is a separate change; until then, pin the property that actually
+    /// matters: **common must never be weaker than the crawler**. If the crawler
+    /// refuses a path, the contract must refuse it too, or a locator the crawler
+    /// considers hostile could still be signed into the index by hand.
+    ///
+    /// Not asserted as equality: `common` additionally fails CLOSED on input that
+    /// will not converge within its decode cap, so it is deliberately stricter.
+    #[test]
+    fn common_path_guards_are_at_least_as_strict_as_the_crawler_copies() {
+        let cases = [
+            "/../x",
+            "/a/../../b",
+            "#/../x",
+            "?next=/../x",
+            "/%2e%2e/x",
+            "/..%2fx",
+            "/%2e%2e%2fx",
+            "/%252e%252e/x",
+            "/.%2e/x",
+            "/..\\x",
+            "/a/./b",
+            "//etc/passwd",
+            "/%2fetc",
+            "/C:/Windows/win.ini",
+            "/ordinary/path",
+            "/#AmcVD92D3U/2/links",
+            "/assets/app.js",
+        ];
+        for p in cases {
+            if has_dot_segment(p) {
+                assert!(
+                    atlas_common::path::has_dot_segment(p),
+                    "crawler rejects {p:?} as a dot segment but atlas_common does not — \
+                     the contract-enforced guard is the weaker one"
+                );
+            }
+            if is_absolute_contract_path(p) {
+                assert!(
+                    atlas_common::path::is_absolute_escape(p),
+                    "crawler rejects {p:?} as an absolute escape but atlas_common does not"
+                );
+            }
+        }
+    }
 
     /// The contract rejects control characters in title/snippet/tags, so the writer
     /// must never emit them — a multi-line `<title>` is ordinary HTML.
