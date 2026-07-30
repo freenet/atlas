@@ -857,6 +857,16 @@ const MAX_QUARANTINE_CYCLES: u32 = 4;
 /// the locator — only that there was no room for it.
 const REFUSED_RETRY_SECS: u64 = 60 * 60;
 
+/// How many consecutive refusals before one is counted as a retry cycle.
+///
+/// A refusal deliberately does not burn a cycle, because nothing was learned
+/// about the locator. But an entry the queue can NEVER accept would then never
+/// reach the terminal state at all: it would re-release hourly for ever, hold a
+/// slot in its author's share, and — being due soonest — sit at exactly the end
+/// the trim protects, so it would outlive entries with real retry history. After
+/// a day of being unplaceable, treat that as a cycle so it still converges.
+const MAX_CONSECUTIVE_DEFERS: u32 = 24;
+
 /// Upper bound on the quarantine file, so a pathological source cannot grow it
 /// without limit.
 const MAX_QUARANTINE: usize = 5_000;
@@ -906,6 +916,8 @@ struct Quarantine {
 struct QuarantineEntry {
     due_at: u64,
     cycles: u32,
+    /// Consecutive times the queue refused this locator, reset on placement.
+    defers: u32,
     kind: &'static str,
     author: String,
 }
@@ -935,10 +947,12 @@ impl Quarantine {
             return (q, released, decided);
         };
         for line in body.lines() {
-            // due_at \t cycles \t kind \t author \t locator  (locator last: it may
-            // not contain a tab, so this parses unambiguously).
-            let mut parts = line.splitn(5, '\t');
-            let (Some(due), Some(cycles), Some(_kind), Some(author), Some(loc)) = (
+            // due_at \t cycles \t defers \t kind \t author \t locator
+            // (locator last: it may not contain a tab, so this parses
+            // unambiguously).
+            let mut parts = line.splitn(6, '\t');
+            let (Some(due), Some(cycles), Some(defers), Some(_kind), Some(author), Some(loc)) = (
+                parts.next(),
                 parts.next(),
                 parts.next(),
                 parts.next(),
@@ -1025,6 +1039,7 @@ impl Quarantine {
                 QuarantineEntry {
                     due_at,
                     cycles,
+                    defers: defers.trim().parse().unwrap_or(0),
                     kind,
                     author: author.to_string(),
                 },
@@ -1034,12 +1049,15 @@ impl Quarantine {
         // stays in the map until it is decided.
         let over = q.entries.len().saturating_sub(MAX_QUARANTINE);
         if over > 0 {
-            // Drop the entries due FURTHEST out. `Pending::evict_one` already
-            // answers the same tradeoff: the entry held longest ago is likeliest
-            // to have aged out of its source, so losing it is the permanent one,
-            // while a recently-held locator is likeliest to still be
-            // rediscoverable. Ordering by `due_at` puts the newest and the
-            // most-backed-off at that end.
+            // Drop the entries due FURTHEST out. Note what that actually
+            // selects, because it is NOT the recoverability argument
+            // `Pending::evict_one` makes: a freshly-held entry is due in one
+            // week, a thrice-cycled one in eight, so the newest sits at the
+            // PROTECTED end and what goes is the most-backed-off. That is
+            // defensible on its own terms — an entry that has already failed
+            // three cycles is the likeliest to be genuinely dead, and it has
+            // spent most of its retry budget either way — but it is a
+            // most-likely-dead rule, not a most-recoverable one.
             let mut by_due: Vec<(String, u64)> = q
                 .entries
                 .iter()
@@ -1087,6 +1105,7 @@ impl Quarantine {
             QuarantineEntry {
                 due_at: due_after(0, now),
                 cycles: 0,
+                defers: 0,
                 kind,
                 author: author.to_string(),
             },
@@ -1125,6 +1144,7 @@ impl Quarantine {
     fn mark_attempted(&mut self, loc: &str, now: u64) {
         if let Some(e) = self.entries.get_mut(loc) {
             e.cycles += 1;
+            e.defers = 0;
             e.due_at = due_after(e.cycles, now);
             self.dirty = true;
         }
@@ -1134,7 +1154,17 @@ impl Quarantine {
     /// not burn a cycle — just try again shortly, once the queue may have drained.
     fn defer_placement(&mut self, loc: &str, now: u64) {
         if let Some(e) = self.entries.get_mut(loc) {
-            e.due_at = now.saturating_add(REFUSED_RETRY_SECS);
+            e.defers += 1;
+            if e.defers >= MAX_CONSECUTIVE_DEFERS {
+                // Unplaceable for a day. Count it as a cycle so an entry the
+                // queue can never accept still converges instead of living for
+                // ever at the soonest-due end of the file.
+                e.cycles += 1;
+                e.defers = 0;
+                e.due_at = due_after(e.cycles, now);
+            } else {
+                e.due_at = now.saturating_add(REFUSED_RETRY_SECS);
+            }
             self.dirty = true;
         }
     }
@@ -1169,8 +1199,8 @@ impl Quarantine {
             .iter()
             .map(|(loc, e)| {
                 format!(
-                    "{}\t{}\t{}\t{}\t{}\n",
-                    e.due_at, e.cycles, e.kind, e.author, loc
+                    "{}\t{}\t{}\t{}\t{}\t{}\n",
+                    e.due_at, e.cycles, e.defers, e.kind, e.author, loc
                 )
             })
             .collect();
@@ -1450,7 +1480,7 @@ fn run_once(
     if held_back > 0 {
         eprintln!("warn: {held_back} released locator(s) did not fit the queue — kept quarantined");
     }
-    let capture_filter = capture_filter(&seen, &quarantine);
+    let suppressed = capture_filter(&seen, &quarantine);
     // Loaded once per run: which apps the curator has registered, so an app-hosted
     // link can be recognised as a resource rather than as its container.
     let registry = AppRegistryView::load(cli);
@@ -1486,7 +1516,7 @@ fn run_once(
                 &client,
                 &gw,
                 &hub,
-                &capture_filter,
+                &suppressed,
                 &mut pending,
                 &registry,
             );
@@ -1499,7 +1529,7 @@ fn run_once(
             // re-keys on every WASM upgrade). Polled on EVERY tick, budget or
             // not — see `crawl_river_room` for why that is load-bearing.
             let owner_vk = owner_vk.trim().to_string();
-            captured += crawl_river_room(cli, &owner_vk, &capture_filter, &mut pending, &registry);
+            captured += crawl_river_room(cli, &owner_vk, &suppressed, &mut pending, &registry);
         } else {
             // A curated locator from the operator's own file. Normalized before
             // it is queued, like every other locator: queuing the raw line meant
@@ -1512,7 +1542,7 @@ fn run_once(
                 None => (line.to_string(), "external"),
             };
             trusted.insert(loc.clone());
-            if !capture_filter.contains(&loc) && pending.add(&loc, kind, CURATED_AUTHOR) {
+            if !suppressed.contains(&loc) && pending.add(&loc, kind, CURATED_AUTHOR) {
                 captured += 1;
             }
         }
@@ -4910,15 +4940,44 @@ mod tests {
             q.mark_attempted(loc, now);
             assert!(q.save());
 
-            // Not due again immediately.
-            let (_, again, _) = Quarantine::load(f.path(), now, &none);
+            // The backoff must be pinned against the SCHEDULE THE CODE STORED,
+            // not against the test's own arithmetic. "Not due at `now`" is a
+            // lower bound of ANY positive delay, so it passes even when
+            // mark_attempted stores `now + 1` — which makes a locator due on the
+            // very next run, burns all four cycles in minutes, and blacklists a
+            // live site for good. That is the original bug, with a green suite.
+            // So: assert it is NOT due one second early, and IS due exactly on
+            // time.
+            let next_due = due_after(cycle + 1, now);
+            let (_, early, _) = Quarantine::load(f.path(), next_due - 1, &none);
             assert!(
-                again.is_empty(),
-                "cycle {cycle} must not re-release at once"
+                early.is_empty(),
+                "cycle {cycle} must wait the FULL backoff, not release early"
             );
+            let (_, on_time, terminal) = Quarantine::load(f.path(), next_due, &none);
+            if cycle + 1 < MAX_QUARANTINE_CYCLES {
+                assert_eq!(
+                    on_time.len(),
+                    1,
+                    "cycle {cycle} must release exactly when its stored due time \
+                     arrives"
+                );
+            } else {
+                // The LAST cycle is truncated on purpose: `load` checks
+                // `cycles >= MAX_QUARANTINE_CYCLES` BEFORE `now >= due_at`, so
+                // the run after the fourth placement gives up rather than
+                // granting a fourth release. That is why the lifetime cost is
+                // ~13 attempts and not 15. Pinned so a future reader who
+                // "fixes" the check order sees it is a decision, not an
+                // accident.
+                assert!(
+                    on_time.is_empty() && terminal == vec![loc.to_string()],
+                    "the final cycle must exhaust rather than release again"
+                );
+            }
 
             let prev = now;
-            now = due_after(cycle + 1, now);
+            now = next_due;
             gaps.push(now - prev);
         }
 
@@ -4987,6 +5046,37 @@ mod tests {
         assert_eq!(
             soon[0].0, 0,
             "a refusal is not an attempt, so it must not consume a retry cycle"
+        );
+    }
+
+    /// A refusal does not burn a cycle — but an entry the queue can NEVER accept
+    /// must still converge. Without a bound on consecutive deferrals it would
+    /// re-release hourly for ever, never reach the terminal state, hold one of
+    /// its author's slots indefinitely, and — being due soonest — sit at exactly
+    /// the end the trim protects, outliving entries with real retry history.
+    #[test]
+    fn an_unplaceable_locator_still_converges() {
+        let f = TmpFile::new("defer-converge");
+        let none: HashSet<String> = HashSet::new();
+        let loc = "https://unplaceable.example/1";
+        let mut now = 1_000_000u64;
+
+        let (mut q, _, _) = Quarantine::load(f.path(), now, &none);
+        assert!(q.hold(loc, "external", "ALICE", now).is_none());
+
+        // Refused every single time.
+        for _ in 0..MAX_CONSECUTIVE_DEFERS {
+            q.defer_placement(loc, now);
+            now += REFUSED_RETRY_SECS;
+        }
+        assert!(q.save());
+
+        let (_, released, _) = Quarantine::load(f.path(), due_after(1, now), &none);
+        assert_eq!(
+            released.first().map(|r| r.0),
+            Some(1),
+            "a day of being unplaceable must count as a cycle, or the entry never \
+             reaches the terminal state"
         );
     }
 
@@ -5061,6 +5151,47 @@ mod tests {
     /// refused ones afterwards, so the trim only ever measured the cooling subset
     /// and the file could grow without limit — with a test that read as if it
     /// proved the opposite, because its fixture was entirely inside the cooldown.
+    /// WHICH end the trim drops. The bound test gives every entry the same
+    /// due_at, so its sort degenerates to the locator tiebreak and inverting the
+    /// policy still passes. This one gives them distinct due times.
+    #[test]
+    fn the_trim_drops_the_entries_due_furthest_out() {
+        let f = TmpFile::new("quarantine-trim-dir");
+        let now = 9_000_000_000u64;
+        let none: HashSet<String> = HashSet::new();
+        // Half due soon (already past), half due far out. Only the far ones may go.
+        let soon = MAX_QUARANTINE - 20;
+        let body: String = (0..MAX_QUARANTINE + 40)
+            .map(|i| {
+                let due = if i < soon {
+                    now - 1
+                } else {
+                    now + 1_000_000 + i as u64
+                };
+                format!("{due}\t0\t0\texternal\tALICE\thttps://q.example/{i}\n")
+            })
+            .collect();
+        fs::write(f.path(), body).unwrap();
+
+        let (q, _, decided) = Quarantine::load(f.path(), now, &none);
+        assert_eq!(q.held().count(), MAX_QUARANTINE);
+        assert_eq!(decided.len(), 40);
+        let held: HashSet<String> = q.held().collect();
+        for i in 0..soon {
+            assert!(
+                held.contains(&format!("https://q.example/{i}")),
+                "a soonest-due entry must survive the trim (i={i})"
+            );
+        }
+        for d in &decided {
+            let i: usize = d.rsplit('/').next().unwrap().parse().unwrap();
+            assert!(
+                i >= soon,
+                "only furthest-due entries may be dropped, got {d}"
+            );
+        }
+    }
+
     #[test]
     fn quarantine_bound_covers_entries_that_are_already_due() {
         let f = TmpFile::new("quarantine-trim-due");
@@ -5069,7 +5200,12 @@ mod tests {
         // EVERY entry already due, which is exactly the population the old trim
         // could not see.
         let body: String = (0..MAX_QUARANTINE + 50)
-            .map(|i| format!("{}\t0\texternal\tALICE\thttps://q.example/{i}\n", now - 1))
+            .map(|i| {
+                format!(
+                    "{}\t0\t0\texternal\tALICE\thttps://q.example/{i}\n",
+                    now - 1
+                )
+            })
             .collect();
         fs::write(f.path(), body).unwrap();
 
@@ -5148,6 +5284,36 @@ mod tests {
         );
     }
 
+    /// Re-holding a locator ALREADY in the quarantine must not reset its
+    /// schedule. Without the guard a give-up on an already-held locator
+    /// overwrites it at cycles=0, so the counter never advances past 1 and the
+    /// terminal state is never reached — the unbounded cost, restored. This is
+    /// the realistic sequence: released, placed, fails its three attempts again,
+    /// held again.
+    #[test]
+    fn re_holding_does_not_reset_the_cycle_count() {
+        let none: HashSet<String> = HashSet::new();
+        let f = TmpFile::new("rehold");
+        let (mut q, _, _) = Quarantine::load(f.path(), 0, &none);
+        let loc = "https://flaky.example/1";
+        let now = 1_000_000u64;
+
+        assert!(q.hold(loc, "external", "ALICE", now).is_none());
+        q.mark_attempted(loc, now);
+        q.mark_attempted(loc, now);
+
+        // A second give-up on the same locator.
+        assert!(q.hold(loc, "external", "ALICE", now).is_none());
+
+        assert!(q.save());
+        let (_, released, _) = Quarantine::load(f.path(), due_after(2, now), &none);
+        assert_eq!(
+            released.first().map(|r| r.0),
+            Some(2),
+            "re-holding must keep the accumulated cycles, or there is no terminal state"
+        );
+    }
+
     /// A curated locator is an explicit operator decision and is exempt from the
     /// share cap.
     #[test]
@@ -5214,7 +5380,7 @@ mod tests {
     fn a_corrupt_cycle_count_does_not_blacklist() {
         let f = TmpFile::new("quarantine-badcycles");
         let none: HashSet<String> = HashSet::new();
-        fs::write(f.path(), "0\t99\texternal\tALICE\thttps://a.example/1\n").unwrap();
+        fs::write(f.path(), "0\t99\t0\texternal\tALICE\thttps://a.example/1\n").unwrap();
         let (q, released, decided) = Quarantine::load(f.path(), 1_785_000_000, &none);
         assert!(
             decided.is_empty(),
@@ -5255,7 +5421,7 @@ mod tests {
         fs::write(
             f.path(),
             format!(
-                "{}\t0\texternal\tALICE\thttps://a.example/1\n",
+                "{}\t0\t0\texternal\tALICE\thttps://a.example/1\n",
                 now + 3_000_000_000u64
             ),
         )
@@ -5438,6 +5604,10 @@ mod tests {
         }
         for s in [
             StatusCode::FORBIDDEN,
+            // Reads like a permanent decision, but is jurisdiction-scoped: a
+            // different network or exit reaches it. The likeliest wrong addition.
+            StatusCode::UNAVAILABLE_FOR_LEGAL_REASONS,
+            StatusCode::REQUEST_TIMEOUT,
             StatusCode::TOO_MANY_REQUESTS,
             StatusCode::INTERNAL_SERVER_ERROR,
             StatusCode::BAD_GATEWAY,
@@ -5465,7 +5635,7 @@ mod tests {
     fn quarantine_drops_entries_that_no_longer_validate() {
         let f = TmpFile::new("quarantine-revalidate");
         let none: HashSet<String> = HashSet::new();
-        fs::write(f.path(), "0\t0\tsite\tALICE\tfreenet:not-a-valid-id/x\n").unwrap();
+        fs::write(f.path(), "0\t0\t0\tsite\tALICE\tfreenet:not-a-valid-id/x\n").unwrap();
         let (q, released, _) = Quarantine::load(f.path(), QUARANTINE_SECS + 1, &none);
         assert!(
             released.is_empty(),
@@ -5481,7 +5651,7 @@ mod tests {
     fn quarantine_purges_locators_already_decided() {
         let f = TmpFile::new("quarantine-purge");
         let loc = "https://decided.example/1".to_string();
-        fs::write(f.path(), format!("0\t0\texternal\tALICE\t{loc}\n")).unwrap();
+        fs::write(f.path(), format!("0\t0\t0\texternal\tALICE\t{loc}\n")).unwrap();
 
         let none: HashSet<String> = HashSet::new();
         let (q, released, _) = Quarantine::load(f.path(), 1_785_000_000, &none);
@@ -5515,6 +5685,7 @@ mod tests {
             QuarantineEntry {
                 due_at: 0,
                 cycles: 0,
+                defers: 0,
                 kind: "external",
                 author: "X\n99999999999\t0\texternal\tY\thttps://forged.example/".to_string(),
             },
@@ -5533,7 +5704,7 @@ mod tests {
         let none: HashSet<String> = HashSet::new();
         fs::write(
             f.path(),
-            "not-a-number\t0\texternal\tALICE\thttps://a.example/1\n",
+            "not-a-number\t0\t0\texternal\tALICE\thttps://a.example/1\n",
         )
         .unwrap();
         let (_, released, _) = Quarantine::load(f.path(), 1_785_000_000, &none);
