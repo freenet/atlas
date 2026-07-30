@@ -1204,11 +1204,16 @@ fn main() -> Result<()> {
     // MAX_ATTEMPTS — and the whole queue is given up on at once. Both writers
     // also compute the same `sibling_tmp` name within one process, so the atomic
     // renames race. Cheaper to refuse than to debug.
+    // Compared after canonicalization where possible, so `./a.txt` and `a.txt`,
+    // or a symlink, cannot slip past. A path that does not exist yet cannot be
+    // canonicalized, so fall back to the literal — which still catches the
+    // realistic misconfiguration of naming the same path twice.
+    let real = |p: &PathBuf| fs::canonicalize(p).unwrap_or_else(|_| p.clone());
     let paths = [
-        ("--seen", &seen_path),
-        ("--spend", &spend_path),
-        ("--pending", &pending_path),
-        ("--quarantine", &quarantine_path),
+        ("--seen", real(&seen_path)),
+        ("--spend", real(&spend_path)),
+        ("--pending", real(&pending_path)),
+        ("--quarantine", real(&quarantine_path)),
     ];
     for (i, (name_a, a)) in paths.iter().enumerate() {
         for (name_b, b) in &paths[i + 1..] {
@@ -1282,6 +1287,10 @@ fn requeue_released(
             // left the quarantine file, so it cannot be lost here.
             quarantine.defer_placement(&loc, now);
             held_back += 1;
+            debug_assert!(
+                quarantine.held().any(|h| h == loc),
+                "a deferred locator must still be held, or it is lost"
+            );
         }
     }
     (requeued, held_back)
