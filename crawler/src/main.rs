@@ -1157,17 +1157,18 @@ fn index_locator(
 /// no text is rated on almost nothing — and an image-only site is exactly the case
 /// the gate most needs to catch.
 ///
-/// Calibrated ABOVE the chrome baseline, which the previous value was not: measured,
-/// a Delta resource that renders only the app shell yields ~288 visible characters
-/// with no page content at all, and the threshold was 220. That is below the floor,
-/// so it could never fire for the app this change is about — an empty or unrouted
-/// Delta resource cleared it and got described. `page.text` is the frame's
-/// innerText, chrome included, so the number has to clear the chrome.
+/// `page.text` is now the page's CONTENT REGION (render.js prefers `main` /
+/// `[role=main]` / `article` over the whole frame), so this measures actual content
+/// rather than content-plus-chrome. That is why it is back down to 200: it no longer
+/// has to clear an app shell's ~288 characters of navigation.
 ///
-/// 420 leaves roughly 130 characters of actual content above a Delta shell. It is a
-/// heuristic, and deliberately a cheap one; the honest fix is to strip the app chrome
-/// before rating, which needs per-app knowledge the registry does not carry yet.
-const MIN_DESCRIBABLE_CHARS: usize = 420;
+/// History worth keeping, because both mistakes were mine. It was first 220, which
+/// was BELOW the chrome baseline and so could never fire for an app-hosted page. Then
+/// 420, which cleared the chrome but was measuring the wrong thing — and describing
+/// from frame text turned out to be the actual bug: Delta's sidebar lists every
+/// visited site by name, so the LLM was handed a menu of other sites' titles and
+/// picked one, producing 16 live entries with cross-contaminated names.
+const MIN_DESCRIBABLE_CHARS: usize = 200;
 
 /// Describe an already-fetched page and add it to the index, applying the
 /// content-safety gate. Split out from `index_locator` so a hub crawl can index

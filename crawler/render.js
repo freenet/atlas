@@ -80,6 +80,38 @@ const watchdog = setTimeout(() => {
 }, WATCHDOG_MS);
 watchdog.unref();
 
+// Text used for DESCRIPTION and SAFETY RATING, taken from the page's content region
+// rather than the whole frame.
+//
+// This mattered a great deal. An app shell's chrome is in the frame text too, and
+// Delta's sidebar lists every site the node has ever visited BY NAME — so describing
+// from the frame text fed the LLM a menu of other sites' names, and it picked one as
+// the title. The result was 16 live index entries with cross-contaminated titles
+// ("Run Freenet in Docker" eight times, for eight unrelated sites). The site content
+// was being fetched correctly all along; only the text handed to the LLM was wrong.
+//
+// The preference list is generic HTML semantics, not app-specific: a page that marks
+// up its content region gets described from it, and anything else falls back to the
+// full body exactly as before.
+const CONTENT_SELECTORS = ['main', '[role=main]', 'article', '#content', '.content'];
+
+async function contentText(frame) {
+  try {
+    return await frame.evaluate((sels) => {
+      for (const s of sels) {
+        const el = document.querySelector(s);
+        const t = el && el.innerText ? el.innerText.trim() : '';
+        // Require some substance: an empty or near-empty <main> means the app has
+        // not rendered into it yet, and the body text is the better signal.
+        if (t.length > 80) return t;
+      }
+      return document.body ? document.body.innerText : '';
+    }, CONTENT_SELECTORS);
+  } catch (_) {
+    return '';
+  }
+}
+
 // Pick the frame most likely to hold the rendered app: prefer one whose URL
 // carries the gateway sandbox marker, else the frame with the most text.
 async function pickFrame(page) {
@@ -152,7 +184,7 @@ async function pickFrame(page) {
 
     frame = await pickFrame(page);
     const html = await frame.evaluate(() => document.documentElement.outerHTML).catch(() => '');
-    const text = await frame.evaluate(() => (document.body ? document.body.innerText : '')).catch(() => '');
+    const text = await contentText(frame);
 
     if (shotPath) {
       // Screenshot the whole page viewport: the gateway shell is a thin wrapper
