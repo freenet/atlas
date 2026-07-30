@@ -1006,6 +1006,7 @@ fn run_once(
     // ---- Phase 2: description. Billed, rationed, and fair. ----
     let mut added = 0usize;
     let mut unresolvable = 0usize;
+    let mut baselines = AppBaselines::default();
     let mut author_used: HashMap<String, usize> = HashMap::new();
     let mut authors_served: HashSet<String> = HashSet::new();
     let order = pending.drain_order();
@@ -1053,6 +1054,7 @@ fn run_once(
             kind,
             is_trusted,
             &registry,
+            &mut baselines,
         ) {
             // Indexed, or deliberately refused by the content-safety gate.
             // Both are final: mark seen and stop tracking it.
@@ -1146,8 +1148,21 @@ fn index_locator(
     kind: &str,
     trusted: bool,
     registry: &AppRegistryView,
+    baselines: &mut AppBaselines,
 ) -> Result<bool> {
     let page = get_page(cli, client, gw, loc, registry)?;
+    // Before spending anything: is this actually a page about the resource we asked
+    // for, or the app's fallback content for a resource it could not load? The latter
+    // reads as a perfectly good page, so this has to be checked explicitly.
+    if let Some(slug) = loc
+        .strip_prefix("app:")
+        .and_then(|rest| rest.split_once('/'))
+        .map(|(slug, _)| slug)
+    {
+        if baselines.is_placeholder(cli, client, gw, registry, slug, &page.text) {
+            return Err(PlaceholderPage.into());
+        }
+    }
     index_page(cli, client, key, model, loc, kind, trusted, &page)
 }
 
@@ -1484,6 +1499,26 @@ fn render_page(
     })
 }
 
+/// "The app served its fallback content instead of the resource we asked for."
+///
+/// Deterministic while the resource stays unavailable, so like [`TooThin`] it must not
+/// consume an attempt: the page becomes describable as soon as the site loads, and
+/// burning three retries would blacklist a real site forever.
+#[derive(Debug)]
+struct PlaceholderPage;
+
+impl std::fmt::Display for PlaceholderPage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "the app served its fallback content, not this resource (the resource is \
+             not loaded yet)"
+        )
+    }
+}
+
+impl std::error::Error for PlaceholderPage {}
+
 /// "This page had too little text to describe or to rate."
 ///
 /// Deterministic for a given page, so — like [`UnresolvableApp`] — it must not
@@ -1541,7 +1576,78 @@ fn is_unresolvable_app(e: &anyhow::Error) -> bool {
 /// True if this error is a DETERMINISTIC refusal, so retrying it cannot help and
 /// charging it an attempt would eventually blacklist a page for good.
 fn is_deterministic_refusal(e: &anyhow::Error) -> bool {
-    e.chain().any(|c| c.downcast_ref::<TooThin>().is_some())
+    e.chain().any(|c| {
+        c.downcast_ref::<TooThin>().is_some() || c.downcast_ref::<PlaceholderPage>().is_some()
+    })
+}
+
+/// Per-run cache of what each app renders for a resource that DOES NOT EXIST.
+///
+/// This closes the last and subtlest way an app-hosted listing came out wrong. When
+/// the requested resource is not available, Delta does not render an empty page or an
+/// error — it falls back to selecting some OTHER site it knows about and renders that
+/// site's content into the content region. So the text looks like a perfectly good
+/// page, passes every guard, and gets published under the WRONG site's locator.
+///
+/// Neither a selector nor a length threshold can see this: the content is real, it is
+/// just about a different site. What identifies it is that the app produces the same
+/// content for a resource that cannot exist. Probing once per app per run with a
+/// synthetic handle gives a baseline to compare against — generic, no per-app
+/// knowledge, one extra render.
+///
+/// Verified: `#zzzzzzzzzz` (a well-formed but nonexistent Delta handle) renders 2968
+/// characters of Delta's own introduction, which is exactly the text that had been
+/// published as two unrelated sites' descriptions.
+#[derive(Default)]
+struct AppBaselines {
+    /// app slug -> whitespace-normalised text the app renders for a missing resource.
+    /// `None` means the probe failed, so no comparison is possible this run.
+    by_slug: HashMap<String, Option<String>>,
+}
+
+/// A well-formed handle that cannot belong to a real site (base58, right length, and
+/// a value no owner key would produce).
+const SYNTHETIC_RESOURCE: &str = "zzzzzzzzzz";
+
+fn normalise_text(t: &str) -> String {
+    t.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+impl AppBaselines {
+    /// True if `text` is what this app shows for a resource that does not exist, i.e.
+    /// the page is not really about the resource we asked for.
+    fn is_placeholder(
+        &mut self,
+        cli: &Cli,
+        client: &reqwest::blocking::Client,
+        gw: &str,
+        registry: &AppRegistryView,
+        slug: &str,
+        text: &str,
+    ) -> bool {
+        if !self.by_slug.contains_key(slug) {
+            let probe = format!("app:{slug}/{SYNTHETIC_RESOURCE}");
+            let baseline = get_page(cli, client, gw, &probe, registry)
+                .ok()
+                .map(|p| normalise_text(&p.text))
+                .filter(|t| !t.is_empty());
+            match &baseline {
+                Some(b) => eprintln!(
+                    "  app `{slug}`: captured a {}-char missing-resource baseline",
+                    b.len()
+                ),
+                None => eprintln!(
+                    "  app `{slug}`: could not capture a missing-resource baseline, so \
+                     placeholder pages cannot be detected this run"
+                ),
+            }
+            self.by_slug.insert(slug.to_string(), baseline);
+        }
+        match self.by_slug.get(slug) {
+            Some(Some(baseline)) => normalise_text(text) == *baseline,
+            _ => false,
+        }
+    }
 }
 
 /// The SUBJECT a hub page should be listed and compared under.
@@ -3001,6 +3107,52 @@ fn trim_len(s: &str, max: usize) -> String {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn normalise_text_makes_whitespace_irrelevant() {
+        assert_eq!(normalise_text("a\n\n  b\tc "), "a b c");
+        assert_eq!(normalise_text("  "), "");
+    }
+
+    /// The baseline comparison must be whitespace-insensitive, because a re-render of
+    /// the same fallback content can differ in line breaks without differing in
+    /// substance — and an exact byte comparison would then let the placeholder through.
+    #[test]
+    fn a_placeholder_matches_its_baseline_regardless_of_whitespace() {
+        let mut b = AppBaselines::default();
+        b.by_slug.insert(
+            "delta".to_string(),
+            Some(normalise_text(
+                "Introducing Delta\n\nDelta is a new Freenet application",
+            )),
+        );
+        let cached = b.by_slug.get("delta").unwrap().clone().unwrap();
+        assert_eq!(
+            normalise_text("Introducing Delta   Delta is a new Freenet   application"),
+            cached,
+            "differing whitespace must still match the baseline"
+        );
+        assert_ne!(
+            normalise_text("Mason Jar Rebellion Be intentional"),
+            cached,
+            "a real page must NOT match the baseline"
+        );
+    }
+
+    /// A failed baseline probe must not cause every page to be treated as a
+    /// placeholder (which would index nothing) — it fails OPEN, with a warning, because
+    /// refusing everything is worse than the pre-existing behaviour.
+    #[test]
+    fn a_missing_baseline_does_not_reject_every_page() {
+        let mut b = AppBaselines::default();
+        b.by_slug.insert("delta".to_string(), None);
+        assert!(
+            !matches!(b.by_slug.get("delta"), Some(Some(_))),
+            "probe recorded as failed"
+        );
+        // With no baseline, the comparison arm cannot match, so nothing is rejected.
+        assert_eq!(b.by_slug.get("delta"), Some(&None));
+    }
 
     const DELTA: &str = "EqJ5YpEEV3XLqEvKWLQHFhGAac2qXzSUoE6k2zbdnXBr";
     const RIVER: &str = "raAqMhMG7KUpXBU2SxgCQ3Vh4PYjttxdSWd9ftV7RLv";
