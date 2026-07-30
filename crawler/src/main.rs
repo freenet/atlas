@@ -871,6 +871,37 @@ const MAX_CONSECUTIVE_DEFERS: u32 = 24;
 /// without limit.
 const MAX_QUARANTINE: usize = 5_000;
 
+/// Why a locator left the quarantine for good.
+///
+/// These arrive by different routes and mean different things to an operator
+/// asking "why is this site missing", so they must not share one message. The
+/// `journalctl | grep 'giving up on'` line is the forensic record that replaces
+/// the undifferentiated seen file (see the recovery issue), and telling someone a
+/// link burned four retry cycles when it actually lost a capacity contest on its
+/// first day sends them to exactly the wrong conclusion.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Decided {
+    /// Spent every retry cycle. Genuinely dead as far as we can tell.
+    Exhausted,
+    /// Dropped because the file hit `MAX_QUARANTINE`. May have zero cycles.
+    OverCapacity,
+}
+
+impl Decided {
+    fn why(&self) -> String {
+        match self {
+            Self::Exhausted => {
+                format!("after all {MAX_QUARANTINE_CYCLES} retry cycles were spent")
+            }
+            Self::OverCapacity => format!(
+                "the quarantine is at its {MAX_QUARANTINE}-entry limit — this was a \
+                 capacity eviction, NOT retry exhaustion, so it may never have been \
+                 retried at all"
+            ),
+        }
+    }
+}
+
 /// When a locator on its `cycles`-th cycle next becomes eligible.
 fn due_after(cycles: u32, now: u64) -> u64 {
     let mult = 1u64.checked_shl(cycles).unwrap_or(u64::MAX);
@@ -933,7 +964,7 @@ impl Quarantine {
         path: &Path,
         now: u64,
         seen: &HashSet<String>,
-    ) -> (Self, Vec<ReleasedLocator>, Vec<String>) {
+    ) -> (Self, Vec<ReleasedLocator>, Vec<(String, Decided)>) {
         let mut q = Self {
             path: path.to_path_buf(),
             entries: HashMap::new(),
@@ -941,7 +972,7 @@ impl Quarantine {
         };
         let mut released: Vec<ReleasedLocator> = Vec::new();
         // Locators leaving this file permanently: out of cycles, or trimmed.
-        let mut decided: Vec<String> = Vec::new();
+        let mut decided: Vec<(String, Decided)> = Vec::new();
         let mut dropped = 0usize;
         let Ok(body) = fs::read_to_string(path) else {
             return (q, released, decided);
@@ -974,6 +1005,13 @@ impl Quarantine {
             // relying on every future producer keeping them out: a newline here
             // would let one entry forge another, and a forged far-future entry is
             // invisible to discovery for as long as it sits there.
+            // NOTE: this cannot fire from a well-formed file, and that is not an
+            // oversight. `author` is the field BETWEEN tabs, so an embedded tab
+            // pushes the remainder into the locator, which `normalize_href`
+            // rejects below; an embedded newline ends the line. Kept as a cheap
+            // belt-and-braces read of an untrusted file, with the real
+            // enforcement at `hold`, where an author actually enters and where a
+            // future author source could introduce one.
             if author.contains(['\t', '\n']) {
                 dropped += 1;
                 q.dirty = true;
@@ -1027,7 +1065,7 @@ impl Quarantine {
             }
             if cycles >= MAX_QUARANTINE_CYCLES {
                 // Out of chances. The caller marks it seen; it leaves this file.
-                decided.push(canon);
+                decided.push((canon, Decided::Exhausted));
                 q.dirty = true;
                 continue;
             }
@@ -1070,7 +1108,7 @@ impl Quarantine {
                 // Marked seen by the caller rather than dropped. A trimmed entry
                 // is already out of the pending queue, so dropping it silently
                 // would leave it in no file at all.
-                decided.push(loc);
+                decided.push((loc, Decided::OverCapacity));
             }
             q.dirty = true;
             eprintln!(
@@ -1099,6 +1137,16 @@ impl Quarantine {
     fn hold(&mut self, loc: &str, kind: &'static str, author: &str, now: u64) -> Option<String> {
         if self.entries.contains_key(loc) {
             return None;
+        }
+        // An author carrying a field separator would let one entry forge another
+        // on the next read, and a forged far-future entry is invisible to
+        // discovery for as long as it sits there. Reject rather than sanitise: a
+        // sanitised author is silently a DIFFERENT rate-limit bucket. Unreachable
+        // from today's callers (@hub, @curated, or MemberId's base32), so this
+        // guards a future author source. The locator still leaves as a decision.
+        if author.contains(['\t', '\n']) {
+            eprintln!("warn: refusing to quarantine {loc} under an author carrying a separator");
+            return Some(loc.to_string());
         }
         self.entries.insert(
             loc.to_string(),
@@ -1467,8 +1515,8 @@ fn run_once(
     // permanent: not because one fetch failed, but because several attempts
     // spread over months all did. Without this terminal state the quarantine has
     // no bottom, and re-testing dead links eventually consumes the whole budget.
-    for loc in &decided {
-        eprintln!("giving up on {loc} for good after {MAX_QUARANTINE_CYCLES} retry cycles");
+    for (loc, why) in &decided {
+        eprintln!("giving up on {loc} for good: {}", why.why());
         seen.insert(loc.clone());
         append_seen(seen_path, loc);
     }
@@ -1624,6 +1672,13 @@ fn run_once(
                 seen.insert(loc.clone());
                 append_seen(seen_path, &loc);
                 pending.remove(&loc);
+                // Drop any quarantine entry NOW rather than leaving it for the
+                // next load's seen-purge. `mark_attempted` may have just pushed
+                // its due time weeks out, which would make this — a locator we
+                // just indexed successfully — the furthest-due entry and so the
+                // prime victim of an author-share eviction later in this same
+                // drain, producing a "gave up for good" line for a live site.
+                quarantine.forget(&loc);
             }
             // A locator whose app the registry does not know is a CONFIGURATION
             // state, not a bad link: leave it queued and do not burn one of its
@@ -1669,12 +1724,19 @@ fn run_once(
                     // append-only and never re-read for retry — so marking it
                     // there excluded the site permanently. Held for
                     // QUARANTINE_SECS, then queued again.
-                    eprintln!(
-                        "  quarantining {loc} after {MAX_ATTEMPTS} transient failures \
-                         — will retry in {}d",
-                        QUARANTINE_SECS / 86_400
-                    );
-                    if let Some(victim) = quarantine.hold(&loc, kind, &author, now_secs()) {
+                    let victim = quarantine.hold(&loc, kind, &author, now_secs());
+                    if victim.as_deref() != Some(loc.as_str()) {
+                        // Only claim a retry when there will be one: when the
+                        // locator IS the victim, the two lines would contradict
+                        // each other and `grep 'will retry'` would report a
+                        // retry that never happens.
+                        eprintln!(
+                            "  quarantining {loc} after {MAX_ATTEMPTS} transient failures \
+                             — will retry in {}d",
+                            QUARANTINE_SECS / 86_400
+                        );
+                    }
+                    if let Some(victim) = victim {
                         // Holding this one pushed its author over their share.
                         // The displaced locator leaves as a DECISION — it is
                         // already out of the pending queue, so dropping it
@@ -4971,7 +5033,7 @@ mod tests {
                 // "fixes" the check order sees it is a decision, not an
                 // accident.
                 assert!(
-                    on_time.is_empty() && terminal == vec![loc.to_string()],
+                    on_time.is_empty() && terminal == vec![(loc.to_string(), Decided::Exhausted)],
                     "the final cycle must exhaust rather than release again"
                 );
             }
@@ -4994,8 +5056,8 @@ mod tests {
         );
         assert_eq!(
             exhausted,
-            vec![loc.to_string()],
-            "it must be given up for good"
+            vec![(loc.to_string(), Decided::Exhausted)],
+            "it must be given up for good, and say why"
         );
         assert_eq!(q.held().count(), 0);
         assert!(q.save());
@@ -5183,11 +5245,16 @@ mod tests {
                 "a soonest-due entry must survive the trim (i={i})"
             );
         }
-        for d in &decided {
+        for (d, why) in &decided {
             let i: usize = d.rsplit('/').next().unwrap().parse().unwrap();
             assert!(
                 i >= soon,
                 "only furthest-due entries may be dropped, got {d}"
+            );
+            assert_eq!(
+                *why,
+                Decided::OverCapacity,
+                "a capacity eviction must not be reported as retry exhaustion"
             );
         }
     }
@@ -5226,11 +5293,12 @@ mod tests {
             50,
             "every trimmed locator must be handed back to be marked seen"
         );
-        for loc in &decided {
+        for (loc, why) in &decided {
             assert!(
                 !q.held().any(|h| &h == loc),
                 "a decided locator must not also still be held"
             );
+            assert_eq!(*why, Decided::OverCapacity);
         }
         for (_, loc, _, _) in &released {
             assert!(
@@ -5244,6 +5312,50 @@ mod tests {
     /// One author must not be able to occupy the whole quarantine, or Pending's
     /// per-author cap is defeated one level down and a single room member owns
     /// the recurring retry budget.
+    /// An author carrying a field separator would let one quarantine entry forge
+    /// another on the next read. Rejecting is right (sanitising would silently
+    /// move the locator to a different rate-limit bucket) — but the locator must
+    /// still leave as a decision rather than evaporating.
+    #[test]
+    fn hold_refuses_a_separator_bearing_author_without_losing_the_locator() {
+        let none: HashSet<String> = HashSet::new();
+        let (mut q, _, _) = Quarantine::load(TmpFile::new("hold-sep").path(), 0, &none);
+        let loc = "https://a.example/1";
+        let victim = q.hold(loc, "external", "AL\tICE", 1_000);
+        assert_eq!(
+            victim.as_deref(),
+            Some(loc),
+            "the locator must be handed back to be decided, not dropped"
+        );
+        assert_eq!(
+            q.held().count(),
+            0,
+            "and must not be stored under a forged author"
+        );
+    }
+
+    /// A capacity eviction must not be reported as retry exhaustion. The
+    /// per-locator "giving up on X" line is the greppable forensic record that
+    /// replaces the undifferentiated seen file, so telling an operator a link
+    /// burned all its retry cycles when it actually lost a capacity contest on
+    /// its first day sends them to exactly the wrong conclusion.
+    #[test]
+    fn the_reason_a_locator_was_given_up_on_is_recorded_accurately() {
+        assert_ne!(
+            Decided::Exhausted.why(),
+            Decided::OverCapacity.why(),
+            "the two must not share a message"
+        );
+        assert!(
+            Decided::OverCapacity.why().contains("NOT retry exhaustion"),
+            "a capacity eviction must say so explicitly"
+        );
+        assert!(
+            Decided::Exhausted.why().contains("retry cycles"),
+            "genuine exhaustion must still name the cycles"
+        );
+    }
+
     /// A locator refused by the author-share cap must leave as a DECISION, never
     /// as a silent drop. By the time hold() runs, record_failure has already
     /// removed it from the pending queue, so dropping it puts it in no file at
@@ -5491,6 +5603,36 @@ mod tests {
             5,
             "stripping comments must not have hidden a call site"
         );
+        // The Ok arm must release the quarantine entry. Without it a locator we
+        // just indexed keeps an entry whose due time `mark_attempted` may have
+        // pushed weeks out, making it the furthest-due — and so the prime victim
+        // of an author-share eviction later in the SAME drain, which then logs
+        // "gave up for good" for a live, freshly-indexed site.
+        let ok_at = production
+            .find("Ok(indexed) => {")
+            .expect("the indexed arm must still exist");
+        let ok_body_start = ok_at + "Ok(indexed) =>".len();
+        let mut depth = 0usize;
+        let mut ok_end = ok_body_start;
+        for (i, c) in production[ok_body_start..].char_indices() {
+            match c {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        ok_end = ok_body_start + i + 1;
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        assert!(
+            strip_comments(&production[ok_body_start..ok_end]).contains("quarantine.forget("),
+            "an indexed locator must release its quarantine entry immediately, or \
+             it can be evicted as though we had given up on it"
+        );
+
         assert!(
             production.contains("if !pending.save() {"),
             "phase 1's pending save must be CHECKED: it is what makes a released \
