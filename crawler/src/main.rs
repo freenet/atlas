@@ -928,10 +928,11 @@ impl Quarantine {
             dirty: false,
         };
         let mut released: Vec<ReleasedLocator> = Vec::new();
-        let mut exhausted: Vec<String> = Vec::new();
+        // Locators leaving this file permanently: out of cycles, or trimmed.
+        let mut decided: Vec<String> = Vec::new();
         let mut dropped = 0usize;
         let Ok(body) = fs::read_to_string(path) else {
-            return (q, released, exhausted);
+            return (q, released, decided);
         };
         for line in body.lines() {
             // due_at \t cycles \t kind \t author \t locator  (locator last: it may
@@ -978,7 +979,17 @@ impl Quarantine {
                 q.dirty = true;
                 continue;
             }
+            // `mark_attempted` can only ever write up to MAX_QUARANTINE_CYCLES, so
+            // anything above it is corrupt. Treat it as 0 rather than as
+            // "exhausted": every other parse failure in this file fails OPEN, and
+            // this is the one input that would otherwise fail CLOSED into a
+            // permanent blacklist.
             let cycles: u32 = cycles.trim().parse().unwrap_or(0);
+            let cycles = if cycles > MAX_QUARANTINE_CYCLES {
+                0
+            } else {
+                cycles
+            };
             // An unparseable due time is treated as "due now". Failing OPEN is
             // the safe direction: the cost of retrying early is a few billed
             // attempts, the cost of failing closed is losing the link.
@@ -990,7 +1001,7 @@ impl Quarantine {
             // capture filter, which is precisely the permanent exclusion this
             // type exists to remove.
             let due: u64 = due.trim().parse().unwrap_or(0);
-            let ceiling = due_after(MAX_QUARANTINE_CYCLES, now);
+            let ceiling = due_after(cycles, now);
             let due_at = due.min(ceiling);
             if due_at != due {
                 q.dirty = true;
@@ -1002,7 +1013,7 @@ impl Quarantine {
             }
             if cycles >= MAX_QUARANTINE_CYCLES {
                 // Out of chances. The caller marks it seen; it leaves this file.
-                exhausted.push(canon);
+                decided.push(canon);
                 q.dirty = true;
                 continue;
             }
@@ -1038,6 +1049,10 @@ impl Quarantine {
             for (loc, _) in by_due.into_iter().rev().take(over) {
                 q.entries.remove(&loc);
                 released.retain(|(_, l, _, _)| l != &loc);
+                // Marked seen by the caller rather than dropped. A trimmed entry
+                // is already out of the pending queue, so dropping it silently
+                // would leave it in no file at all.
+                decided.push(loc);
             }
             q.dirty = true;
             eprintln!(
@@ -1049,24 +1064,23 @@ impl Quarantine {
         if dropped > 0 {
             eprintln!("warn: dropped {dropped} quarantined locator(s) that no longer validate");
         }
-        (q, released, exhausted)
+        (q, released, decided)
     }
 
     /// Hold a locator that has burned its attempts on transient errors.
     ///
     /// A locator already here keeps its existing schedule: it is mid-cycle, and
     /// `mark_attempted` has already advanced it.
-    fn hold(&mut self, loc: &str, kind: &'static str, author: &str, now: u64) {
+    /// Returns a locator the caller must now mark SEEN, if holding this one
+    /// pushed its author over their share. It must never simply be dropped: by
+    /// the time this is called `record_failure` has already removed the locator
+    /// from the pending queue, so a silent drop leaves it in NO file at all —
+    /// the exact loss this whole type exists to remove, one level down.
+    /// Whatever leaves here leaves as a DECISION, with a log line.
+    #[must_use]
+    fn hold(&mut self, loc: &str, kind: &'static str, author: &str, now: u64) -> Option<String> {
         if self.entries.contains_key(loc) {
-            return;
-        }
-        // One author cannot occupy the whole file. Without this, `Pending`'s
-        // per-author cap is defeated one level down: a single room member could
-        // fill the quarantine and so own the recurring retry budget outright.
-        let own = self.entries.values().filter(|e| e.author == author).count();
-        if author != CURATED_AUTHOR && own >= MAX_PENDING_PER_AUTHOR {
-            eprintln!("warn: quarantine share for one author is full — dropping {loc}");
-            return;
+            return None;
         }
         self.entries.insert(
             loc.to_string(),
@@ -1078,6 +1092,32 @@ impl Quarantine {
             },
         );
         self.dirty = true;
+        // One author cannot occupy the whole file. Without this, `Pending`'s
+        // per-author cap is defeated one level down: a single room member could
+        // fill the quarantine and so own the recurring retry budget outright.
+        if author == CURATED_AUTHOR {
+            return None;
+        }
+        let own: Vec<(String, u64)> = self
+            .entries
+            .iter()
+            .filter(|(_, e)| e.author == author)
+            .map(|(l, e)| (l.clone(), e.due_at))
+            .collect();
+        if own.len() <= MAX_PENDING_PER_AUTHOR {
+            return None;
+        }
+        // The victim is the entry due FURTHEST out — it has already failed the
+        // most cycles, so it is both nearest to being given up on anyway and
+        // furthest from another attempt. Same tiebreak as the global trim. That
+        // may be the locator just inserted, which is correct: an author already
+        // at their cap should not displace better candidates.
+        let victim = own
+            .into_iter()
+            .max_by(|a, b| a.1.cmp(&b.1).then_with(|| a.0.cmp(&b.0)))
+            .map(|(l, _)| l)?;
+        self.entries.remove(&victim);
+        Some(victim)
     }
 
     /// A released locator was actually handed to the queue: burn the cycle and
@@ -1275,10 +1315,18 @@ fn requeue_released(
             quarantine.forget(&loc);
             continue;
         }
-        if pending.add(&loc, kind, &author) || pending.contains(&loc) {
-            // Handed to the queue (or already sitting in it): this cycle is
-            // spent, and the next one is scheduled further out.
+        if pending.add(&loc, kind, &author) {
+            // Genuinely handed to the queue: this cycle is spent, and the next
+            // one is scheduled further out.
             quarantine.mark_attempted(&loc, now);
+            requeued += 1;
+        } else if pending.contains(&loc) {
+            // Already sitting in the queue from an earlier run and not yet
+            // drained. Nothing was learned about it — it simply has not come up
+            // in the drain order — so it must NOT burn a cycle. Burning one here
+            // meant a backlogged queue could exhaust a locator's four cycles
+            // without ever re-attempting it, and then blacklist it for good.
+            quarantine.defer_placement(&loc, now);
             requeued += 1;
         } else {
             // The queue REFUSED it (author cap, or full and nothing evictable).
@@ -1384,13 +1432,12 @@ fn run_once(
     // now expired. Released entries are re-queued directly rather than waiting to
     // be rediscovered, because a River room's history is bounded and the message
     // that carried the link may be gone by now.
-    let (mut quarantine, released, exhausted) =
-        Quarantine::load(quarantine_path, now_secs(), &seen);
+    let (mut quarantine, released, decided) = Quarantine::load(quarantine_path, now_secs(), &seen);
     // Out of retry cycles. THIS is where a locator legitimately becomes
     // permanent: not because one fetch failed, but because several attempts
     // spread over months all did. Without this terminal state the quarantine has
     // no bottom, and re-testing dead links eventually consumes the whole budget.
-    for loc in &exhausted {
+    for loc in &decided {
         eprintln!("giving up on {loc} for good after {MAX_QUARANTINE_CYCLES} retry cycles");
         seen.insert(loc.clone());
         append_seen(seen_path, loc);
@@ -1597,7 +1644,19 @@ fn run_once(
                          — will retry in {}d",
                         QUARANTINE_SECS / 86_400
                     );
-                    quarantine.hold(&loc, kind, &author, now_secs());
+                    if let Some(victim) = quarantine.hold(&loc, kind, &author, now_secs()) {
+                        // Holding this one pushed its author over their share.
+                        // The displaced locator leaves as a DECISION — it is
+                        // already out of the pending queue, so dropping it
+                        // silently would put it in no file at all.
+                        eprintln!(
+                            "  giving up on {victim} for good: {author} is at their \
+                             quarantine share"
+                        );
+                        seen.insert(victim.clone());
+                        append_seen(seen_path, &victim);
+                        pending.remove(&victim);
+                    }
                 }
             }
         }
@@ -4791,7 +4850,7 @@ mod tests {
         {
             let (mut q, released, exhausted) = Quarantine::load(f.path(), at, &none);
             assert!(released.is_empty() && exhausted.is_empty());
-            q.hold("https://flaky.example/1", "external", "ALICE", at);
+            let _ = q.hold("https://flaky.example/1", "external", "ALICE", at);
             assert!(q.save());
         }
         // One second short of due: still held, nothing released.
@@ -4836,7 +4895,7 @@ mod tests {
         let mut now = 1_000_000_000u64;
 
         let (mut q, _, _) = Quarantine::load(f.path(), now, &none);
-        q.hold(loc, "external", "ALICE", now);
+        let _ = q.hold(loc, "external", "ALICE", now);
         assert!(q.save());
         // The initial hold schedules the FIRST retry one base cooldown out, so
         // advance to it before the first cycle.
@@ -4896,7 +4955,7 @@ mod tests {
 
         {
             let (mut q, _, _) = Quarantine::load(f.path(), now, &none);
-            q.hold(&loc, "external", "ALICE", now);
+            let _ = q.hold(&loc, "external", "ALICE", now);
             assert!(q.save());
         }
 
@@ -4944,8 +5003,8 @@ mod tests {
 
         let mut pending = Pending::load(TmpFile::new("requeue-ok-p").path());
         let (mut q, _, _) = Quarantine::load(f.path(), now, &none);
-        q.hold(&fresh, "external", "ALICE", now);
-        q.hold(&decided, "external", "ALICE", now);
+        let _ = q.hold(&fresh, "external", "ALICE", now);
+        let _ = q.hold(&decided, "external", "ALICE", now);
 
         let (requeued, held_back) = requeue_released(
             vec![
@@ -4985,7 +5044,7 @@ mod tests {
         let held = "https://held.example/1".to_string();
         let indexed = "https://indexed.example/1".to_string();
         let free = "https://free.example/1".to_string();
-        q.hold(&held, "external", "ALICE", 1_000);
+        let _ = q.hold(&held, "external", "ALICE", 1_000);
         let seen: HashSet<String> = [indexed.clone()].into_iter().collect();
 
         let f = capture_filter(&seen, &q);
@@ -5014,7 +5073,7 @@ mod tests {
             .collect();
         fs::write(f.path(), body).unwrap();
 
-        let (q, released, _) = Quarantine::load(f.path(), now, &none);
+        let (q, released, decided) = Quarantine::load(f.path(), now, &none);
         assert_eq!(
             q.held().count(),
             MAX_QUARANTINE,
@@ -5024,6 +5083,19 @@ mod tests {
             released.len() <= MAX_QUARANTINE,
             "a trimmed entry must not still be handed to the queue"
         );
+        // A trimmed entry is already out of the pending queue, so it must leave
+        // as a DECISION. Dropping it silently puts it in no file at all.
+        assert_eq!(
+            decided.len(),
+            50,
+            "every trimmed locator must be handed back to be marked seen"
+        );
+        for loc in &decided {
+            assert!(
+                !q.held().any(|h| &h == loc),
+                "a decided locator must not also still be held"
+            );
+        }
         for (_, loc, _, _) in &released {
             assert!(
                 q.held().any(|h| &h == loc),
@@ -5036,12 +5108,128 @@ mod tests {
     /// One author must not be able to occupy the whole quarantine, or Pending's
     /// per-author cap is defeated one level down and a single room member owns
     /// the recurring retry budget.
+    /// A locator refused by the author-share cap must leave as a DECISION, never
+    /// as a silent drop. By the time hold() runs, record_failure has already
+    /// removed it from the pending queue, so dropping it puts it in no file at
+    /// all — the exact loss this type exists to remove, one level down.
+    #[test]
+    fn the_author_share_cap_yields_a_victim_instead_of_dropping() {
+        let none: HashSet<String> = HashSet::new();
+        let (mut q, _, _) = Quarantine::load(TmpFile::new("author-victim").path(), 0, &none);
+        let mut victims = Vec::new();
+        for i in 0..MAX_PENDING_PER_AUTHOR + 50 {
+            if let Some(v) = q.hold(
+                &format!("https://s.example/{i}"),
+                "external",
+                "SPAMMER",
+                1_000,
+            ) {
+                victims.push(v);
+            }
+        }
+        assert_eq!(
+            victims.len(),
+            50,
+            "every locator over the share must be handed back to be decided, not \
+             dropped: {} held + {} victims must account for all {} offered",
+            q.held().count(),
+            victims.len(),
+            MAX_PENDING_PER_AUTHOR + 50
+        );
+        let held: HashSet<String> = q.held().collect();
+        let accounted: HashSet<String> = held
+            .union(&victims.iter().cloned().collect())
+            .cloned()
+            .collect();
+        assert_eq!(
+            accounted.len(),
+            MAX_PENDING_PER_AUTHOR + 50,
+            "no locator may be unaccounted for"
+        );
+    }
+
+    /// A curated locator is an explicit operator decision and is exempt from the
+    /// share cap.
+    #[test]
+    fn the_author_share_cap_exempts_curated_locators() {
+        let none: HashSet<String> = HashSet::new();
+        let (mut q, _, _) = Quarantine::load(TmpFile::new("author-curated").path(), 0, &none);
+        for i in 0..MAX_PENDING_PER_AUTHOR + 10 {
+            assert!(
+                q.hold(
+                    &format!("https://c.example/{i}"),
+                    "external",
+                    CURATED_AUTHOR,
+                    1_000
+                )
+                .is_none(),
+                "a curated locator must never be displaced"
+            );
+        }
+        assert_eq!(q.held().count(), MAX_PENDING_PER_AUTHOR + 10);
+    }
+
+    /// A locator already sitting in the queue from an earlier run must NOT burn a
+    /// retry cycle. Nothing was learned about it — it simply has not come up in
+    /// the drain order — and burning one lets a backlogged queue exhaust all four
+    /// cycles without ever re-attempting it, then blacklist it for good.
+    #[test]
+    fn an_undrained_queue_entry_does_not_burn_a_cycle() {
+        let f = TmpFile::new("undrained-q");
+        let none: HashSet<String> = HashSet::new();
+        let now = 1_000_000u64;
+        let loc = "https://queued.example/1".to_string();
+
+        let mut pending = Pending::load(TmpFile::new("undrained-p").path());
+        pending.add(&loc, "external", "ALICE");
+
+        let (mut q, _, _) = Quarantine::load(f.path(), now, &none);
+        let _ = q.hold(&loc, "external", "ALICE", now);
+        assert!(q.save());
+
+        let due = now + QUARANTINE_SECS;
+        let (mut q, released, _) = Quarantine::load(f.path(), due, &none);
+        assert_eq!(released.len(), 1);
+        let (requeued, _) = requeue_released(released, &none, &mut pending, &mut q, due);
+        assert_eq!(requeued, 1, "it is in the queue, so it counts as placed");
+        assert!(q.save());
+
+        let (_, again, _) = Quarantine::load(f.path(), due + REFUSED_RETRY_SECS, &none);
+        assert_eq!(
+            again.len(),
+            1,
+            "it must come back rather than being stuck behind a full cooldown"
+        );
+        assert_eq!(
+            again[0].0, 0,
+            "sitting undrained in the queue is not an attempt, so it must not \
+             consume a retry cycle"
+        );
+    }
+
+    /// A cycle count above the maximum is definitionally corrupt — mark_attempted
+    /// can never write one. It must fail OPEN like every other parse in this
+    /// file, not straight into a permanent blacklist.
+    #[test]
+    fn a_corrupt_cycle_count_does_not_blacklist() {
+        let f = TmpFile::new("quarantine-badcycles");
+        let none: HashSet<String> = HashSet::new();
+        fs::write(f.path(), "0\t99\texternal\tALICE\thttps://a.example/1\n").unwrap();
+        let (q, released, decided) = Quarantine::load(f.path(), 1_785_000_000, &none);
+        assert!(
+            decided.is_empty(),
+            "a corrupt cycle count must not be read as exhausted"
+        );
+        assert_eq!(released.len(), 1, "it must be retried, not given up on");
+        assert_eq!(q.held().count(), 1);
+    }
+
     #[test]
     fn quarantine_bounds_one_authors_share() {
         let none: HashSet<String> = HashSet::new();
         let (mut q, _, _) = Quarantine::load(TmpFile::new("quarantine-author").path(), 0, &none);
         for i in 0..MAX_PENDING_PER_AUTHOR + 50 {
-            q.hold(
+            let _ = q.hold(
                 &format!("https://s.example/{i}"),
                 "external",
                 "SPAMMER",
@@ -5127,12 +5315,14 @@ mod tests {
         let stripped = strip_comments(production);
         assert_eq!(
             stripped.matches("append_seen(").count(),
-            4,
-            "only the decided paths may write to the permanent seen file"
+            5,
+            "only the decided paths may write to the permanent seen file: the \
+             definition, the Ok arm, the gone-for-good arm, the out-of-cycles \
+             loop, and the author-share eviction victim"
         );
         assert_eq!(
             production.matches("append_seen(").count(),
-            4,
+            5,
             "stripping comments must not have hidden a call site"
         );
         assert!(
@@ -5182,10 +5372,21 @@ mod tests {
             branch.contains("quarantine.hold("),
             "a transient give-up must quarantine the locator for a later retry"
         );
+        // THIS locator must not be marked seen. The branch may mark a DIFFERENT
+        // one — `hold` returns a locator displaced by its author's share, which
+        // is already out of the pending queue and so has to leave as a decision
+        // rather than be dropped into no file at all. So the needles name `loc`
+        // specifically rather than banning the call outright.
         assert!(
-            !branch.contains("seen.insert") && !branch.contains("append_seen"),
-            "a transient give-up must NOT be written to the permanent seen file — \
-             it is never re-read for retry, so that loses the site for good"
+            !branch.contains("append_seen(seen_path, &loc)") && !branch.contains("seen.insert(loc"),
+            "a transient give-up must NOT write ITS OWN locator to the permanent \
+             seen file — it is never re-read for retry, so that loses the site \
+             for good"
+        );
+        assert!(
+            branch.contains("append_seen(seen_path, &victim)"),
+            "a locator displaced by the author-share cap must leave as a decision; \
+             dropping it silently puts it in no file at all"
         );
 
         // The give-up branch is the TRANSIENT catch-all of the
@@ -5352,7 +5553,7 @@ mod tests {
         let none: HashSet<String> = HashSet::new();
         let (mut q, released, _) = Quarantine::load(&bad, 1_785_000_000, &none);
         assert!(released.is_empty(), "an unreadable file releases nothing");
-        q.hold("https://a.example/1", "external", "ALICE", 1_785_000_000);
+        let _ = q.hold("https://a.example/1", "external", "ALICE", 1_785_000_000);
         assert!(
             !q.save(),
             "a failed write must be reported, not swallowed as a warning"
