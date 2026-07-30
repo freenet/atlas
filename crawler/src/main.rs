@@ -416,6 +416,14 @@ const CURATED_AUTHOR: &str = "@curated";
 /// A locator queued for description: `(locator, kind, author)`.
 type QueuedLocator = (String, &'static str, String);
 
+/// A locator released from quarantine: `(quarantined_at, locator, kind, author)`.
+///
+/// The original timestamp rides along because a release that cannot be placed in
+/// the queue has to be put BACK at the same timestamp. Re-holding it at `now`
+/// would silently push its retry out by another full cooldown every time the
+/// queue happened to be full.
+type ReleasedLocator = (u64, String, &'static str, String);
+
 #[derive(Clone)]
 struct PendingEntry {
     kind: &'static str,
@@ -860,14 +868,14 @@ struct Quarantine {
 impl Quarantine {
     /// Load the file and split it at the cooldown boundary. Released entries are
     /// returned for re-queueing and dropped from the file.
-    fn load(path: &Path, now: u64) -> (Self, Vec<QueuedLocator>) {
+    fn load(path: &Path, now: u64) -> (Self, Vec<ReleasedLocator>) {
         let mut q = Self {
             path: path.to_path_buf(),
             held: HashSet::new(),
             entries: Vec::new(),
             dirty: false,
         };
-        let mut released: Vec<QueuedLocator> = Vec::new();
+        let mut released: Vec<ReleasedLocator> = Vec::new();
         let Ok(body) = fs::read_to_string(path) else {
             return (q, released);
         };
@@ -900,7 +908,7 @@ impl Quarantine {
             // this type exists to fix.
             let at: u64 = ts.trim().parse().unwrap_or(0);
             if now.saturating_sub(at) >= QUARANTINE_SECS {
-                released.push((canon, kind, author.to_string()));
+                released.push((at, canon, kind, author.to_string()));
                 q.dirty = true;
             } else if q.held.insert(canon.clone()) {
                 q.entries.push((at, canon, kind, author.to_string()));
@@ -1106,13 +1114,32 @@ fn run_once(
     // that carried the link may be gone by now.
     let (mut quarantine, released) = Quarantine::load(quarantine_path, now_secs());
     let mut requeued = 0usize;
-    for (loc, kind, author) in released {
-        if !seen.contains(&loc) && pending.add(&loc, kind, &author) {
-            requeued += 1;
+    let mut held_back = 0usize;
+    for (at, loc, kind, author) in released {
+        // Already decided about: drop it, the release was a no-op.
+        if seen.contains(&loc) {
+            continue;
         }
+        if pending.add(&loc, kind, &author) {
+            requeued += 1;
+        } else if !pending.contains(&loc) {
+            // The queue REFUSED it (author cap, or full and nothing evictable).
+            // It has already been dropped from the quarantine file, so leaving it
+            // here would lose the locator entirely — the exact failure this type
+            // exists to prevent, reintroduced through the release path. Put it
+            // back, at its ORIGINAL timestamp so it is retried on the next run
+            // rather than waiting out another cooldown.
+            quarantine.hold(&loc, kind, &author, at);
+            held_back += 1;
+        }
+        // add() also returns false when the locator is ALREADY queued, which is
+        // not a loss — that is the `pending.contains` arm above.
     }
     if requeued > 0 {
         eprintln!("released {requeued} locator(s) from quarantine for retry");
+    }
+    if held_back > 0 {
+        eprintln!("warn: {held_back} released locator(s) did not fit the queue — kept quarantined");
     }
     // Discovery must not immediately re-queue what phase 2 just gave up on, so
     // capture is filtered against seen AND the still-held quarantine. `seen`
@@ -4446,11 +4473,13 @@ mod tests {
         assert_eq!(
             released,
             vec![(
+                at,
                 "https://flaky.example/1".to_string(),
                 "external",
                 "ALICE".to_string()
             )],
-            "kind and author must round-trip so a room link can be re-queued"
+            "timestamp, kind and author must round-trip so a room link can be \
+             re-queued and, if the queue is full, re-held without losing its place"
         );
         assert_eq!(
             q.held().count(),
@@ -4480,6 +4509,105 @@ mod tests {
 
         let (_, released) = Quarantine::load(q_file.path(), at + QUARANTINE_SECS);
         assert_eq!(released.len(), 1, "it must come back for a retry later");
+    }
+
+    /// A release the queue cannot accept must go BACK into quarantine, not
+    /// vanish. It has already been dropped from the quarantine file by the time
+    /// the caller tries to place it, so "refused by the queue" would otherwise
+    /// lose the locator from BOTH files — the exact loss this type exists to
+    /// prevent, reintroduced through the release path.
+    ///
+    /// This pins the loop in `run_once` by reproducing it, because that function
+    /// needs a node and an LLM to call. The mechanism it depends on —
+    /// `Pending::add` returning false on a full author bucket — is real, not
+    /// mocked.
+    #[test]
+    fn a_release_the_queue_refuses_is_kept_quarantined() {
+        let q_file = TmpFile::new("release-refused-q");
+        let at = 2_000_000_000u64;
+        let loc = "https://refused.example/1".to_string();
+
+        {
+            let (mut q, _) = Quarantine::load(q_file.path(), at);
+            q.hold(&loc, "external", "ALICE", at);
+            q.save();
+        }
+
+        // Fill ALICE's bucket so the release cannot be placed.
+        let mut pending = Pending::load(TmpFile::new("release-refused-p").path());
+        for i in 0..MAX_PENDING_PER_AUTHOR {
+            pending.add(&format!("https://filler.example/{i}"), "external", "ALICE");
+        }
+
+        let (mut q, released) = Quarantine::load(q_file.path(), at + QUARANTINE_SECS);
+        assert_eq!(released.len(), 1, "the hold has expired, so it is released");
+        let seen: HashSet<String> = HashSet::new();
+        for (orig_at, loc, kind, author) in released {
+            if seen.contains(&loc) {
+                continue;
+            }
+            if !pending.add(&loc, kind, &author) && !pending.contains(&loc) {
+                q.hold(&loc, kind, &author, orig_at);
+            }
+        }
+        assert!(
+            !pending.contains(&loc),
+            "test premise: the full bucket must actually refuse it"
+        );
+        q.save();
+
+        // It must still be quarantined, at its ORIGINAL timestamp so the next run
+        // releases it again rather than restarting the 7-day cooldown.
+        let (_, again) = Quarantine::load(q_file.path(), at + QUARANTINE_SECS);
+        assert_eq!(
+            again.len(),
+            1,
+            "a refused release must be kept, not lost from both files"
+        );
+        assert_eq!(again[0].0, at, "it must keep its original timestamp");
+    }
+
+    /// The companion pin to the test above. That test reproduces `run_once`'s
+    /// release loop; this one asserts the REAL loop still does the thing, so the
+    /// two cannot drift apart silently.
+    #[test]
+    fn the_release_loop_puts_back_what_the_queue_refuses() {
+        let src = include_str!("main.rs");
+        let production = src
+            .split("\nmod tests")
+            .next()
+            .expect("source must have a pre-test region");
+        let anchor = "for (at, loc, kind, author) in released {";
+        let at = production
+            .find(anchor)
+            .expect("the quarantine release loop must still exist");
+        let body_start = at + anchor.len() - 1;
+        let mut depth = 0usize;
+        let mut end = body_start;
+        for (i, c) in production[body_start..].char_indices() {
+            match c {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        end = body_start + i + 1;
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        let loop_body = &production[body_start..end];
+        assert!(
+            loop_body.contains("quarantine.hold("),
+            "a released locator the queue refuses must be put BACK in quarantine, \
+             or it is lost from both files"
+        );
+        assert!(
+            loop_body.contains("pending.contains("),
+            "the re-hold must be skipped when add() returned false merely because \
+             the locator was ALREADY queued, or it would be double-tracked"
+        );
     }
 
     /// THE regression pin. The bug was never in `Quarantine` itself — it was in
