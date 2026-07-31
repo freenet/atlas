@@ -869,6 +869,18 @@ const MAX_CONSECUTIVE_DEFERS: u32 = 24;
 
 /// Upper bound on the quarantine file, so a pathological source cannot grow it
 /// without limit.
+///
+/// This number is load-bearing for more than file size. The global trim picks
+/// victims by furthest-due across ALL authors, so reaching it lets one source
+/// retire another's most-cycled entries. At 5 000, with the per-author cap at
+/// 200, getting there deliberately costs ~15 000 billed attempts across ~25
+/// identities — about 75 days at `--daily-max 200` — to accelerate a decision
+/// that was already three-quarters made, so it is not worth an attacker's time.
+/// The realistic route to the trim firing at all is a large curated sources
+/// file, since `CURATED_AUTHOR` is exempt from the per-author cap.
+///
+/// If this is ever lowered substantially, or `MAX_PENDING_PER_AUTHOR` raised,
+/// that cross-author reasoning no longer holds and deserves a fresh look.
 const MAX_QUARANTINE: usize = 5_000;
 
 /// Why a locator left the quarantine for good.
@@ -1242,6 +1254,13 @@ impl Quarantine {
     /// walk a perfectly good locator through all four cycles and blacklist it
     /// without a single re-attempt — which is what the refusal branch's own
     /// comment says must not happen, just more slowly.
+    /// Known tradeoff: this parks the entry at the SOONEST-due end, which is the
+    /// end both the author-share eviction and the global trim protect. So a
+    /// safely-queued locator that needs no protection outranks one genuinely
+    /// waiting out a backoff. Mild, and far better than the alternative it
+    /// replaced (blacklisting it outright) — but if victim selection is ever
+    /// revisited, preferring undrained entries as victims is free: their locator
+    /// is in `pending` regardless, so only the cycle count is lost.
     fn defer_undrained(&mut self, loc: &str, now: u64) {
         if let Some(e) = self.entries.get_mut(loc) {
             e.due_at = now.saturating_add(REFUSED_RETRY_SECS);
