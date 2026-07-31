@@ -3339,16 +3339,29 @@ impl AppRegistryView {
         let mut all_named_containers = HashSet::new();
         if let Some(map) = parsed["apps"].as_object() {
             for (slug, rec) in map {
-                let (Some(contract_id), Some(template)) =
-                    (rec["contract_id"].as_str(), rec["link_template"].as_str())
-                else {
+                // `contract_id` alone is recorded even when `link_template` is
+                // missing or unparseable, and BEFORE the template is even looked
+                // at: `atlasctl apps --json` verifies every entry against
+                // `AppRecord::check` before printing (which requires a non-empty
+                // template), so this arm is not reachable from today's producer
+                // — but the field's whole point is to name every container the
+                // registry mentions no matter how it fails to parse further, and
+                // silently exempting "no template at all" from that would leave
+                // exactly the gap a future producer (or a hand-edited registry)
+                // could fall into.
+                let Some(contract_id) = rec["contract_id"].as_str() else {
                     continue;
                 };
-                // Recorded even if the entry is dropped below: an app whose
-                // template this crawler cannot reverse is still a REAL,
-                // on-chain-valid registered app (see the field's own doc), so its
-                // container must never look "unregistered" to the collapse gate.
                 all_named_containers.insert(contract_id.to_string());
+                let Some(template) = rec["link_template"].as_str() else {
+                    continue;
+                };
+                // The container is already recorded above regardless of what
+                // happens from here — an app whose template this crawler cannot
+                // reverse is still a REAL, on-chain-valid registered app (see the
+                // field's own doc), so it must never look "unregistered" to the
+                // collapse gate just because ITS OWN template defeated us.
+                //
                 // Derive the recognizer from the TEMPLATE rather than hard-coding
                 // one per app: the literal text before `{resource}` is exactly what
                 // a URL for that app has between the contract id and the handle.
@@ -3607,14 +3620,16 @@ fn map_or_collapse(loc: String, registry: &AppRegistryView) -> String {
 /// hiccups.
 ///
 /// Does NOT fold the `""` / `"/"` bare-root alias `contract_web_href` treats as
-/// one page: an ALREADY-indexed site stored under the bare form (a real,
-/// reachable shape — `normalize_href` and `scan_urls` both produce it) would
-/// get rediscovered as the `/` form, miss the crawler's own `seen` check, and
-/// be described and added a second time — `dedup_key` (unchanged) treats
-/// `freenet:<id>` and `freenet:<id>/` as different URIs, so nothing downstream
-/// would catch it either. Worth doing, but as its own change with its own
-/// safety net, not folded into the fix for a bug that never involved this
-/// aliasing in the first place.
+/// one page. The fragment collapse above pays the identical cost — an
+/// ALREADY-indexed site stored under a fragment form gets rediscovered as the
+/// bare-root form the SAME way, misses `seen`, and is described and added a
+/// second time, because `dedup_key` (unchanged) treats every distinct URI as a
+/// distinct entry regardless of which normalisation produced it. That cost is
+/// accepted above because it buys fixing the reported live bug: five entries
+/// collapsing to one. Folding `""` into `"/"` too would pay the SAME one-time
+/// cost for a site that was never reported broken (no locator in the reported
+/// shape used the bare form), so it stays out until it is fixing something
+/// concrete rather than something merely inconsistent.
 fn collapse_unmapped_fragment(loc: String, registry: &AppRegistryView) -> String {
     if registry.all_named_containers.is_empty() {
         return loc;
@@ -5159,6 +5174,30 @@ mod tests {
             a, b,
             "with no registry loaded, nothing may be collapsed — not even a \
              contract that WOULD be Delta's, once the registry is back"
+        );
+    }
+
+    /// The empty gate reads `all_named_containers`, not `apps` — and the two can
+    /// genuinely differ: EVERY app in a real registry could fail this crawler's
+    /// reversal (leaving `apps` empty) while the registry itself loaded fine and
+    /// named real containers (leaving `all_named_containers` non-empty). Reading
+    /// the wrong field here would switch collapsing off for every OTHER,
+    /// unrelated unregistered contract in that state — not the catastrophic
+    /// collapse B-2 was about, but a silent feature outage nothing would notice,
+    /// on a state this test constructs precisely so it cannot go unpinned.
+    #[test]
+    fn map_or_collapse_still_works_when_apps_is_empty_but_the_registry_is_not() {
+        let reg = AppRegistryView {
+            apps: Vec::new(),
+            all_named_containers: [DELTA.to_string()].into_iter().collect(),
+        };
+        const OTHER: &str = "9S7AAZqHC4ZW5V3nhauhDXg1dhtZzBUKBizJwa67E7YF";
+        let a = map_or_collapse(format!("freenet:{OTHER}/#/site-a"), &reg);
+        let b = map_or_collapse(format!("freenet:{OTHER}/#/site-b"), &reg);
+        assert_eq!(
+            a, b,
+            "an unrelated unregistered contract must still collapse; a registry \
+             with zero REVERSIBLE apps is not the same as zero NAMED containers"
         );
     }
 
