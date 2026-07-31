@@ -5048,6 +5048,33 @@ mod tests {
         );
     }
 
+    /// The detection gap review flagged as the highest-value fix in this
+    /// module: `fetch_room_state` cannot itself distinguish "resolved via the
+    /// current generation" from "silently fell through to an abandoned one",
+    /// because both look identical to it — a live, owner-signed room either
+    /// way. The caller has to check `resolved_idx` and say something. Source-
+    /// scraped because there is no network-mocked test harness in this file
+    /// for `crawl_river_room` to exercise the real branch through.
+    #[test]
+    fn a_non_current_generation_resolving_is_logged_loudly() {
+        let src = include_str!("main.rs");
+        let production = src
+            .split("\nmod tests")
+            .next()
+            .expect("source must have a pre-test region");
+        assert!(
+            !production.contains("fn a_non_current_generation_resolving_is_logged"),
+            "the scan region must exclude the test module, or the pin matches itself"
+        );
+        let production = strip_comments(production);
+        assert!(
+            production.contains("if resolved_idx != 0 {") && production.contains("WARNING"),
+            "crawl_river_room must warn when the resolved candidate is not the \
+             current generation, or a stale bundled WASM goes back to looking \
+             identical to a healthy run"
+        );
+    }
+
     #[test]
     fn parse_owner_vk_rejects_garbage() {
         assert!(parse_owner_vk("not base58 !!!").is_err());
@@ -6878,6 +6905,7 @@ mod tests {
             "fn room_key_derivation_matches_the_live_network",
             "fn the_bundled_wasm_looks_like_a_wasm_module",
             "fn room_candidate_keys_tries_current_generation_first",
+            "fn a_non_current_generation_resolving_is_logged_loudly",
             "fn the_probe_handle_is_fresh_every_run",
             "fn a_too_short_probe_result_is_not_a_usable_baseline",
             "fn a_truncated_walk_is_refused_rather_than_decided",
