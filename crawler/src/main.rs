@@ -2637,6 +2637,21 @@ fn normalise_text(t: &str) -> String {
     t.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
+/// Is this probe result worth storing as a baseline?
+///
+/// Non-empty is NOT the test, which is what it used to be. When the render fails,
+/// `get_page` falls back to a static fetch of the app shell, whose visible text is
+/// the five characters "Delta" — non-empty, so it was stored and logged as a
+/// successful capture, leaving the guard unable to match anything from behind a
+/// reassuring message. Any placeholder worth catching is by definition describable,
+/// so hold the baseline to the same floor a real page has to clear.
+///
+/// Split out so this is a decision a test can make directly, rather than one buried
+/// behind a network fetch and reachable only by scraping the source.
+fn baseline_is_usable(text: &str) -> bool {
+    text.chars().count() >= MIN_DESCRIBABLE_CHARS
+}
+
 impl AppBaselines {
     /// True if `text` is what this app shows for a resource that does not exist, i.e.
     /// the page is not really about the resource we asked for.
@@ -2662,7 +2677,7 @@ impl AppBaselines {
             let baseline = get_page(cli, client, gw, &probe, registry)
                 .ok()
                 .map(|p| normalise_text(&p.text))
-                .filter(|t| t.chars().count() >= MIN_DESCRIBABLE_CHARS);
+                .filter(|t| baseline_is_usable(t));
             match &baseline {
                 // The opening text, not just the length. A length alone cannot
                 // distinguish the app's fallback CONTENT from its chrome, and
@@ -5573,6 +5588,35 @@ mod tests {
         }
     }
 
+    /// A baseline that is merely non-empty is not a baseline.
+    ///
+    /// The static-fetch fallback yields the app shell's five-character visible text,
+    /// "Delta". Stored, it becomes a baseline no real page can ever equal, and the
+    /// run logs a successful capture — the guard off, invisibly. That is the second
+    /// time this guard has been silently inert, so the threshold is a decision with
+    /// a test rather than a filter with a comment.
+    #[test]
+    fn a_too_short_probe_result_is_not_a_usable_baseline() {
+        assert!(
+            !baseline_is_usable("Delta"),
+            "the app shell's static-fetch text must not be stored as a baseline"
+        );
+        assert!(
+            !baseline_is_usable(""),
+            "and neither must an empty probe result"
+        );
+        let real = "x".repeat(MIN_DESCRIBABLE_CHARS);
+        assert!(
+            baseline_is_usable(&real),
+            "a probe result that clears the describable floor IS usable, or the \
+             guard can never arm at all"
+        );
+        assert!(
+            !baseline_is_usable(&"x".repeat(MIN_DESCRIBABLE_CHARS - 1)),
+            "bound is two-sided: one character under the floor must be refused"
+        );
+    }
+
     /// The probe must go through the SAME validation a real locator does.
     ///
     /// If `app_of` rejects the generated handle, `resolve_for_fetch` never runs, the
@@ -6706,6 +6750,7 @@ mod tests {
         let src = include_str!("main.rs");
         for pin in [
             "fn the_probe_handle_is_fresh_every_run",
+            "fn a_too_short_probe_result_is_not_a_usable_baseline",
             "fn a_truncated_walk_is_refused_rather_than_decided",
             "fn the_give_up_branch_quarantines_and_does_not_blacklist",
             "fn strip_comments",
