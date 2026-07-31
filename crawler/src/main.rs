@@ -1923,6 +1923,9 @@ struct Page {
     /// pages that turn out to serve another site's content, so they are NOT index
     /// -aligned thereafter. Nothing may zip them.
     extra_texts: Vec<String>,
+    /// The walk STOPPED EARLY rather than running out of pages: the wall clock ran
+    /// out, or a step failed. What was captured is an arbitrary prefix of the site.
+    truncated: bool,
 }
 
 impl Page {
@@ -1995,6 +1998,11 @@ fn index_locator(
         .as_ref()
         .map(|(_, resource)| (resource.as_str(), cli.app_max_pages));
     let mut page = get_page_enumerating(cli, client, gw, loc, registry, enumerate)?;
+    // A prefix of a site is not the site. Refuse rather than decide permanently on
+    // it — see `TruncatedWalk`.
+    if page.truncated {
+        return Err(TruncatedWalk.into());
+    }
     // Before spending anything: is this actually a page about the resource we asked
     // for, or the app's fallback content for a resource it could not load? The latter
     // reads as a perfectly good page, so this has to be checked explicitly.
@@ -2240,6 +2248,7 @@ fn get_page_enumerating(
             text,
             extra_pages: Vec::new(),
             extra_texts: Vec::new(),
+            truncated: false,
         })
     } else {
         ssrf_check(loc)?;
@@ -2250,6 +2259,7 @@ fn get_page_enumerating(
             text,
             extra_pages: Vec::new(),
             extra_texts: Vec::new(),
+            truncated: false,
         })
     }
 }
@@ -2369,6 +2379,7 @@ fn render_page(
                 .unzip()
         })
         .unwrap_or_default();
+    let truncated = v["partial"].as_bool().unwrap_or(false);
     if !extra_pages.is_empty() {
         eprintln!("  enumerated {} additional page(s)", extra_pages.len());
     }
@@ -2377,6 +2388,7 @@ fn render_page(
         text,
         extra_pages,
         extra_texts,
+        truncated,
     })
 }
 
@@ -2458,9 +2470,36 @@ fn is_unresolvable_app(e: &anyhow::Error) -> bool {
 /// charging it an attempt would eventually blacklist a page for good.
 fn is_deterministic_refusal(e: &anyhow::Error) -> bool {
     e.chain().any(|c| {
-        c.downcast_ref::<TooThin>().is_some() || c.downcast_ref::<PlaceholderPage>().is_some()
+        c.downcast_ref::<TooThin>().is_some()
+            || c.downcast_ref::<PlaceholderPage>().is_some()
+            || c.downcast_ref::<TruncatedWalk>().is_some()
     })
 }
+
+/// "The walk of this site stopped early, so what we have is an arbitrary prefix."
+///
+/// Indexing decides two things permanently: the description, and the content-safety
+/// rating — and the locator is written to the seen file either way, so nothing ever
+/// revisits it. Deciding those from however many pages fit before the clock ran out
+/// makes the verdict a race on gateway latency: the same site rates `ok` on a fast
+/// run and could rate otherwise on a slow one, with whichever ran first standing
+/// forever. Refusing is the honest option — the locator stays queued, burns no
+/// retry, and says why in the log, so a site that can never be walked in time is a
+/// visible condition rather than a coin flip already spent.
+#[derive(Debug)]
+struct TruncatedWalk;
+
+impl std::fmt::Display for TruncatedWalk {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "the walk of this site stopped early, so its description and safety \
+             rating would be decided from an arbitrary prefix of it"
+        )
+    }
+}
+
+impl std::error::Error for TruncatedWalk {}
 
 /// Per-run cache of what each app renders for a resource that DOES NOT EXIST.
 ///
@@ -5167,6 +5206,7 @@ mod tests {
             text: stub.clone(),
             extra_pages: vec!["<html/>".into(), "<html/>".into()],
             extra_texts: vec![real.clone(), third.clone()],
+            truncated: false,
         };
         let body = page.describable_text();
         // The EXACT joined string, not two `contains` calls. `contains` is order-
@@ -5209,6 +5249,7 @@ mod tests {
             extra_pages: vec!["<html/>".into()],
             // Same text, re-rendered: whitespace differs, substance does not.
             extra_texts: vec![stub.replace(' ', "\n")],
+            truncated: false,
         };
         assert_eq!(
             page.describable_text(),
@@ -5231,6 +5272,7 @@ mod tests {
             text: "just the one page".into(),
             extra_pages: Vec::new(),
             extra_texts: Vec::new(),
+            truncated: false,
         };
         assert_eq!(page.describable_text(), "just the one page");
 
@@ -5241,6 +5283,7 @@ mod tests {
             text: "short".into(),
             extra_pages: vec!["<html/>".into(), "<html/>".into()],
             extra_texts: vec!["   ".into(), String::new()],
+            truncated: false,
         };
         // NOT `.trim()`ed: trimming the result would consume the very artifact
         // this asserts the absence of, so the filter could be deleted with the
@@ -5320,6 +5363,41 @@ mod tests {
         );
     }
 
+    /// A walk that stopped early must not decide anything permanently.
+    ///
+    /// Indexing writes the locator to the seen file whether it publishes or refuses
+    /// on safety grounds, and nothing revisits it, so deciding from however many
+    /// pages fit before the clock ran out makes the verdict a race on gateway
+    /// latency. It has to route to the refusal class that leaves the locator queued
+    /// and burns no retry — an ordinary error would spend one of three attempts and
+    /// eventually quarantine a site whose only fault is being slow to walk.
+    #[test]
+    fn a_truncated_walk_is_refused_rather_than_decided() {
+        assert!(
+            is_deterministic_refusal(&TruncatedWalk.into()),
+            "a truncated walk must leave the locator queued with no retry burned"
+        );
+        let src = include_str!("main.rs");
+        let production = src
+            .split("\nmod tests")
+            .next()
+            .expect("source must have a pre-test region");
+        assert!(
+            !production.contains("fn a_truncated_walk_is_refused"),
+            "the scan region must exclude the test module, or the pin matches itself"
+        );
+        let production = strip_comments(production);
+        assert!(
+            production.contains("if page.truncated {") && production.contains("TruncatedWalk"),
+            "the describe path must check the flag; parsing it and ignoring it is \
+             the state this replaced"
+        );
+        assert!(
+            production.contains(r#"v["partial"].as_bool()"#),
+            "and the flag must actually be read off the renderer's output"
+        );
+    }
+
     /// The renderer half of the same fix, which no Rust test can otherwise reach.
     ///
     /// `extra_texts` is populated from exactly one line of JavaScript. Delete it and
@@ -5347,6 +5425,24 @@ mod tests {
             js.contains("got.text = await contentText(f2)"),
             "each enumerated page must capture its CONTENT-REGION text; stripping \
              its HTML instead would feed the app's chrome to the describer"
+        );
+        // Landing back on the entry page must SKIP, not stop. The entry is whatever
+        // the sources file named, so a walk starting at #res/3 meets its own entry
+        // on step 3 — stopping there loses every page after it.
+        assert!(
+            js.contains("if (got.hash === entryHash)") && js.contains("continue;"),
+            "revisiting the entry page must skip it, not end the walk"
+        );
+        // An early stop must be reported. Unreported, the caller cannot tell a
+        // complete walk from a prefix, and decides permanently on whichever it got.
+        assert!(
+            js.contains("truncated = true;") && js.contains("partial: truncated"),
+            "a walk that stops early must say so in its output"
+        );
+        assert!(
+            js.contains("const stopBy = startedAt + WATCHDOG_MS - ENUM_RESERVE_MS;"),
+            "the walk deadline must share the watchdog's origin, or the reserve \
+             grants itself a fresh budget and stops bounding anything"
         );
     }
 
@@ -6390,6 +6486,7 @@ mod tests {
     fn the_source_pins_are_all_present() {
         let src = include_str!("main.rs");
         for pin in [
+            "fn a_truncated_walk_is_refused_rather_than_decided",
             "fn the_give_up_branch_quarantines_and_does_not_blacklist",
             "fn strip_comments",
             "fn the_indexing_path_enumerates_an_app_resource",
