@@ -158,12 +158,39 @@ impl Locator {
     ///
     /// For [`Locator::AppResource`] this deliberately DROPS `path`, so links to
     /// two different pages of one Delta site collapse to a single subject rather
-    /// than becoming two listings. For the other variants it is the full URI,
-    /// preserving existing behaviour (two paths under one web contract stay
-    /// distinct, which is right when the contract is the publisher).
+    /// than becoming two listings.
+    ///
+    /// For [`Locator::Freenet`] it is `contract_id` plus the path UP TO the first
+    /// `#`, dropping the fragment. Two DIFFERENT paths still stay distinct — the
+    /// contract is the publisher, so `/posts/hello` and `/posts/goodbye` are two
+    /// things — but a fragment on a Freenet locator is never a second path: the
+    /// node has no server-side routing, so anything after `#` is by construction
+    /// client-side navigation within whatever the bare path already served, the
+    /// same distinction `normalize_href` already draws when it says a `#` here
+    /// "is the app's own client-side ROUTE, not a document anchor". An
+    /// unregistered single-page app that routes by fragment (an image board
+    /// whose board and thread views are all `#/b/...` under one root) produced
+    /// one index listing per fragment before this — five for one Calliope
+    /// board, each named after whatever board or thread happened to be loaded,
+    /// none referencing each other. Collapsing them here is the same fix
+    /// `AppResource` already applies for a REGISTERED multi-page app; this
+    /// covers everything else without requiring registration. A genuinely
+    /// multi-tenant unregistered site that also happened to key different
+    /// OWNERS' content by fragment would collapse too — that shape needs the app
+    /// registry, exactly as Delta's did, not a fragment-preserving carve-out
+    /// here.
+    ///
+    /// For [`Locator::External`] it stays the full URI, unchanged: no evidence
+    /// yet that web fragments need the same treatment, and speculatively
+    /// widening this to arbitrary `https://` URLs risks collapsing genuinely
+    /// distinct pages on ordinary sites that use `#` as a real document anchor.
     pub fn dedup_key(&self) -> String {
         match self {
             Locator::AppResource { app, resource, .. } => format!("app:{app}/{resource}"),
+            Locator::Freenet { contract_id, path } => {
+                let server_path = path.split('#').next().unwrap_or(path);
+                format!("freenet:{contract_id}{server_path}")
+            }
             other => other.to_uri(),
         }
     }
@@ -748,6 +775,77 @@ mod tests {
             path: "/b".to_string(),
         };
         assert_ne!(a.dedup_key(), b.dedup_key());
+    }
+
+    fn freenet_loc(path: &str) -> Locator {
+        Locator::Freenet {
+            contract_id: ID.to_string(),
+            path: path.to_string(),
+        }
+    }
+
+    /// The exact shape reported live: five index entries for one Calliope
+    /// board — the bare root, `#/share`, `#/b/general`, and two different
+    /// `#/b/general/t/<id>` thread pages — all under one contract with an
+    /// empty server path. All five must collapse to one dedup key.
+    #[test]
+    fn dedup_key_collapses_fragment_routed_pages_of_one_freenet_site() {
+        let root = freenet_loc("/");
+        let share = freenet_loc("/#/share");
+        let general = freenet_loc("/#/b/general");
+        let thread_a = freenet_loc("/#/b/general/t/3zusJJow77inBg8Grh1C8fjxA69ZSknwgXXmhSfTiAz6");
+        let thread_b = freenet_loc("/#/b/general/t/CCcVLnGCX3ahZocrJRadgBt8f2V7YSpqJ3YxMgP32Y7n");
+        for other in [&share, &general, &thread_a, &thread_b] {
+            assert_eq!(
+                root.dedup_key(),
+                other.dedup_key(),
+                "fragment-only variation of the same path must collapse: {other:?}"
+            );
+        }
+    }
+
+    /// The fragment is what gets dropped, not the whole path: two documents at
+    /// genuinely different paths stay distinct even when both carry a fragment,
+    /// and even when the fragments happen to be identical strings.
+    #[test]
+    fn dedup_key_still_separates_different_paths_that_both_carry_a_fragment() {
+        let ch1 = freenet_loc("/docs/chapter1#intro");
+        let ch2 = freenet_loc("/docs/chapter2#intro");
+        assert_ne!(
+            ch1.dedup_key(),
+            ch2.dedup_key(),
+            "different paths must stay distinct regardless of a shared fragment"
+        );
+        // Same path, different fragment — this IS the collapsing case, same
+        // reasoning as the thread-page test above.
+        let ch1_other_frag = freenet_loc("/docs/chapter1#outro");
+        assert_eq!(ch1.dedup_key(), ch1_other_frag.dedup_key());
+    }
+
+    /// Two different sites (contract ids) must never collapse just because
+    /// their fragments or paths happen to match.
+    #[test]
+    fn dedup_key_never_collapses_across_different_contracts() {
+        let a = freenet_loc("/#/b/general");
+        let b = Locator::Freenet {
+            contract_id: "9S7AAZqHC4ZW5V3nhauhDXg1dhtZzBUKBizJwa67E7YF".to_string(),
+            path: "/#/b/general".to_string(),
+        };
+        assert_ne!(a.dedup_key(), b.dedup_key());
+    }
+
+    /// `dedup_key` narrows identity; `to_uri` (what actually gets fetched and
+    /// rendered) must still carry the full path AND fragment untouched, or two
+    /// collapsed entries would be indistinguishable from EACH OTHER once
+    /// resolved, rather than merely refusing a second listing.
+    #[test]
+    fn dedup_key_change_does_not_touch_to_uri() {
+        let general = freenet_loc("/#/b/general");
+        assert_eq!(
+            general.to_uri(),
+            format!("freenet:{ID}/#/b/general"),
+            "to_uri must still round-trip the fragment; only dedup_key ignores it"
+        );
     }
 
     #[test]
