@@ -2353,14 +2353,22 @@ fn render_page(
     }
     let html = v["html"].as_str().unwrap_or("").to_string();
     let text = v["text"].as_str().unwrap_or("").to_string();
-    // Fall back to stripping the rendered HTML if the browser gave no innerText —
-    // but NOT for an app, where empty means the content region was absent and the
-    // whole frame IS the chrome. Stripping it there defeated `--require-content`
-    // entirely: the guard returned '' exactly as designed and this handed the
-    // describer the app shell anyway, which is how a sidebar listing every visited
-    // site became a site's description. Empty text leaves the locator under the
-    // describable floor, which defers it for free and burns no retry.
-    let text = if text.trim().is_empty() && !require_content {
+    // Fall back to stripping the rendered HTML if the browser gave no innerText.
+    //
+    // This DOES weaken `--require-content` for the entry page: the guard returns ''
+    // for an app shell exactly as designed, and then this hands the describer the
+    // stripped frame, chrome included. Suppressing it here looks obviously right and
+    // is not, because one caller depends on the fallback — the missing-resource
+    // BASELINE probe. Delta's missing-resource page has no content region, so under
+    // the strict guard it yields nothing, and `AppBaselines` stores `None` and stops
+    // detecting placeholders for the whole run. Suppressing this took the live
+    // baseline from 801 characters to none and silently disabled the #15 guard, so
+    // the fallback stays until the baseline is captured some other way. The floor is
+    // what keeps chrome out of the index in the meantime: an app shell strips to far
+    // less than `MIN_DESCRIBABLE_CHARS`.
+    //
+    // Do NOT re-suppress this without giving the baseline probe its own path.
+    let text = if text.trim().is_empty() {
         visible_text(&html)
     } else {
         text
@@ -5406,6 +5414,40 @@ mod tests {
         );
     }
 
+    /// The missing-resource baseline depends on the stripped-HTML fallback.
+    ///
+    /// The placeholder guard is only armed if the baseline probe captured text, and
+    /// the app whose fallback content motivated that guard renders its
+    /// missing-resource page with no content region at all. So under the strict
+    /// content guard the probe yields nothing, `AppBaselines` caches `None`, and
+    /// `is_placeholder` returns false for everything for the rest of the run —
+    /// the guard is off, and the only sign is one line of log.
+    ///
+    /// This is pinned because suppressing that fallback looks obviously correct in
+    /// isolation: it genuinely does stop `--require-content` from being defeated for
+    /// the entry page. Doing it took the live baseline from 801 characters to none,
+    /// with every test green.
+    #[test]
+    fn the_baseline_probe_still_has_a_fallback_to_capture() {
+        let src = include_str!("main.rs");
+        let production = src
+            .split("\nmod tests")
+            .next()
+            .expect("source must have a pre-test region");
+        assert!(
+            !production.contains("fn the_baseline_probe_still_has"),
+            "the scan region must exclude the test module, or the pin matches itself"
+        );
+        let production = strip_comments(production);
+        assert!(
+            production
+                .contains("let text = if text.trim().is_empty() {\n        visible_text(&html)"),
+            "the empty-innerText fallback must stay UNCONDITIONAL: gating it on \
+             require_content leaves the missing-resource baseline empty, which \
+             disarms placeholder detection for the whole run"
+        );
+    }
+
     /// The renderer half of the same fix, which no Rust test can otherwise reach.
     ///
     /// `extra_texts` is populated from exactly one line of JavaScript. Delete it and
@@ -6508,6 +6550,7 @@ mod tests {
     fn the_source_pins_are_all_present() {
         let src = include_str!("main.rs");
         for pin in [
+            "fn the_baseline_probe_still_has_a_fallback_to_capture",
             "fn a_truncated_walk_is_refused_rather_than_decided",
             "fn the_give_up_branch_quarantines_and_does_not_blacklist",
             "fn strip_comments",
