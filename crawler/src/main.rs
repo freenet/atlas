@@ -2895,25 +2895,41 @@ fn crawl_hub(
 /// The current River room-contract WASM, bundled the same way `riverctl`
 /// bundles it (`cli/contracts/room_contract.wasm`, `include_bytes!`).
 ///
-/// A hand-copied HASH constant was tried here first and quietly rotted: it
-/// drifted at least one room-contract generation behind reality and nothing
-/// caught it, so the crawler spent 13 days (2026-07-18 to 2026-07-30) silently
-/// reading an abandoned pre-re-key copy of the Official room — 200 live
-/// messages a day, "10 candidate link(s), 0 newly captured" every run,
-/// indistinguishable from a genuinely quiet room. `river-core`'s own doc
-/// comment on `LEGACY_ROOM_CONTRACT_CODE_HASHES` explains why a hand-copied
-/// hash cannot be kept in sync: "the current generation's hash is
-/// intentionally absent — it is computed at runtime from the bundled WASM
-/// bytes." A client is expected to CARRY THE WASM, not a hash of it, precisely
-/// so this can never go stale by omission the way the constant did.
+/// A hand-copied HASH constant was tried here first and was wrong from the
+/// day it was written: it named code hash `74f3dff1…` (river-core's registry
+/// calls this generation "V26", retired 2026-07-16), introduced into this
+/// crate on 2026-07-25 — a day on which `river-core 0.1.17` (already the
+/// pinned dependency, no bump needed) already listed THREE newer generations
+/// as legacy. The room had moved on before the constant existed. River-room
+/// ingestion itself only started running in production on 2026-07-30 (see
+/// `crawler-sources.txt`), so the live exposure was five hourly runs
+/// (17:55-21:05 that day) before this was caught and fixed — but the
+/// underlying defect, "this constant cannot be kept in sync by hand", was
+/// present from the start and would have caused the identical silent failure
+/// whenever ingestion first ran. `river-core`'s own doc comment on
+/// `LEGACY_ROOM_CONTRACT_CODE_HASHES` names the fix directly: "the current
+/// generation's hash is intentionally absent — it is computed at runtime from
+/// the bundled WASM bytes." A client is expected to CARRY THE WASM, not a
+/// hash of it, precisely so this can never go stale by omission the way the
+/// constant did.
+///
+/// Every run this was live looked identical to a quiet room: "10 candidate
+/// link(s), 0 newly captured", the same line a genuinely quiet room would log.
+/// `crawl_river_room` now also logs which candidate generation resolved and
+/// warns loudly when it is not the current one, so a stale bundle is visible
+/// on the FIRST run it causes, not only via a test someone has to think to
+/// run.
 ///
 /// Re-sync procedure, unchanged from what the failed constant needed: after a
 /// River re-key, `cp river/main/cli/contracts/room_contract.wasm
-/// crawler/contracts/room_contract.wasm`. `the_bundled_wasm_is_not_yet_legacy`
-/// below is what makes forgetting LOUD instead of silent: it fails the moment
-/// `river-core` is bumped past a bump that retires this exact generation,
-/// which is the same signal that would have caught this incident at the
-/// point of drift instead of 13 days into it.
+/// crawler/contracts/room_contract.wasm`, then refresh
+/// `OFFICIAL_CURRENT_KEY` from `riverctl debug contract-key`.
+/// `the_bundled_wasm_is_not_yet_legacy` is what makes forgetting the WASM copy
+/// LOUD instead of silent: it fails the moment `river-core` is bumped past a
+/// bump that retires this exact generation. That check is gated on bumping
+/// `river-core`, though, which is itself a manual step — it narrows the
+/// detection window from "as long as nobody notices" to "as long as nobody
+/// bumps a dependency", not to zero.
 const ROOM_CONTRACT_WASM: &[u8] = include_bytes!("../contracts/room_contract.wasm");
 
 /// BLAKE3 code hash of [`ROOM_CONTRACT_WASM`], computed once per process.
@@ -2969,13 +2985,24 @@ async fn fetch_room_state(
     node_url: &str,
     owner_vk: &VerifyingKey,
     candidates: &[ContractInstanceId],
-) -> Result<Option<ChatRoomStateV1>> {
-    let (ws, _) = tokio_tungstenite::connect_async(node_url)
-        .await
-        .with_context(|| format!("connecting to node {node_url}"))?;
-    let mut api = WebApi::start(ws);
-
-    for id in candidates {
+) -> Result<Option<(ChatRoomStateV1, usize)>> {
+    // A fresh connection PER CANDIDATE, not one socket shared across the whole
+    // probe. Responses were previously correlated to requests only by arrival
+    // order on one socket, so a single 30s timeout desynchronised every
+    // candidate after it: the next iteration read the TIMED-OUT candidate's
+    // late reply, failed the `key.id() != id` check below, and the loop never
+    // recovered — one slow GET on the FIRST (current-generation) candidate
+    // silently discarded a room that exists and fell through to "no live room
+    // found". A fresh socket per candidate cannot desync; the cost is bounded
+    // (discovery-only, one River room configured today) and paid rarely, since
+    // resolving now succeeds on the first candidate whenever the bundled WASM
+    // is current.
+    for (idx, id) in candidates.iter().enumerate() {
+        let (ws, _) = match tokio_tungstenite::connect_async(node_url).await {
+            Ok(c) => c,
+            Err(_) => continue,
+        };
+        let mut api = WebApi::start(ws);
         let req = ContractRequest::Get {
             key: *id,
             return_contract_code: true,
@@ -2993,11 +3020,6 @@ async fn fetch_room_state(
         else {
             continue;
         };
-        // Responses are correlated to requests only by arrival order on this
-        // one socket, so a late reply (the 30s timeout above fires, then the
-        // response lands) would otherwise be read as the NEXT candidate's
-        // answer — silently inverting the current-before-legacy preference, or
-        // reporting "no live room" for a room that exists.
         if key.id() != id {
             continue;
         }
@@ -3022,7 +3044,7 @@ async fn fetch_room_state(
                 .then_with(|| a.id().cmp(&b.id()))
         });
         room_state.recent_messages.rebuild_actions_state();
-        return Ok(Some(room_state));
+        return Ok(Some((room_state, idx)));
     }
     Ok(None)
 }
@@ -3064,7 +3086,7 @@ fn crawl_river_room(
             return 0;
         }
     };
-    let state = match state {
+    let (state, resolved_idx) = match state {
         Ok(Some(s)) => s,
         Ok(None) => {
             eprintln!(
@@ -3078,6 +3100,23 @@ fn crawl_river_room(
             return 0;
         }
     };
+    // The only way to see WHICH generation actually answered. A silently-stale
+    // bundled WASM (the exact incident this module exists to prevent
+    // recurring) looks identical to a healthy run without this: the room
+    // still resolves, still has messages, still logs a plausible-looking
+    // candidate count — just from an abandoned pre-re-key copy. Candidate 0 is
+    // always the current-generation derivation (`room_candidate_keys`), so
+    // landing anywhere else means the bundled WASM needs updating NOW, not
+    // whenever someone happens to notice a quiet room that should not be
+    // quiet.
+    if resolved_idx != 0 {
+        eprintln!(
+            "river-room {owner_vk_b58}: WARNING resolved via LEGACY generation \
+             (candidate {resolved_idx}/{}) — crawler/contracts/room_contract.wasm \
+             is stale; see crawler/contracts/README.md",
+            candidate_ids.len()
+        );
+    }
 
     let links = extract_message_urls(&state, &owner_vk, registry);
     let mut captured = 0;
@@ -3090,8 +3129,10 @@ fn crawl_river_room(
         }
     }
     eprintln!(
-        "river-room {owner_vk_b58}: {} candidate link(s), {captured} newly captured",
-        links.len()
+        "river-room {owner_vk_b58}: {} candidate link(s), {captured} newly captured \
+         (generation {resolved_idx}/{})",
+        links.len(),
+        candidate_ids.len()
     );
     captured
 }
@@ -4894,26 +4935,83 @@ mod tests {
     /// `river-official-room` runbook; the key gkapi signs invites with).
     const OFFICIAL_OWNER_VK: &str = "4uNUKFzZQCnzo4K2ecZ16cMsYEEfoaRS35z6exEsbvm4";
 
-    /// The structural check, not the incident's own postmortem check.
+    /// The live contract key for [`OFFICIAL_OWNER_VK`] under the bundled WASM,
+    /// per `riverctl debug contract-key 4uNUKFzZQCnzo4K2ecZ16cMsYEEfoaRS35z6exEsbvm4`
+    /// — the network, not this file's own computation. Refresh from that
+    /// command (not from re-running this crate's own derivation) whenever
+    /// `crawler/contracts/room_contract.wasm` is updated, or this reverts to
+    /// comparing the code against itself, which is the exact defect it
+    /// replaces.
+    const OFFICIAL_CURRENT_KEY: &str = "DwqkZjAZFjgB2eEUrLMpBiVr3wCnSiJNCmfV3PyDfkdZ";
+
+    /// The bundled WASM is a checked-in binary a human `cp`s in — the only
+    /// integrity check on its CONTENT before this. Catches an empty, truncated,
+    /// or wrong-file `cp` (a plausible mistake: this repo also has
+    /// `contracts/index-contract/` and `contracts/web-container/`, either of
+    /// which would compile and hash cleanly if copied here by accident) as a
+    /// compile-adjacent sanity check, cheaply, before the real key-derivation
+    /// pin below has to catch it.
+    #[test]
+    fn the_bundled_wasm_looks_like_a_wasm_module() {
+        assert!(
+            ROOM_CONTRACT_WASM.starts_with(b"\0asm"),
+            "crawler/contracts/room_contract.wasm does not start with the WASM \
+             magic bytes — wrong file committed?"
+        );
+        assert!(
+            ROOM_CONTRACT_WASM.len() > 100_000,
+            "room_contract.wasm is suspiciously small ({} bytes) — truncated copy?",
+            ROOM_CONTRACT_WASM.len()
+        );
+    }
+
+    /// The independent cross-check the disclosed coverage gap needed.
     ///
-    /// The PREVIOUS version of this test hardcoded the expected key as a string
-    /// literal — `assert_eq!(derived, "43YnY…")` — captured at the same moment
-    /// the (also hand-copied) code-hash constant was written. Both were
-    /// snapshots of the SAME live lookup, so of course they agreed; the test
-    /// could only ever confirm "this file is internally consistent with
-    /// itself", never "this file still matches the network". That is why it
-    /// passed for the entire 13 days the crawler was silently reading a dead
-    /// room: nothing in the test involves the network, `river-core`, or any
-    /// source that updates independently of this file.
+    /// `the_bundled_wasm_is_not_yet_legacy` below proves the bundle is not
+    /// KNOWN-stale; it cannot prove the bundle is CORRECT — a zeroed, corrupt,
+    /// or wrong-but-differently-hashed WASM passes it just as cleanly as a
+    /// genuine one, because "absent from the legacy list" is satisfied by
+    /// nearly any garbage. This test pins the actual derived key against
+    /// [`OFFICIAL_CURRENT_KEY`], sourced from `riverctl` — a party that does
+    /// not read this file — so it fails on a wrong-file `cp`, a corrupt
+    /// download, or a broken hash computation, none of which the other two
+    /// tests can see.
+    #[test]
+    fn room_key_derivation_matches_the_live_network() {
+        let owner = parse_owner_vk(OFFICIAL_OWNER_VK).expect("official owner vk parses");
+        let key = river_core::migration::contract_key_for_code_hash(
+            &owner,
+            current_room_contract_code_hash(),
+        );
+        assert_eq!(
+            key.id().to_string(),
+            OFFICIAL_CURRENT_KEY,
+            "current-generation derivation must reproduce the live Official room \
+             key — if `room_contract.wasm` was just updated, refresh \
+             OFFICIAL_CURRENT_KEY from `riverctl debug contract-key`; if it was \
+             NOT updated, something is wrong with the derivation itself"
+        );
+    }
+
+    /// The structural check that outlives any one WASM refresh.
     ///
-    /// This version asserts something that can ONLY be true if the bundled
-    /// WASM is still current: that its hash is ABSENT from river-core's
-    /// legacy registry. `river-core` appends a hash to that registry exactly
-    /// when a re-key retires it — so the day this crate's `river-core`
-    /// dependency is bumped past a bump that retires today's bundled WASM,
-    /// this fails, with the exact word "legacy" in the message, at the point
-    /// of drift. That is the same signal a human ignored for 13 days; the
-    /// difference is this one is `cargo test`, not a log line to notice.
+    /// [`room_key_derivation_matches_the_live_network`] pins a value that goes
+    /// stale the moment River re-keys again — exactly the shape that let the
+    /// PREVIOUS version of this test agree with a hand-copied hash constant for
+    /// five hourly runs (2026-07-30 17:55-21:05) before this fix landed,
+    /// without ever touching the network. `river-core`'s own registry is the
+    /// one input here that updates independently of this file: it appends a
+    /// hash exactly when a re-key retires it, so the day this crate's
+    /// `river-core` dependency is bumped past whatever bump retires today's
+    /// bundled WASM, this fails with the word "legacy" in the message, at the
+    /// point of drift rather than at the point someone happens to notice a
+    /// room that has gone quiet in a way it should not have.
+    ///
+    /// Concretely: the constant this whole module replaces (code hash
+    /// `74f3dff1…`, river-core's registry name "V26", retired 2026-07-16) was
+    /// ALREADY present in `river-core 0.1.17` — the version this crate had
+    /// pinned since the day the constant was introduced. This assertion would
+    /// have failed on that dependency with no version bump at all.
     #[test]
     fn the_bundled_wasm_is_not_yet_legacy() {
         let hash = *current_room_contract_code_hash();
@@ -4921,7 +5019,9 @@ mod tests {
             !river_core::migration::LEGACY_ROOM_CONTRACT_CODE_HASHES.contains(&hash),
             "crawler/contracts/room_contract.wasm has been superseded (its hash is \
              now in river-core's legacy registry) — copy the current WASM from \
-             river/main/cli/contracts/room_contract.wasm and re-run this test"
+             river/main/cli/contracts/room_contract.wasm, refresh \
+             OFFICIAL_CURRENT_KEY from `riverctl debug contract-key`, and \
+             re-run this test"
         );
     }
 
@@ -6775,6 +6875,8 @@ mod tests {
         let src = include_str!("main.rs");
         for pin in [
             "fn the_bundled_wasm_is_not_yet_legacy",
+            "fn room_key_derivation_matches_the_live_network",
+            "fn the_bundled_wasm_looks_like_a_wasm_module",
             "fn room_candidate_keys_tries_current_generation_first",
             "fn the_probe_handle_is_fresh_every_run",
             "fn a_too_short_probe_result_is_not_a_usable_baseline",
