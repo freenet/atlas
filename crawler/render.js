@@ -208,7 +208,7 @@ async function pickFrame(page) {
     // hashchange, not a navigation, so the app keeps its connection and state.
     if (enumResource && enumMax > 0) {
       const entryHash = await frame.evaluate(() => location.hash).catch(() => '');
-      const pages = [{ hash: entryHash, html }];
+      const pages = [{ hash: entryHash, html, text }];
       const seenHashes = new Set([entryHash]);
       captured = { status, url: frame.url(), html, text, pages };
       // From 1, not 2: the entry URL is whatever the sources file named, which need
@@ -236,6 +236,11 @@ async function pickFrame(page) {
           }))
           .catch(() => null);
         if (!got) break;
+        // Content-region text per page, extracted the same way as the entry page.
+        // The caller needs this to DESCRIBE a multi-page site: stripping the raw
+        // HTML instead would pull in the app's chrome, which is the contamination
+        // `--require-content` exists to prevent.
+        got.text = await contentText(f2);
         // The app ran out of pages: it either stopped moving or re-served a page we
         // already have. Without this, a 3-page site spent most of the remaining
         // watchdog re-capturing identical DOMs and pushing them toward the output

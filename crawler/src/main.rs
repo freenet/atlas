@@ -154,6 +154,13 @@ struct Cli {
     /// fresh render, so this is bounded for tidiness rather than cost.
     #[arg(long, default_value_t = 12)]
     hub_max_pages: usize,
+    /// Max pages to walk when DESCRIBING an app-hosted resource (a Delta site's
+    /// own pages). Lower than `--hub-interval`'s hub walk: a hub is one page whose
+    /// whole purpose is to list links, whereas this runs once per site indexed, so
+    /// the time is paid far more often. Enough to reach a site's real content when
+    /// its landing page is a stub, without walking a large site exhaustively.
+    #[arg(long, default_value_t = 6)]
+    app_max_pages: usize,
     /// If set, loop every N seconds instead of running once. Cheap sources
     /// (River rooms) are polled every tick, so this can be small; expensive hub
     /// re-rendering is rate-limited separately by `--hub-interval`.
@@ -1903,9 +1910,39 @@ struct Page {
     html: String,
     text: String,
     /// Additional pages of the SAME app-hosted resource, discovered by walking the
-    /// app's internal routes in one browser session. Their HTML is mined for links;
-    /// the resource itself is still described from the entry page.
+    /// app's internal routes in one browser session. Their HTML is mined for links.
     extra_pages: Vec<String>,
+    /// Content-region text of those same pages, in the same order.
+    ///
+    /// Separate from `extra_pages` because the two are used for different things and
+    /// must not be conflated: links come from the raw HTML, but DESCRIBING a page
+    /// needs the content region only. Stripping the HTML here would feed the app's
+    /// chrome to the describer, which is exactly what `--require-content` prevents
+    /// for the entry page.
+    extra_texts: Vec<String>,
+}
+
+impl Page {
+    /// Everything this locator has to say, entry page first.
+    ///
+    /// An app-hosted site is ONE locator with several pages, so this is what should
+    /// be described and safety-rated — not the landing page alone. Judging a site on
+    /// its landing page left `app:delta/AWPjDQdKey` deferred as too thin every run
+    /// while an 11,000-character second page sat behind it.
+    ///
+    /// Safe for the gate in the direction that matters: it can only ADD evidence for
+    /// the rating, never remove it, so a page that would have been refused as too
+    /// thin cannot become describable on less text than before.
+    fn describable_text(&self) -> String {
+        if self.extra_texts.is_empty() {
+            return self.text.clone();
+        }
+        std::iter::once(self.text.as_str())
+            .chain(self.extra_texts.iter().map(String::as_str))
+            .filter(|t| !t.trim().is_empty())
+            .collect::<Vec<_>>()
+            .join("\n\n")
+    }
 }
 
 /// Index one locator (`https://...` or `freenet:<id><path>`): fetch its content,
@@ -1925,7 +1962,26 @@ fn index_locator(
     registry: &AppRegistryView,
     baselines: &mut AppBaselines,
 ) -> Result<bool> {
-    let page = get_page(cli, client, gw, loc, registry)?;
+    // Walk an app-hosted resource's OTHER pages before describing it. A Delta site
+    // is one locator with several pages, and reading only the landing page judged
+    // the whole site on it: `app:delta/AWPjDQdKey` ("Ian Clarke's Delta Website")
+    // has a ~100-character home page and an 11,000-character second page, so it was
+    // deferred as too thin every run and never indexed, while its actual content sat
+    // one page over. Enumeration already existed for hub crawling; it was simply
+    // never wired into the path that describes a site.
+    //
+    // Cheap relative to the first load: each extra page is an in-session hash
+    // navigation, not a fresh render. `resource_of` returns None for a non-app or
+    // non-fragment-routed locator, so nothing else pays for this.
+    let enumerate = registry.resource_of(loc).map(|r| (r, cli.app_max_pages));
+    let page = get_page_enumerating(
+        cli,
+        client,
+        gw,
+        loc,
+        registry,
+        enumerate.as_ref().map(|(r, n)| (r.as_str(), *n)),
+    )?;
     // Before spending anything: is this actually a page about the resource we asked
     // for, or the app's fallback content for a resource it could not load? The latter
     // reads as a perfectly good page, so this has to be checked explicitly.
@@ -1934,6 +1990,10 @@ fn index_locator(
         .and_then(|rest| rest.split_once('/'))
         .map(|(slug, _)| slug)
     {
+        // Checked against the ENTRY page's text, deliberately. The placeholder
+        // baseline is what the app renders for a resource that does not exist, and
+        // that is a property of the landing render — folding in other pages would
+        // dilute it below the match threshold and let a fallback through.
         if baselines.is_placeholder(cli, client, gw, registry, slug, &page.text) {
             return Err(PlaceholderPage.into());
         }
@@ -1984,7 +2044,8 @@ fn index_page(
     // then publish whatever it says: the rating IS the safety gate, and a gate fed
     // no evidence is not a gate. Notably this is the image-only-site case, which is
     // both the likeliest NSFW vector and the one the text rating is blindest to.
-    let visible = page.text.trim().chars().count();
+    let body = page.describable_text();
+    let visible = body.trim().chars().count();
     if visible < MIN_DESCRIBABLE_CHARS {
         // `TooThin`, not a plain error: this verdict is DETERMINISTIC for a given
         // page, so charging it a retry means three runs with a broken renderer (node
@@ -1999,7 +2060,7 @@ fn index_page(
         // rating, so doing that turns any OpenAI hiccup (a 429 an attacker can
         // induce by flooding links, a content-policy 400 on exactly the
         // material the gate exists to catch) into an open door to the index.
-        Some(k) => match describe_llm(client, k, model, loc, &page.text) {
+        Some(k) => match describe_llm(client, k, model, loc, &body) {
             Ok(d) => d,
             Err(e) if trusted => {
                 eprintln!("  llm failed ({e:#}), falling back to title/meta");
@@ -2151,6 +2212,7 @@ fn get_page_enumerating(
             html,
             text,
             extra_pages: Vec::new(),
+            extra_texts: Vec::new(),
         })
     } else {
         ssrf_check(loc)?;
@@ -2160,6 +2222,7 @@ fn get_page_enumerating(
             html,
             text,
             extra_pages: Vec::new(),
+            extra_texts: Vec::new(),
         })
     }
 }
@@ -2264,6 +2327,15 @@ fn render_page(
                 .collect()
         })
         .unwrap_or_default();
+    let extra_texts: Vec<String> = v["pages"]
+        .as_array()
+        .map(|ps| {
+            ps.iter()
+                .skip(1)
+                .map(|p| p["text"].as_str().unwrap_or("").to_string())
+                .collect()
+        })
+        .unwrap_or_default();
     if !extra_pages.is_empty() {
         eprintln!("  enumerated {} additional page(s)", extra_pages.len());
     }
@@ -2271,6 +2343,7 @@ fn render_page(
         html,
         text,
         extra_pages,
+        extra_texts,
     })
 }
 
@@ -5031,6 +5104,106 @@ mod tests {
             "must give up on the final attempt"
         );
         assert!(!p.contains("https://flaky.example/1"));
+    }
+
+    /// A site is described from ALL its pages, not just the landing page. Judging
+    /// a site on page 1 left `app:delta/AWPjDQdKey` unindexed for good: its home
+    /// page is Delta's default stub ("Welcome to your new site", 97 characters,
+    /// under the 200-character floor) while page 2 holds a 10,264-character
+    /// document. Every run deferred it as too thin.
+    #[test]
+    fn a_site_is_described_from_all_its_pages() {
+        let stub = "Welcome to your new site.".to_string();
+        let real = "x".repeat(500);
+        let page = Page {
+            html: String::new(),
+            text: stub.clone(),
+            extra_pages: vec!["<html/>".into()],
+            extra_texts: vec![real.clone()],
+        };
+        let body = page.describable_text();
+        assert!(
+            body.contains(&stub) && body.contains(&real),
+            "the entry page and its other pages must both reach the describer"
+        );
+        assert!(
+            body.trim().chars().count() >= MIN_DESCRIBABLE_CHARS,
+            "a stub landing page must not sink a site whose content is one page over"
+        );
+        assert!(
+            page.text.trim().chars().count() < MIN_DESCRIBABLE_CHARS,
+            "test premise: the landing page alone really is below the floor"
+        );
+    }
+
+    /// With no extra pages the behaviour is exactly as before — this can only ever
+    /// ADD evidence for the safety rating, never remove it.
+    #[test]
+    fn describable_text_is_unchanged_for_a_single_page() {
+        let page = Page {
+            html: String::new(),
+            text: "just the one page".into(),
+            extra_pages: Vec::new(),
+            extra_texts: Vec::new(),
+        };
+        assert_eq!(page.describable_text(), "just the one page");
+
+        // An app that returns a blank page must not pad the text with separators
+        // and sneak past the floor on whitespace.
+        let blank = Page {
+            html: String::new(),
+            text: "short".into(),
+            extra_pages: vec!["<html/>".into(), "<html/>".into()],
+            extra_texts: vec!["   ".into(), String::new()],
+        };
+        assert_eq!(
+            blank.describable_text().trim(),
+            "short",
+            "empty pages must contribute nothing, not separator whitespace"
+        );
+    }
+
+    /// The enumeration must happen on the path that DESCRIBES a locator, not only
+    /// when crawling a hub. That was the whole defect: the machinery existed and
+    /// was wired into `crawl_hub` alone.
+    #[test]
+    fn the_indexing_path_enumerates_an_app_resource() {
+        let src = include_str!("main.rs");
+        let production = src
+            .split("\nmod tests")
+            .next()
+            .expect("source must have a pre-test region");
+        let at = production
+            .find("fn index_locator(")
+            .expect("index_locator must exist");
+        let body = &production[at..];
+        let end = body
+            .find("\nfn ")
+            .map(|e| at + e)
+            .unwrap_or(production.len());
+        let body = strip_comments(&production[at..end]);
+        assert!(
+            body.contains("resource_of(loc)") && body.contains("get_page_enumerating("),
+            "index_locator must walk an app resource's other pages, or a site with a \
+             stub landing page is judged on the stub"
+        );
+        // The describer lives in its own function, so assert there rather than in
+        // index_locator's body: the floor check and the LLM call must both read the
+        // whole site, or enumerating it achieves nothing.
+        let desc = strip_comments(production);
+        assert!(
+            desc.contains("let body = page.describable_text();"),
+            "the describe path must read the whole site"
+        );
+        assert!(
+            desc.contains("let visible = body.trim().chars().count();"),
+            "the too-thin floor must be measured on the whole site, or a stub \
+             landing page still sinks it"
+        );
+        assert!(
+            desc.contains("describe_llm(client, k, model, loc, &body)"),
+            "and the LLM must be given the whole site, not just the entry page"
+        );
     }
 
     #[test]
