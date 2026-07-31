@@ -2712,9 +2712,14 @@ impl AppBaselines {
 /// while an unmapped identity is the CONTAINER id, which can never equal a mapped
 /// link's identity, so nothing would be recognised as in-app navigation at all.
 ///
+/// For an UNMAPPED hub on an unregistered contract, this now also collapses the
+/// fragment via `map_or_collapse` — the hub itself is a listing candidate like
+/// any other locator this crawler discovers, so it must not be the one place a
+/// fragment-routed unregistered site's identity stays un-collapsed.
+///
 /// Extracted so a test pins the production expression rather than a copy of it.
 fn hub_subject_of(hub: &str, registry: &AppRegistryView) -> String {
-    registry.map_locator(hub).unwrap_or_else(|| hub.to_string())
+    map_or_collapse(hub.to_string(), registry)
 }
 
 /// Should a link found on a hub page be skipped rather than queued?
@@ -3282,6 +3287,19 @@ struct AppView {
 #[derive(Clone, Debug, Default)]
 struct AppRegistryView {
     apps: Vec<AppView>,
+    /// Every contract id NAMED by the registry, whether or not its entry parsed
+    /// far enough to become an [`AppView`]. `owns_container` reads THIS, not
+    /// `apps`, and the difference is load-bearing: an entry can be dropped for a
+    /// link-template shape the crawler cannot reverse (`rest != "{path}"` below)
+    /// while still being a real, on-chain-valid multi-tenant app — `AppRecord::
+    /// check` in `atlas-common` permits `{resource}` and `{path}` to have
+    /// something between them, this crawler's reversal does not. If
+    /// `owns_container` consulted `apps` alone, that ONE unreversible entry would
+    /// look identical to "not registered at all" to `collapse_unmapped_fragment`,
+    /// and every site on that platform would collapse into one shared listing —
+    /// the exact danger the registered-app gate exists to prevent, reachable
+    /// through a narrower door than "the registry failed to load".
+    all_named_containers: HashSet<String>,
 }
 
 impl AppRegistryView {
@@ -3318,6 +3336,7 @@ impl AppRegistryView {
             }
         };
         let mut apps = Vec::new();
+        let mut all_named_containers = HashSet::new();
         if let Some(map) = parsed["apps"].as_object() {
             for (slug, rec) in map {
                 let (Some(contract_id), Some(template)) =
@@ -3325,6 +3344,11 @@ impl AppRegistryView {
                 else {
                     continue;
                 };
+                // Recorded even if the entry is dropped below: an app whose
+                // template this crawler cannot reverse is still a REAL,
+                // on-chain-valid registered app (see the field's own doc), so its
+                // container must never look "unregistered" to the collapse gate.
+                all_named_containers.insert(contract_id.to_string());
                 // Derive the recognizer from the TEMPLATE rather than hard-coding
                 // one per app: the literal text before `{resource}` is exactly what
                 // a URL for that app has between the contract id and the handle.
@@ -3357,7 +3381,10 @@ impl AppRegistryView {
                     .join(" ")
             );
         }
-        Self { apps }
+        Self {
+            apps,
+            all_named_containers,
+        }
     }
 
     /// Rewrite a `freenet:<id><path>` locator into `app:<slug>/<resource>` when it
@@ -3382,18 +3409,23 @@ impl AppRegistryView {
     }
 
     /// Does `contract_id` belong to a REGISTERED app, regardless of whether this
-    /// specific locator's path/resource matched its pattern?
+    /// specific locator's path/resource matched its pattern, and regardless of
+    /// whether the app's OWN entry parsed far enough to become an [`AppView`]?
     ///
-    /// `map_locator` returning `None` conflates two different situations: the
+    /// `map_locator` returning `None` conflates THREE different situations: the
     /// container is not registered at all (genuinely safe to treat as a single-
-    /// owner site), or it IS registered but this locator's path failed to match
-    /// (a too-short resource handle, a prefix mismatch) — which says nothing
-    /// about whether the CONTAINER itself is multi-tenant. `collapse_unmapped_
-    /// fragment` needs to tell these apart; this is that check, factored out so
-    /// the two `self.apps` scans (this one and `map_locator`'s) stay obviously
-    /// the same predicate rather than drifting apart.
+    /// owner site); it IS registered and its `AppView` built fine, but this
+    /// locator's path failed to match (a too-short resource handle, a prefix
+    /// mismatch); or it IS registered but its OWN link-template shape could not
+    /// be reversed at all, so no `AppView` for it exists in `apps`. Checking
+    /// `apps` alone would treat the third case as "not registered" — collapsing
+    /// every site on that platform into one, the exact danger this gate exists
+    /// to prevent, through a door `apps` cannot see. `all_named_containers` is
+    /// populated for every entry the registry NAMES, before any of the
+    /// reversal checks that can drop it from `apps`, so this stays a genuine
+    /// "did the registry ever mention this id" test.
     fn owns_container(&self, id: &str) -> bool {
-        self.apps.iter().any(|a| a.contract_id == id)
+        self.all_named_containers.contains(id)
     }
 }
 
@@ -3506,7 +3538,9 @@ fn locator_identity(loc: &str) -> &str {
     freenet_id(loc).unwrap_or(loc)
 }
 
-/// Normalize an href and then map it onto a registered app if it belongs to one.
+/// Normalize an href, then `map_or_collapse` it: onto a registered app if it
+/// belongs to one, else collapsing its fragment if it names an unregistered
+/// fragment-routed site.
 fn normalize_mapped(href: &str, registry: &AppRegistryView) -> Option<(String, &'static str)> {
     let (loc, kind) = normalize_href(href)?;
     Some((map_or_collapse(loc, registry), kind))
@@ -3517,10 +3551,11 @@ fn normalize_mapped(href: &str, registry: &AppRegistryView) -> Option<(String, &
 /// fragment-routed site converge on one canonical form.
 ///
 /// This is the ONE place both steps happen together, used by every discovery
-/// path (curated sources, hub link mining, River-room message scanning) so none
-/// of them can drift out of sync with each other — which is exactly how the
-/// three call sites ended up independently reimplementing "map or fall back to
-/// raw" before this existed as a named function.
+/// path (curated sources, hub link mining, River-room message scanning) AND by
+/// a hub's own listing identity (`hub_subject_of`) so none of them can drift
+/// out of sync with each other — which is exactly how several of these ended up
+/// independently reimplementing "map or fall back to raw" before this existed
+/// as a named function.
 fn map_or_collapse(loc: String, registry: &AppRegistryView) -> String {
     match registry.map_locator(&loc) {
         Some(mapped) => mapped,
@@ -3540,33 +3575,48 @@ fn map_or_collapse(loc: String, registry: &AppRegistryView) -> String {
 /// the gateway resolves the PATH only, and a browser never sends the fragment
 /// across the wire at all — so everything after `#` on a `freenet:` locator is
 /// client-side navigation within whatever the path already served, never a
-/// second document. (This is specifically about the fragment, not the query: a
-/// `?__sandbox=1` query DOES select a different server response, so only `#` is
-/// safe to drop here.)
+/// second document. (This is specifically about the fragment, not the query:
+/// appending `?__sandbox=1` DOES select a different server response, which
+/// matters elsewhere in this file — but it never reaches here, because
+/// `normalize_href` already strips any query off a `freenet:` locator before
+/// this function ever sees one.)
 ///
 /// Deliberately NOT applied when `contract_id` belongs to a REGISTERED app —
 /// even one THIS locator failed to match (a too-short resource handle, a prefix
-/// mismatch, the container's own root with no resource at all). `map_locator`
-/// exists specifically because collapsing by container id ALONE conflates every
-/// site on a multi-tenant platform into one listing, and a registered app's
-/// container is a multi-tenant platform by definition — Delta's own link
-/// template puts every site under one shared container, fragment-routed. Were
-/// this check absent, a registry hiccup (see below) or a resource shorter than
-/// `MIN_APP_RESOURCE_LEN` would collapse EVERY Delta site down to one shared
-/// listing, permanently — worse than the bug #20 fixed (which produced many
-/// wrong-identity listings, still recoverable one at a time), because this
-/// produces exactly one, with no way to add a second without `atlasctl remove`-
-/// ing it first. Falling back to the un-collapsed locator here instead
-/// reproduces that pre-#20 degradation for the one affected locator, not
-/// something worse: a bounded, already-tolerated cost, not a new failure class.
+/// mismatch, the container's own root with no resource at all, or the app's own
+/// link-template shape being one this crawler cannot reverse at all — see
+/// `owns_container`). `map_locator` exists specifically because collapsing by
+/// container id ALONE conflates every site on a multi-tenant platform into one
+/// listing, and a registered app's container is a multi-tenant platform by
+/// definition — Delta's own link template puts every site under one shared
+/// container, fragment-routed. Were this check absent, a registry hiccup (see
+/// below) or a resource shorter than `MIN_APP_RESOURCE_LEN` would collapse
+/// EVERY Delta site down to one shared listing, permanently — worse than the
+/// bug #20 fixed (which produced many wrong-identity listings, still
+/// recoverable one at a time), because this produces exactly one, with no way
+/// to add a second without `atlasctl remove`-ing it first. Falling back to the
+/// un-collapsed locator here instead reproduces that pre-#20 degradation for
+/// the one affected locator, not something worse: a bounded, already-tolerated
+/// cost, not a new failure class.
 ///
-/// Also deliberately NOT applied when the registry is EMPTY. `AppRegistryView::
-/// load` returns the same empty value whether the registry genuinely has zero
-/// apps or merely failed to load this run, so an empty registry carries no
-/// evidence either way — treating it as "nothing is registered" would hit the
-/// exact Delta danger above on every run where `atlasctl apps` hiccups.
+/// Also deliberately NOT applied when the registry named NO containers at all.
+/// `AppRegistryView::load` returns the same empty value whether the registry
+/// genuinely has zero apps or merely failed to load this run, so that state
+/// carries no evidence either way — treating it as "nothing is registered"
+/// would hit the exact Delta danger above on every run where `atlasctl apps`
+/// hiccups.
+///
+/// Does NOT fold the `""` / `"/"` bare-root alias `contract_web_href` treats as
+/// one page: an ALREADY-indexed site stored under the bare form (a real,
+/// reachable shape — `normalize_href` and `scan_urls` both produce it) would
+/// get rediscovered as the `/` form, miss the crawler's own `seen` check, and
+/// be described and added a second time — `dedup_key` (unchanged) treats
+/// `freenet:<id>` and `freenet:<id>/` as different URIs, so nothing downstream
+/// would catch it either. Worth doing, but as its own change with its own
+/// safety net, not folded into the fix for a bug that never involved this
+/// aliasing in the first place.
 fn collapse_unmapped_fragment(loc: String, registry: &AppRegistryView) -> String {
-    if registry.apps.is_empty() {
+    if registry.all_named_containers.is_empty() {
         return loc;
     }
     let Some(rest) = loc.strip_prefix("freenet:") else {
@@ -3577,14 +3627,6 @@ fn collapse_unmapped_fragment(loc: String, registry: &AppRegistryView) -> String
         return loc;
     }
     let server_path = path.split('#').next().unwrap_or(path);
-    // "" and "/" name the same page (`contract_web_href` already treats them as
-    // one); fold that here too, or the same site can still split across two
-    // listings depending on which form a link happened to use.
-    let server_path = if server_path.is_empty() {
-        "/"
-    } else {
-        server_path
-    };
     format!("freenet:{id}{server_path}")
 }
 
@@ -3658,8 +3700,13 @@ fn normalize_href(href: &str) -> Option<(String, &'static str)> {
     }
     // A `#…` on a freenet locator is the app's own client-side ROUTE, not a
     // document anchor — the Delta hub is itself configured as
-    // `freenet:<id>/#AmcVD92D3U/2/links`. So it is carried into the locator, or
-    // every page of an SPA would collapse onto its root and be indexed once.
+    // `freenet:<id>/#AmcVD92D3U/2/links`. It is carried into the locator here
+    // regardless: THIS function has no app-registry access, so it cannot know
+    // yet whether the fragment names a distinct resource on a multi-tenant
+    // platform (Delta) or is safe to fold away later as one unregistered site's
+    // internal navigation (`map_or_collapse`, called on this function's output
+    // by every caller). Stripping it at this stage would destroy the
+    // information registry-aware collapsing needs to make that call correctly.
     // It is only ever appended to a path found above; it is never searched for
     // a gateway prefix, which is the distinction that closes the hole.
     let fragment = href.split_once('#').map(|(_, f)| f).unwrap_or("");
@@ -4409,6 +4456,7 @@ mod tests {
                 contract_id: DELTA.into(),
                 prefix: "/#".into(),
             }],
+            all_named_containers: [DELTA.to_string()].into_iter().collect(),
         }
     }
 
@@ -4474,6 +4522,23 @@ mod tests {
             unmapped_identity,
             locator_identity(&own_other_page),
             "this mismatch is why the hub identity has to be mapped"
+        );
+    }
+
+    /// A hub on an UNREGISTERED contract is a listing candidate too, and its own
+    /// fragment must collapse exactly like any other locator discovered from it
+    /// — otherwise the hub itself keeps a fragment-qualified identity while
+    /// every OTHER page of the same site (found via the hub's own outbound
+    /// links) collapses to the bare root, splitting one site across two
+    /// listings through the one call site that used to be exempt.
+    #[test]
+    fn an_unregistered_hubs_own_fragment_collapses_too() {
+        const CALLIOPE: &str = "DPZS3nmaS8XRqLufy3cq4t2DWkfG8k22gi8jcbykRzAH";
+        let reg = delta_registry(); // Registered, but Calliope is not IN it.
+        let raw_hub = format!("freenet:{CALLIOPE}/#/b/general");
+        assert_eq!(
+            hub_subject_of(&raw_hub, &reg),
+            format!("freenet:{CALLIOPE}/")
         );
     }
 
@@ -4661,6 +4726,7 @@ mod tests {
                 contract_id: RIVER.into(),
                 prefix: "/w/".into(),
             }],
+            all_named_containers: [RIVER.to_string()].into_iter().collect(),
         };
         assert_eq!(
             reg.map_locator(&format!("freenet:{RIVER}/w/abc123XYZmnp/deep"))
@@ -4728,6 +4794,37 @@ mod tests {
             ],
             "expected exactly the two other Delta sites (deduped across pages) and \
              the plain web contract"
+        );
+    }
+
+    /// Composition test for the same call site as the test above, but exercising
+    /// the path it never touches: a hub page linking to several fragments of
+    /// ONE unregistered site. A mutation reverting the `map_or_collapse` call at
+    /// this specific site (keeping the helper and its direct tests untouched)
+    /// must fail here.
+    #[test]
+    fn hub_outbound_links_collapses_an_unregistered_sites_fragment() {
+        const CALLIOPE: &str = "DPZS3nmaS8XRqLufy3cq4t2DWkfG8k22gi8jcbykRzAH";
+        let reg = delta_registry(); // Registered, but Calliope is not IN it.
+        let tmp = TmpFile::new("compose-collapse");
+        let pending = Pending::load(tmp.path());
+        let seen: HashSet<String> = HashSet::new();
+
+        let hub = format!("freenet:{DELTA}/#AmcVD92D3U/3/delta-sites");
+        let hub_subject = hub_subject_of(&hub, &reg);
+        let page = format!(
+            r#"<a href="/v1/contract/web/{CALLIOPE}/#/share">Share</a>
+               <a href="/v1/contract/web/{CALLIOPE}/#/b/general">General</a>"#
+        );
+
+        let got = hub_outbound_links(&hub, &hub_subject, &[page.as_str()], &reg, &seen, &pending);
+        let locs: Vec<String> = got.into_iter().map(|(l, _)| l).collect();
+
+        assert_eq!(
+            locs,
+            vec![format!("freenet:{CALLIOPE}/")],
+            "two fragments of one unregistered site linked from a hub page must \
+             collapse to ONE outbound link, not two"
         );
     }
 
@@ -4864,6 +4961,59 @@ mod tests {
         assert_eq!(loc2, format!("freenet:{RIVER}/"));
     }
 
+    /// Composition test: THIS is the actual call site curated `--sources`
+    /// entries go through, not the `map_or_collapse` helper directly. A
+    /// mutation reverting this one function back to bare `map_locator` (keeping
+    /// the helper and its own tests untouched) must fail here, or the fix is
+    /// unpinned at every point it is actually used — see the doc comment on
+    /// `map_or_collapse` about why the three call sites exist as one function
+    /// in the first place.
+    #[test]
+    fn normalize_mapped_collapses_an_unregistered_sites_fragment() {
+        const CALLIOPE: &str = "DPZS3nmaS8XRqLufy3cq4t2DWkfG8k22gi8jcbykRzAH";
+        let reg = delta_registry(); // Registered, but Calliope is not IN it.
+        let (loc, _) = normalize_mapped(&format!("freenet:{CALLIOPE}/#/b/general"), &reg).unwrap();
+        assert_eq!(loc, format!("freenet:{CALLIOPE}/"));
+    }
+
+    /// The THIRD call site, source-pinned rather than exercised end to end:
+    /// `extract_message_urls` needs a real signed `ChatRoomStateV1` to drive
+    /// directly, which nothing in this test module builds — the cost of adding
+    /// that scaffolding for one call site is disproportionate to what it
+    /// protects. This is the same tradeoff `the_indexing_path_enumerates_an_
+    /// app_resource` makes for a different hard-to-drive function; same fix.
+    ///
+    /// Scoped to the function's own body (not the whole file), so this cannot
+    /// pass by matching `map_or_collapse` calls at the OTHER two call sites —
+    /// only a revert of THIS one is what turns it red.
+    #[test]
+    fn extract_message_urls_routes_through_map_or_collapse() {
+        let src = include_str!("main.rs");
+        let production = src
+            .split("\nmod tests")
+            .next()
+            .expect("source must have a pre-test region");
+        assert!(
+            !production.contains("fn extract_message_urls_routes_through"),
+            "the scan region must exclude the test module, or the pin matches itself"
+        );
+        let at = production
+            .find("fn extract_message_urls(")
+            .expect("extract_message_urls must exist");
+        let body = &production[at..];
+        let end = body
+            .find("\nfn ")
+            .map(|e| at + e)
+            .unwrap_or(production.len());
+        let body = strip_comments(&production[at..end]);
+        assert!(
+            body.contains("map_or_collapse(loc, registry)"),
+            "a link posted in a River room must go through map_or_collapse, or a \
+             fragment-routed unregistered site's pages split back into separate \
+             listings through this one door"
+        );
+    }
+
     /// The exact shape reported live: five distinct locators for one unregistered
     /// image board — the bare root, a share page, a general board, and two
     /// individual thread pages — all under one contract with an empty server path
@@ -4900,14 +5050,18 @@ mod tests {
         }
     }
 
-    /// The bare-root aliases "" and "/" must collapse into ONE canonical form too,
-    /// or the same site can still split across two listings depending on which
-    /// spelling a link happened to use.
+    /// Deliberately UNCHANGED: the bare `""` form and the `"/"` form are left as
+    /// two distinct locators, even though they resolve to the same page. Folding
+    /// them was tried and reverted (see the doc comment on
+    /// `collapse_unmapped_fragment`) because it would rediscover any ALREADY-
+    /// indexed bare-form site as a second, undeduped `/`-form listing. This test
+    /// exists so a future attempt at that fold trips over it rather than
+    /// reintroducing the regression silently.
     #[test]
-    fn map_or_collapse_folds_the_bare_root_alias() {
+    fn map_or_collapse_leaves_the_bare_root_alias_unfolded() {
         const SITE: &str = "DPZS3nmaS8XRqLufy3cq4t2DWkfG8k22gi8jcbykRzAH";
         let reg = delta_registry();
-        assert_eq!(
+        assert_ne!(
             map_or_collapse(format!("freenet:{SITE}"), &reg),
             map_or_collapse(format!("freenet:{SITE}/"), &reg),
         );
@@ -4959,6 +5113,35 @@ mod tests {
         // with anything.
         let root = map_or_collapse(format!("freenet:{DELTA}/"), &reg);
         assert_eq!(root, format!("freenet:{DELTA}/"));
+    }
+
+    /// The narrower door a review found into the SAME danger the test above
+    /// covers: a container whose registry entry named it, but whose link
+    /// template this crawler could not reverse (so it never became an
+    /// `AppView` and never entered `apps`), must be protected exactly as if
+    /// its `AppView` HAD built successfully. Without `all_named_containers`,
+    /// `owns_container` would consult `apps` alone, find nothing, and collapse
+    /// every locator on that platform into one shared listing — reachable with
+    /// an on-chain-valid link template (`AppRecord::check` in `atlas-common`
+    /// allows `{resource}` and `{path}` to have something between them; this
+    /// crawler's reversal does not), so a curator doing nothing wrong triggers
+    /// it just by registering an app whose template has that shape.
+    #[test]
+    fn map_or_collapse_protects_a_container_the_registry_named_but_could_not_reverse() {
+        const UNREVERSIBLE: &str = "9S7AAZqHC4ZW5V3nhauhDXg1dhtZzBUKBizJwa67E7YF";
+        let mut reg = delta_registry();
+        // Simulates what `AppRegistryView::load` produces for a registry entry
+        // whose link template failed the `rest != "{path}"` check: the container
+        // is NAMED (recorded before that check runs) but has no `AppView`.
+        reg.all_named_containers.insert(UNREVERSIBLE.to_string());
+        let a = map_or_collapse(format!("freenet:{UNREVERSIBLE}/#/site-a"), &reg);
+        let b = map_or_collapse(format!("freenet:{UNREVERSIBLE}/#/site-b"), &reg);
+        assert_ne!(
+            a, b,
+            "a container the registry named — even one this crawler could not \
+             build an AppView for — must never have its sites collapsed together"
+        );
+        assert_eq!(a, format!("freenet:{UNREVERSIBLE}/#/site-a"));
     }
 
     /// The other half of the same danger: an EMPTY registry is indistinguishable
@@ -6015,6 +6198,7 @@ mod tests {
                 contract_id: RIVER.into(),
                 prefix: "/#".into(),
             }],
+            all_named_containers: [RIVER.to_string()].into_iter().collect(),
         };
         // Built by the PRODUCTION expression, not a copy of it: a test that
         // rebuilds the format string proves only that its own copy resolves.
@@ -7132,6 +7316,7 @@ mod tests {
     fn the_source_pins_are_all_present() {
         let src = include_str!("main.rs");
         for pin in [
+            "fn extract_message_urls_routes_through_map_or_collapse",
             "fn the_bundled_wasm_is_not_yet_legacy",
             "fn room_key_derivation_matches_the_live_network",
             "fn the_bundled_wasm_looks_like_a_wasm_module",
