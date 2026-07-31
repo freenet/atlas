@@ -5587,10 +5587,15 @@ mod tests {
         for i in 0..MAX_PENDING_PER_AUTHOR + 50 {
             // Staggered hold times, so the victim rule is genuinely exercised:
             // with one uniform due time the max_by degenerates to the locator
-            // STRING tiebreak and min_by would pass too. Zero-padded so the
-            // string order cannot stand in for the numeric one either.
+            // STRING tiebreak and min_by would pass too.
+            //
+            // Deliberately NOT zero-padded. Padding would make the string order
+            // agree with the due-time order, so a mutation selecting on the
+            // locator alone would pick the same victims and pass. Unpadded, the
+            // lexicographic max of "0".."249" is "99", so that mutation evicts
+            // low-numbered entries and the survivor loop below catches it.
             if let Some(v) = q.hold(
-                &format!("https://s.example/{i:04}"),
+                &format!("https://s.example/{i}"),
                 "external",
                 "SPAMMER",
                 1_000 + i as u64 * 60,
@@ -5622,7 +5627,7 @@ mod tests {
         // earliest holds.
         for i in 0..MAX_PENDING_PER_AUTHOR {
             assert!(
-                held.contains(&format!("https://s.example/{i:04}")),
+                held.contains(&format!("https://s.example/{i}")),
                 "the soonest-due entries must survive (i={i})"
             );
         }
@@ -5810,16 +5815,6 @@ mod tests {
             !production.contains("fn the_give_up_branch_quarantines"),
             "the scan region must exclude the test module, or the pin matches itself"
         );
-        // A source pin can be deleted along with the code it guards, and that is
-        // not hypothetical: this test WAS accidentally deleted during a rewrite of
-        // the surrounding module and restored only because someone grepped for it.
-        // This assertion is circular — delete both and it goes too — so be clear
-        // what it buys: it raises an ACCIDENTAL deletion to a deliberate one. That
-        // is worth a line; it is not a guarantee.
-        assert!(
-            src.contains("fn the_give_up_branch_quarantines_and_does_not_blacklist"),
-            "this pin must not be removed without removing this assertion too"
-        );
 
         // Every write to the append-only seen file, ANYWHERE in the crawler.
         // Scoping this to one branch let the blacklist come back through a
@@ -5860,7 +5855,9 @@ mod tests {
             match c {
                 '{' => depth += 1,
                 '}' => {
-                    depth -= 1;
+                    depth = depth
+                        .checked_sub(1)
+                        .expect("the Ok arm's body must start at its opening brace");
                     if depth == 0 {
                         ok_end = ok_body_start + i + 1;
                         break;
@@ -5964,6 +5961,38 @@ mod tests {
              (unresolvable app, deterministic refusal, gone-for-good); a new one \
              can shadow every transient error and make give-up dead code"
         );
+    }
+
+    /// The source pins must still exist.
+    ///
+    /// Deliberately a SEPARATE test. An assertion of this kind placed inside the
+    /// pin it names is deleted in the same edit as the pin, so it fires only on a
+    /// rename — which is not the failure that actually happened: the give-up pin
+    /// was accidentally deleted during a rewrite of this module and restored only
+    /// because someone grepped for it. Living out here, a deleter has to remove
+    /// two independent functions.
+    ///
+    /// Still circular (delete this too and it goes), so be precise about what it
+    /// buys: it raises an ACCIDENTAL deletion to a deliberate one. It is not a
+    /// guarantee.
+    #[test]
+    fn the_source_pins_are_all_present() {
+        let src = include_str!("main.rs");
+        for pin in [
+            "fn the_give_up_branch_quarantines_and_does_not_blacklist",
+            "fn strip_comments",
+        ] {
+            // COUNT, not `contains`. Each name appears twice in a healthy file:
+            // the definition, and the literal in this list. A bare `contains`
+            // is satisfied by this list's own text, so it stays green after the
+            // pin is deleted — the self-match trap, and exactly the failure this
+            // test exists to catch.
+            assert_eq!(
+                src.matches(pin).count(),
+                2,
+                "{pin} must exist (found only this list's own mention of it)"
+            );
+        }
     }
 
     /// Strip `//` line comments so a source pin cannot be satisfied by prose.
