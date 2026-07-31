@@ -7,10 +7,15 @@
 // Usage:  node render.js <shellUrl> [--shot <pngPath>]
 // Output (stdout, one JSON object):
 //   { "ok": true, "status": <httpStatus>, "url": <frameUrl>, "html": ..., "text": ... }
-//   { "ok": true, "status": ..., "pages": [ { hash, html }, ... ] }   (--enumerate)
+//   { "ok": true, "status": ..., "pages": [ { hash, html, text }, ... ] }  (--enumerate)
 //   ...plus "partial": true when a watchdog timeout cut enumeration short.
-// Extra pages carry no `text`: the caller mines them for LINKS only, and a full
-// innerText per page doubled the output against RENDER_MAX_BYTES for nothing.
+// Every page carries BOTH: `html` is mined for links, and `text` is the content
+// region, which the caller needs to DESCRIBE a site. An app-hosted site is one
+// locator with several pages, so describing it from the entry page alone judged a
+// site on whatever its landing route happened to be — usually the app's default
+// stub. Do not drop `text` to save output bytes: it is the content region, far
+// smaller than the `html` on the same page, and removing it silently restores that
+// bug (a site whose content is one page over goes back to reading as too thin).
 //   { "ok": false, "error": <message> }
 //
 // `status` is the top-level HTTP status. The caller MUST reject a non-2xx render:
