@@ -897,6 +897,9 @@ enum Decided {
     Exhausted,
     /// Dropped because the file hit `MAX_QUARANTINE`. May have zero cycles.
     OverCapacity,
+    /// Dropped because this author's share was already full. May have zero
+    /// cycles, and says nothing about the file's overall size.
+    OverAuthorShare,
 }
 
 impl Decided {
@@ -909,6 +912,11 @@ impl Decided {
                 "the quarantine is at its {MAX_QUARANTINE}-entry limit — this was a \
                  capacity eviction, NOT retry exhaustion, so it may never have been \
                  retried at all"
+            ),
+            Self::OverAuthorShare => format!(
+                "this author already held its {MAX_PENDING_PER_AUTHOR}-entry share — \
+                 an author-share eviction, NOT retry exhaustion and NOT the file's \
+                 overall limit, so it may never have been retried at all"
             ),
         }
     }
@@ -993,19 +1001,39 @@ impl Quarantine {
             // due_at \t cycles \t defers \t kind \t author \t locator
             // (locator last: it may not contain a tab, so this parses
             // unambiguously).
-            let mut parts = line.splitn(6, '\t');
-            let (Some(due), Some(cycles), Some(defers), Some(_kind), Some(author), Some(loc)) = (
-                parts.next(),
-                parts.next(),
-                parts.next(),
-                parts.next(),
-                parts.next(),
-                parts.next(),
-            ) else {
-                dropped += 1;
-                q.dirty = true;
-                continue;
+            // Dispatch on FIELD COUNT so an older line upgrades in place instead
+            // of being discarded.
+            //
+            // A trailing `unwrap_or` cannot do this: the locator is last, so a
+            // field added in the middle shifts every column after it — a 5-field
+            // line read positionally would take `kind` as `defers`, `author` as
+            // `kind`, and the locator as `author`. Splitting on count is the only
+            // form that reads both shapes correctly.
+            //
+            // This has already changed twice on this branch (adding `cycles`, then
+            // `defers`). Doing it now is free because the file has never shipped;
+            // after merge it holds real durable state, and a third change without
+            // this would silently wipe it while reporting "no longer validate",
+            // which misattributes a schema change as a validation failure. A new
+            // field means a new arm here.
+            let f: Vec<&str> = line.splitn(6, '\t').collect();
+            let (due, cycles, defers, author, loc) = match f.len() {
+                // due, cycles, defers, kind, author, locator  (current)
+                6 => (f[0], f[1], f[2], f[4], f[5]),
+                // due, cycles, kind, author, locator
+                5 => (f[0], f[1], "0", f[3], f[4]),
+                // due, kind, author, locator
+                4 => (f[0], "0", "0", f[2], f[3]),
+                _ => {
+                    dropped += 1;
+                    q.dirty = true;
+                    continue;
+                }
             };
+            // An upgraded line must be rewritten in the current shape.
+            if f.len() != 6 {
+                q.dirty = true;
+            }
             let loc = loc.trim();
             if loc.is_empty() {
                 dropped += 1;
@@ -1125,7 +1153,7 @@ impl Quarantine {
             for (loc, _) in own.drain(MAX_PENDING_PER_AUTHOR..) {
                 q.entries.remove(&loc);
                 released.retain(|(_, l, _, _)| l != &loc);
-                decided.push((loc, Decided::OverCapacity));
+                decided.push((loc, Decided::OverAuthorShare));
             }
             q.dirty = true;
         }
@@ -5513,6 +5541,14 @@ mod tests {
             "an oversized bucket must be trimmed on load, not carried whole"
         );
         assert_eq!(decided.len(), 50, "and the excess must leave as decisions");
+        for (_, why) in &decided {
+            assert_eq!(
+                *why,
+                Decided::OverAuthorShare,
+                "an author-share eviction must not be reported as the FILE hitting \
+                 its limit — that sends an operator to check the wrong thing"
+            );
+        }
     }
 
     /// The already-queued path must go through `defer_undrained`, not
@@ -5553,6 +5589,53 @@ mod tests {
         );
     }
 
+    /// An older on-disk line must UPGRADE, not be discarded. The format has
+    /// already changed twice; after this ships the file holds real durable state,
+    /// and a third change without this would wipe it while reporting "no longer
+    /// validate" — misattributing a schema change as a validation failure.
+    #[test]
+    fn older_quarantine_line_formats_upgrade_in_place() {
+        let none: HashSet<String> = HashSet::new();
+        let now = 1_785_000_000u64;
+        let due = now - 1;
+
+        // 4-field (due, kind, author, locator) and 5-field (adds cycles), the two
+        // shapes this branch wrote before the current one.
+        for (label, line) in [
+            (
+                "4-field",
+                format!("{due}\texternal\tALICE\thttps://old.example/1\n"),
+            ),
+            (
+                "5-field",
+                format!("{due}\t2\texternal\tALICE\thttps://old.example/1\n"),
+            ),
+        ] {
+            let f = TmpFile::new("quarantine-upgrade");
+            fs::write(f.path(), &line).unwrap();
+            let (mut q, released, decided) = Quarantine::load(f.path(), now, &none);
+            assert!(decided.is_empty(), "{label} must not be given up on");
+            assert_eq!(
+                released.len(),
+                1,
+                "{label} must be read, not discarded as invalid"
+            );
+            assert_eq!(
+                q.held().count(),
+                1,
+                "{label} must be retained in the quarantine"
+            );
+            // And it must be rewritten in the current shape.
+            assert!(q.save());
+            let back = fs::read_to_string(f.path()).unwrap();
+            assert_eq!(
+                back.trim_end().split('\t').count(),
+                6,
+                "{label} must be upgraded on disk, not left in the old shape"
+            );
+        }
+    }
+
     /// A capacity eviction must not be reported as retry exhaustion. The
     /// per-locator "giving up on X" line is the greppable forensic record that
     /// replaces the undifferentiated seen file, so telling an operator a link
@@ -5568,6 +5651,17 @@ mod tests {
         assert!(
             Decided::OverCapacity.why().contains("NOT retry exhaustion"),
             "a capacity eviction must say so explicitly"
+        );
+        // A per-author eviction is NOT a global-capacity one: saying so sends an
+        // operator to check the file size when the cause was one author's share.
+        assert_ne!(
+            Decided::OverAuthorShare.why(),
+            Decided::OverCapacity.why(),
+            "the two capacity reasons must be distinguishable"
+        );
+        assert!(
+            Decided::OverAuthorShare.why().contains("author"),
+            "an author-share eviction must name the author's share as the cause"
         );
         assert!(
             Decided::Exhausted.why().contains("retry cycles"),
