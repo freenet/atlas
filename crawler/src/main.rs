@@ -2892,38 +2892,39 @@ fn crawl_hub(
     captured
 }
 
-/// BLAKE3 code hash of the CURRENT River room-contract WASM generation.
+/// The current River room-contract WASM, bundled the same way `riverctl`
+/// bundles it (`cli/contracts/room_contract.wasm`, `include_bytes!`).
 ///
-/// The room contract key is `BLAKE3(room_contract.wasm, params)` with
-/// `params = CBOR({ owner: VerifyingKey })`, so anchoring on the owner VK still
-/// needs the code hash of the current WASM generation to derive the *current*
-/// key. River re-keys the room contract on every WASM upgrade (a stdlib bump,
-/// a common/ change, etc.), which moves this hash. `river-core`'s `migration`
-/// registry gives every *previous* generation's hash (the legacy fallback), but
-/// deliberately excludes the current one, so we carry it here.
+/// A hand-copied HASH constant was tried here first and quietly rotted: it
+/// drifted at least one room-contract generation behind reality and nothing
+/// caught it, so the crawler spent 13 days (2026-07-18 to 2026-07-30) silently
+/// reading an abandoned pre-re-key copy of the Official room — 200 live
+/// messages a day, "10 candidate link(s), 0 newly captured" every run,
+/// indistinguishable from a genuinely quiet room. `river-core`'s own doc
+/// comment on `LEGACY_ROOM_CONTRACT_CODE_HASHES` explains why a hand-copied
+/// hash cannot be kept in sync: "the current generation's hash is
+/// intentionally absent — it is computed at runtime from the bundled WASM
+/// bytes." A client is expected to CARRY THE WASM, not a hash of it, precisely
+/// so this can never go stale by omission the way the constant did.
 ///
-/// This is the crawler's analogue of River UI / riverctl bundling the current
-/// `room_contract.wasm` and hashing it at runtime — we bundle just the 32-byte
-/// hash. `river_core::migration::contract_key_for_code_hash(owner, &hash)` on
-/// this value reproduces exactly what `owner_vk_to_contract_key(owner)` computes
-/// in River (pinned there by `legacy_derivation_matches_live_key_for_current_wasm`).
+/// Re-sync procedure, unchanged from what the failed constant needed: after a
+/// River re-key, `cp river/main/cli/contracts/room_contract.wasm
+/// crawler/contracts/room_contract.wasm`. `the_bundled_wasm_is_not_yet_legacy`
+/// below is what makes forgetting LOUD instead of silent: it fails the moment
+/// `river-core` is bumped past a bump that retires this exact generation,
+/// which is the same signal that would have caught this incident at the
+/// point of drift instead of 13 days into it.
+const ROOM_CONTRACT_WASM: &[u8] = include_bytes!("../contracts/room_contract.wasm");
+
+/// BLAKE3 code hash of [`ROOM_CONTRACT_WASM`], computed once per process.
 ///
-/// UPDATE-ON-RE-KEY: when River re-keys, refresh this to the new generation's
-/// hash (`b3sum river/…/ui/public/contracts/room_contract.wasm`). Until then the
-/// legacy fallback keeps reading the room from the previous generation that
-/// still has live state, so ingestion degrades gracefully rather than stopping.
-/// Bumping `river-core` folds the outgoing generation into the legacy registry
-/// but never supplies the new current hash, so this constant is the one thing
-/// that must move on a re-key.
-///
-/// Current value corresponds to the stdlib-0.8 generation (River workspace
-/// 0.1.13), whose Official-room key is `43YnYUU2nUXQRvqfDVxrv33i5PCKq7wDp9okvfSZjU8s`
-/// for owner `4uNUKFzZQCnzo4K2ecZ16cMsYEEfoaRS35z6exEsbvm4` — pinned by
-/// `river_room_key_derivation_reproduces_official`.
-const CURRENT_ROOM_CONTRACT_CODE_HASH: [u8; 32] = [
-    0x74, 0xf3, 0xdf, 0xf1, 0xc3, 0xc2, 0xf4, 0xef, 0x89, 0xe4, 0xc9, 0x3e, 0xe4, 0x5d, 0xdb, 0x62,
-    0x95, 0x2d, 0xf2, 0x21, 0x61, 0x45, 0x0a, 0x90, 0x5c, 0x27, 0x84, 0xc1, 0xfa, 0xcf, 0x67, 0x40,
-];
+/// Not a `const`: BLAKE3 hashing is not `const fn`, so this runs at first use
+/// via `OnceLock` rather than at compile time — the same tradeoff riverctl's
+/// own `ROOM_CONTRACT_WASM` handling makes (see `cli/src/api.rs`).
+fn current_room_contract_code_hash() -> &'static [u8; 32] {
+    static HASH: std::sync::OnceLock<[u8; 32]> = std::sync::OnceLock::new();
+    HASH.get_or_init(|| *blake3::hash(ROOM_CONTRACT_WASM).as_bytes())
+}
 
 /// Parse a base58 ed25519 verifying key (a River room owner VK).
 fn parse_owner_vk(s: &str) -> Result<VerifyingKey> {
@@ -2938,16 +2939,16 @@ fn parse_owner_vk(s: &str) -> Result<VerifyingKey> {
 }
 
 /// The room-contract keys to probe for `owner_vk`, newest generation first:
-/// the current generation (derived from [`CURRENT_ROOM_CONTRACT_CODE_HASH`])
-/// then every legacy generation from `river-core`'s registry (newest-first).
-/// This is what makes ingestion re-key-proof: after a River re-key the room
-/// state migrates to a new key, and we find it via the current-generation
-/// derivation once this crate learns the new hash, or via the legacy fallback
-/// in the meantime.
+/// the current generation (derived from the bundled
+/// [`ROOM_CONTRACT_WASM`]) then every legacy generation from `river-core`'s
+/// registry (newest-first). This is what makes ingestion re-key-proof: after a
+/// River re-key the room state migrates to a new key, and we find it via the
+/// current-generation derivation as long as the bundled WASM is current, or
+/// via the legacy fallback in the meantime.
 fn room_candidate_keys(owner_vk: &VerifyingKey) -> Vec<ContractKey> {
     let mut keys = vec![river_core::migration::contract_key_for_code_hash(
         owner_vk,
-        &CURRENT_ROOM_CONTRACT_CODE_HASH,
+        current_room_contract_code_hash(),
     )];
     keys.extend(river_core::migration::legacy_contract_keys_for_owner(
         owner_vk,
@@ -4892,30 +4893,54 @@ mod tests {
     /// The Freenet Official room's stable owner VerifyingKey (from the
     /// `river-official-room` runbook; the key gkapi signs invites with).
     const OFFICIAL_OWNER_VK: &str = "4uNUKFzZQCnzo4K2ecZ16cMsYEEfoaRS35z6exEsbvm4";
-    /// The Official room's live contract key at the current (stdlib-0.8) WASM
-    /// generation (verified live in `~/.local/share/river/rooms.json`).
-    const OFFICIAL_CURRENT_KEY: &str = "43YnYUU2nUXQRvqfDVxrv33i5PCKq7wDp9okvfSZjU8s";
 
-    /// The re-key-proofing guard: deriving the current room-contract key from
-    /// the Official room's owner VK + [`CURRENT_ROOM_CONTRACT_CODE_HASH`] must
-    /// reproduce the known live key. If River re-keys and this constant is not
-    /// refreshed, this fails — a loud, correct signal to update the hash.
+    /// The structural check, not the incident's own postmortem check.
+    ///
+    /// The PREVIOUS version of this test hardcoded the expected key as a string
+    /// literal — `assert_eq!(derived, "43YnY…")` — captured at the same moment
+    /// the (also hand-copied) code-hash constant was written. Both were
+    /// snapshots of the SAME live lookup, so of course they agreed; the test
+    /// could only ever confirm "this file is internally consistent with
+    /// itself", never "this file still matches the network". That is why it
+    /// passed for the entire 13 days the crawler was silently reading a dead
+    /// room: nothing in the test involves the network, `river-core`, or any
+    /// source that updates independently of this file.
+    ///
+    /// This version asserts something that can ONLY be true if the bundled
+    /// WASM is still current: that its hash is ABSENT from river-core's
+    /// legacy registry. `river-core` appends a hash to that registry exactly
+    /// when a re-key retires it — so the day this crate's `river-core`
+    /// dependency is bumped past a bump that retires today's bundled WASM,
+    /// this fails, with the exact word "legacy" in the message, at the point
+    /// of drift. That is the same signal a human ignored for 13 days; the
+    /// difference is this one is `cargo test`, not a log line to notice.
     #[test]
-    fn river_room_key_derivation_reproduces_official() {
+    fn the_bundled_wasm_is_not_yet_legacy() {
+        let hash = *current_room_contract_code_hash();
+        assert!(
+            !river_core::migration::LEGACY_ROOM_CONTRACT_CODE_HASHES.contains(&hash),
+            "crawler/contracts/room_contract.wasm has been superseded (its hash is \
+             now in river-core's legacy registry) — copy the current WASM from \
+             river/main/cli/contracts/room_contract.wasm and re-run this test"
+        );
+    }
+
+    /// The room-contract keys to probe must actually start with the current
+    /// generation, not skip straight to a legacy one — and there must be a
+    /// legacy fallback at all, or a stale bundle has no recovery path.
+    #[test]
+    fn room_candidate_keys_tries_current_generation_first() {
         let owner = parse_owner_vk(OFFICIAL_OWNER_VK).expect("official owner vk parses");
-        let key = river_core::migration::contract_key_for_code_hash(
+        let current = river_core::migration::contract_key_for_code_hash(
             &owner,
-            &CURRENT_ROOM_CONTRACT_CODE_HASH,
+            current_room_contract_code_hash(),
         );
-        assert_eq!(
-            key.id().to_string(),
-            OFFICIAL_CURRENT_KEY,
-            "current-generation derivation must reproduce the live Official room key"
-        );
-        // And the first candidate we actually probe is that current key.
         let candidates = room_candidate_keys(&owner);
-        assert_eq!(candidates[0].id().to_string(), OFFICIAL_CURRENT_KEY);
-        // Plus at least one legacy generation from river-core's registry.
+        assert_eq!(
+            candidates[0].id(),
+            current.id(),
+            "the first candidate must be the current-generation derivation"
+        );
         assert!(
             candidates.len() > 1,
             "expected current + legacy candidate keys, got {}",
@@ -6749,6 +6774,8 @@ mod tests {
     fn the_source_pins_are_all_present() {
         let src = include_str!("main.rs");
         for pin in [
+            "fn the_bundled_wasm_is_not_yet_legacy",
+            "fn room_candidate_keys_tries_current_generation_first",
             "fn the_probe_handle_is_fresh_every_run",
             "fn a_too_short_probe_result_is_not_a_usable_baseline",
             "fn a_truncated_walk_is_refused_rather_than_decided",
