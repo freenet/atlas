@@ -2776,9 +2776,10 @@ fn hub_outbound_links(
     let mut have: HashSet<String> = HashSet::new();
     for html in htmls {
         for (loc, kind) in extract_locators(html) {
-            // Map BEFORE deduping, or the same site reached from two pages under two
-            // different page paths counts twice.
-            let loc = registry.map_locator(&loc).unwrap_or(loc);
+            // Map (or, for an unregistered fragment-routed site, collapse) BEFORE
+            // deduping, or the same site reached from two pages under two different
+            // page paths counts twice.
+            let loc = map_or_collapse(loc, registry);
             if have.insert(loc.clone()) {
                 links.push((loc, kind));
             }
@@ -3184,10 +3185,9 @@ fn extract_message_urls(
             // this a Delta URL posted in the room is indexed under its container and
             // becomes a SECOND entry for a site the hub crawl files under `app:delta/…`
             // — the dedup collapse this work exists to prevent, via a different door.
-            let (loc, kind) = match registry.map_locator(&loc) {
-                Some(mapped) => (mapped, kind),
-                None => (loc, kind),
-            };
+            // For anything NOT registered, `map_or_collapse` still folds different
+            // fragments of one unregistered SPA together, same reasoning.
+            let loc = map_or_collapse(loc, registry);
             if seen.insert(loc.clone()) {
                 out.push((loc, kind, author.clone()));
             }
@@ -3380,6 +3380,21 @@ impl AppRegistryView {
         }
         Some(format!("app:{}/{}", app.slug, resource))
     }
+
+    /// Does `contract_id` belong to a REGISTERED app, regardless of whether this
+    /// specific locator's path/resource matched its pattern?
+    ///
+    /// `map_locator` returning `None` conflates two different situations: the
+    /// container is not registered at all (genuinely safe to treat as a single-
+    /// owner site), or it IS registered but this locator's path failed to match
+    /// (a too-short resource handle, a prefix mismatch) — which says nothing
+    /// about whether the CONTAINER itself is multi-tenant. `collapse_unmapped_
+    /// fragment` needs to tell these apart; this is that check, factored out so
+    /// the two `self.apps` scans (this one and `map_locator`'s) stay obviously
+    /// the same predicate rather than drifting apart.
+    fn owns_container(&self, id: &str) -> bool {
+        self.apps.iter().any(|a| a.contract_id == id)
+    }
 }
 
 impl AppRegistryView {
@@ -3494,10 +3509,83 @@ fn locator_identity(loc: &str) -> &str {
 /// Normalize an href and then map it onto a registered app if it belongs to one.
 fn normalize_mapped(href: &str, registry: &AppRegistryView) -> Option<(String, &'static str)> {
     let (loc, kind) = normalize_href(href)?;
+    Some((map_or_collapse(loc, registry), kind))
+}
+
+/// Map a locator onto its registered app if possible; otherwise, for a `freenet:`
+/// locator, collapse its fragment so different pages of one unregistered
+/// fragment-routed site converge on one canonical form.
+///
+/// This is the ONE place both steps happen together, used by every discovery
+/// path (curated sources, hub link mining, River-room message scanning) so none
+/// of them can drift out of sync with each other — which is exactly how the
+/// three call sites ended up independently reimplementing "map or fall back to
+/// raw" before this existed as a named function.
+fn map_or_collapse(loc: String, registry: &AppRegistryView) -> String {
     match registry.map_locator(&loc) {
-        Some(app_loc) => Some((app_loc, kind)),
-        None => Some((loc, kind)),
+        Some(mapped) => mapped,
+        None => collapse_unmapped_fragment(loc, registry),
     }
+}
+
+/// Collapse the fragment of an UNREGISTERED `freenet:` locator, so different
+/// pages of one single-owner fragment-routed app (an image board, say) converge
+/// on one canonical locator — the identity collapse `map_locator` already gives
+/// a REGISTERED app's pages, generalised to a site nobody registered.
+///
+/// Reported live: an unregistered single-page image board produced FIVE index
+/// entries for one site (the bare root, a general board, a share page, two
+/// individual thread pages) because each `#fragment` normalised to its own,
+/// fully independent locator. A Freenet contract has no server-side routing —
+/// the gateway resolves the PATH only, and a browser never sends the fragment
+/// across the wire at all — so everything after `#` on a `freenet:` locator is
+/// client-side navigation within whatever the path already served, never a
+/// second document. (This is specifically about the fragment, not the query: a
+/// `?__sandbox=1` query DOES select a different server response, so only `#` is
+/// safe to drop here.)
+///
+/// Deliberately NOT applied when `contract_id` belongs to a REGISTERED app —
+/// even one THIS locator failed to match (a too-short resource handle, a prefix
+/// mismatch, the container's own root with no resource at all). `map_locator`
+/// exists specifically because collapsing by container id ALONE conflates every
+/// site on a multi-tenant platform into one listing, and a registered app's
+/// container is a multi-tenant platform by definition — Delta's own link
+/// template puts every site under one shared container, fragment-routed. Were
+/// this check absent, a registry hiccup (see below) or a resource shorter than
+/// `MIN_APP_RESOURCE_LEN` would collapse EVERY Delta site down to one shared
+/// listing, permanently — worse than the bug #20 fixed (which produced many
+/// wrong-identity listings, still recoverable one at a time), because this
+/// produces exactly one, with no way to add a second without `atlasctl remove`-
+/// ing it first. Falling back to the un-collapsed locator here instead
+/// reproduces that pre-#20 degradation for the one affected locator, not
+/// something worse: a bounded, already-tolerated cost, not a new failure class.
+///
+/// Also deliberately NOT applied when the registry is EMPTY. `AppRegistryView::
+/// load` returns the same empty value whether the registry genuinely has zero
+/// apps or merely failed to load this run, so an empty registry carries no
+/// evidence either way — treating it as "nothing is registered" would hit the
+/// exact Delta danger above on every run where `atlasctl apps` hiccups.
+fn collapse_unmapped_fragment(loc: String, registry: &AppRegistryView) -> String {
+    if registry.apps.is_empty() {
+        return loc;
+    }
+    let Some(rest) = loc.strip_prefix("freenet:") else {
+        return loc;
+    };
+    let (id, path) = split_freenet(rest);
+    if registry.owns_container(id) {
+        return loc;
+    }
+    let server_path = path.split('#').next().unwrap_or(path);
+    // "" and "/" name the same page (`contract_web_href` already treats them as
+    // one); fold that here too, or the same site can still split across two
+    // listings depending on which form a link happened to use.
+    let server_path = if server_path.is_empty() {
+        "/"
+    } else {
+        server_path
+    };
+    format!("freenet:{id}{server_path}")
 }
 
 fn normalize_href(href: &str) -> Option<(String, &'static str)> {
@@ -4774,6 +4862,149 @@ mod tests {
         // A non-app link is passed through unchanged.
         let (loc2, _) = normalize_mapped(&format!("/v1/contract/web/{RIVER}/"), &reg).unwrap();
         assert_eq!(loc2, format!("freenet:{RIVER}/"));
+    }
+
+    /// The exact shape reported live: five distinct locators for one unregistered
+    /// image board — the bare root, a share page, a general board, and two
+    /// individual thread pages — all under one contract with an empty server path
+    /// once the fragment is dropped. All five must collapse to one canonical
+    /// locator.
+    #[test]
+    fn map_or_collapse_folds_fragment_routed_pages_of_one_unregistered_site() {
+        const CALLIOPE: &str = "DPZS3nmaS8XRqLufy3cq4t2DWkfG8k22gi8jcbykRzAH";
+        let reg = delta_registry(); // Registered, but Calliope is not IN it.
+        let root = map_or_collapse(format!("freenet:{CALLIOPE}/"), &reg);
+        let share = map_or_collapse(format!("freenet:{CALLIOPE}/#/share"), &reg);
+        let general = map_or_collapse(format!("freenet:{CALLIOPE}/#/b/general"), &reg);
+        let thread_a = map_or_collapse(
+            format!(
+                "freenet:{CALLIOPE}/#/b/general/t/3zusJJow77inBg8Grh1C8fjxA69ZSknwgXXmhSfTiAz6"
+            ),
+            &reg,
+        );
+        let thread_b = map_or_collapse(
+            format!(
+                "freenet:{CALLIOPE}/#/b/general/t/CCcVLnGCX3ahZocrJRadgBt8f2V7YSpqJ3YxMgP32Y7n"
+            ),
+            &reg,
+        );
+        let want = format!("freenet:{CALLIOPE}/");
+        for (name, got) in [
+            ("root", &root),
+            ("share", &share),
+            ("general", &general),
+            ("thread_a", &thread_a),
+            ("thread_b", &thread_b),
+        ] {
+            assert_eq!(got, &want, "{name} must collapse to the bare root");
+        }
+    }
+
+    /// The bare-root aliases "" and "/" must collapse into ONE canonical form too,
+    /// or the same site can still split across two listings depending on which
+    /// spelling a link happened to use.
+    #[test]
+    fn map_or_collapse_folds_the_bare_root_alias() {
+        const SITE: &str = "DPZS3nmaS8XRqLufy3cq4t2DWkfG8k22gi8jcbykRzAH";
+        let reg = delta_registry();
+        assert_eq!(
+            map_or_collapse(format!("freenet:{SITE}"), &reg),
+            map_or_collapse(format!("freenet:{SITE}/"), &reg),
+        );
+    }
+
+    /// The path is what stays distinct, not collapsed away with the fragment: two
+    /// genuinely different documents on one unregistered contract must stay two
+    /// listings, exactly the "contract is the publisher" case this deliberately
+    /// preserves.
+    #[test]
+    fn map_or_collapse_still_separates_different_paths_on_one_unregistered_site() {
+        const SITE: &str = "DPZS3nmaS8XRqLufy3cq4t2DWkfG8k22gi8jcbykRzAH";
+        let reg = delta_registry();
+        let a = map_or_collapse(format!("freenet:{SITE}/posts/hello"), &reg);
+        let b = map_or_collapse(format!("freenet:{SITE}/posts/goodbye"), &reg);
+        assert_ne!(a, b, "different paths must stay distinct listings");
+    }
+
+    /// The danger a blind review caught before merge: collapsing MUST NOT apply to
+    /// a REGISTERED app's own container, even for a locator that failed to match
+    /// that app's pattern — a too-short resource, a registry the loader had not
+    /// resolved yet, or the container's own bare root. Every one of these is
+    /// reachable in production (see `MIN_APP_RESOURCE_LEN`, `AppRegistryView::
+    /// load`'s non-fatal failure path), and getting this wrong is much worse than
+    /// the bug this whole function exists to fix: it would collapse EVERY site on
+    /// a multi-tenant platform like Delta down to ONE shared listing, permanently
+    /// — not many wrong-identity listings (recoverable one at a time, as #20 left
+    /// it), but exactly one, with no way to add a second without `atlasctl remove`
+    /// -ing it first.
+    #[test]
+    fn map_or_collapse_never_touches_a_registered_apps_container() {
+        let reg = delta_registry();
+        // A resource shorter than MIN_APP_RESOURCE_LEN fails map_locator's match,
+        // but the CONTAINER is still Delta's — must not collapse.
+        let short_a = map_or_collapse(format!("freenet:{DELTA}/#new"), &reg);
+        let short_b = map_or_collapse(format!("freenet:{DELTA}/#settings"), &reg);
+        assert_ne!(
+            short_a, short_b,
+            "two DIFFERENT under-length resources on Delta's container must not \
+             collapse into each other just because neither matched"
+        );
+        assert_eq!(
+            short_a,
+            format!("freenet:{DELTA}/#new"),
+            "an unmatched locator on a REGISTERED container must pass through \
+             UNCHANGED, not have its fragment stripped"
+        );
+        // The container's own bare root — also unmatched, also must not collapse
+        // with anything.
+        let root = map_or_collapse(format!("freenet:{DELTA}/"), &reg);
+        assert_eq!(root, format!("freenet:{DELTA}/"));
+    }
+
+    /// The other half of the same danger: an EMPTY registry is indistinguishable
+    /// from a FAILED load (`AppRegistryView::load` returns the same value either
+    /// way), so it must be treated as "unknown", not "nothing is registered" — or
+    /// a transient `atlasctl apps` hiccup would collapse Delta's sites exactly as
+    /// the test above proves must never happen, on every run where the registry
+    /// fails to load.
+    #[test]
+    fn map_or_collapse_does_nothing_when_the_registry_is_empty() {
+        let empty = AppRegistryView::default();
+        let a = map_or_collapse(format!("freenet:{DELTA}/#/b/general"), &empty);
+        let b = map_or_collapse(format!("freenet:{DELTA}/#/share"), &empty);
+        assert_ne!(
+            a, b,
+            "with no registry loaded, nothing may be collapsed — not even a \
+             contract that WOULD be Delta's, once the registry is back"
+        );
+    }
+
+    /// Two different unregistered contracts must never collapse into each other
+    /// just because their paths or fragments happen to match.
+    #[test]
+    fn map_or_collapse_never_collapses_across_different_contracts() {
+        let reg = delta_registry();
+        let a = map_or_collapse(
+            "freenet:DPZS3nmaS8XRqLufy3cq4t2DWkfG8k22gi8jcbykRzAH/#/b/general".to_string(),
+            &reg,
+        );
+        let b = map_or_collapse(
+            "freenet:9S7AAZqHC4ZW5V3nhauhDXg1dhtZzBUKBizJwa67E7YF/#/b/general".to_string(),
+            &reg,
+        );
+        assert_ne!(a, b);
+    }
+
+    /// A locator that DOES map onto a registered app is untouched by the collapse
+    /// logic entirely — it returns straight from `map_locator`, never reaching
+    /// `collapse_unmapped_fragment`.
+    #[test]
+    fn map_or_collapse_leaves_a_successfully_mapped_locator_alone() {
+        let reg = delta_registry();
+        assert_eq!(
+            map_or_collapse(format!("freenet:{DELTA}/#AmcVD92D3U/7/river-lore"), &reg),
+            "app:delta/AmcVD92D3U"
+        );
     }
 
     /// The crawler keeps its own copies of the path guards, and `atlas_common::path`
