@@ -257,10 +257,6 @@ async function pickFrame(page) {
         // HTML instead would pull in the app's chrome, which is the contamination
         // `--require-content` exists to prevent.
         got.text = await contentText(f2);
-        // The app ran out of pages: it either stopped moving or re-served a page we
-        // already have. Without this, a 3-page site spent most of the remaining
-        // watchdog re-capturing identical DOMs and pushing them toward the output
-        // cap, then fed the same HTML to link extraction nine times.
         // Walking back onto the ENTRY page is not "out of pages". The entry is
         // whatever the sources file named, so a walk that starts at #res/3 passes
         // through its own entry on step 3 — breaking there lost pages 4..N for
@@ -272,6 +268,12 @@ async function pickFrame(page) {
           if (entryRevisits++) break;
           continue;
         }
+        // The app ran out of pages: it re-served one we already captured on THIS
+        // walk. Without this, a 3-page site spent most of the remaining watchdog
+        // re-capturing identical DOMs and pushing them toward the output cap, then
+        // fed the same HTML to link extraction nine times. Note this does not fire
+        // for an app that answers an out-of-range page with a fresh empty page
+        // under a fresh hash, so the page cap is the real bound there.
         if (seenHashes.has(got.hash)) break;
         seenHashes.add(got.hash);
         pages.push(got);

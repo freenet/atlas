@@ -1998,9 +1998,16 @@ fn index_locator(
         .as_ref()
         .map(|(_, resource)| (resource.as_str(), cli.app_max_pages));
     let mut page = get_page_enumerating(cli, client, gw, loc, registry, enumerate)?;
-    // A prefix of a site is not the site. Refuse rather than decide permanently on
-    // it — see `TruncatedWalk`.
-    if page.truncated {
+    // A PREFIX of a multi-page site is not the site. Refuse rather than decide
+    // permanently on it — see `TruncatedWalk`.
+    //
+    // Only when the walk actually captured part of one, though. A walk that ran out
+    // of clock before its first step tells us nothing except what we already knew:
+    // the entry page, which is exactly what this locator was judged on before any of
+    // this existed. Refusing there discarded sites that were being indexed correctly
+    // — a single-page site with a 10,000-character landing page would be thrown away
+    // on a slow gateway for failing to walk pages it does not have.
+    if page.truncated && !page.extra_texts.is_empty() {
         return Err(TruncatedWalk.into());
     }
     // Before spending anything: is this actually a page about the resource we asked
@@ -5340,7 +5347,7 @@ mod tests {
         // pages the site may not have, so an unscreened extra page hands the
         // classifier a description of a site the reader never asked for.
         assert!(
-            body.contains("page.extra_texts") && body.contains("is_placeholder("),
+            body.contains(".retain(|t| !baselines.is_placeholder("),
             "every enumerated page must be screened against the missing-resource \
              baseline, not just the entry page"
         );
@@ -5388,7 +5395,8 @@ mod tests {
         );
         let production = strip_comments(production);
         assert!(
-            production.contains("if page.truncated {") && production.contains("TruncatedWalk"),
+            production.contains("if page.truncated && !page.extra_texts.is_empty() {")
+                && production.contains("return Err(TruncatedWalk.into());"),
             "the describe path must check the flag; parsing it and ignoring it is \
              the state this replaced"
         );
@@ -5435,14 +5443,28 @@ mod tests {
         );
         // An early stop must be reported. Unreported, the caller cannot tell a
         // complete walk from a prefix, and decides permanently on whichever it got.
+        assert_eq!(
+            js.matches("truncated = true;").count(),
+            3,
+            "every early exit must mark the walk: the wall clock, a failed hash \
+             step, and a failed capture — a bare `contains` stays green while the \
+             wall-clock one, the likeliest of the three, is deleted"
+        );
         assert!(
-            js.contains("truncated = true;") && js.contains("partial: truncated"),
-            "a walk that stops early must say so in its output"
+            js.contains("partial: truncated"),
+            "and the mark must reach the caller"
         );
         assert!(
             js.contains("const stopBy = startedAt + WATCHDOG_MS - ENUM_RESERVE_MS;"),
             "the walk deadline must share the watchdog's origin, or the reserve \
              grants itself a fresh budget and stops bounding anything"
+        );
+        // WHERE the origin is taken is the whole fix; the arithmetic above was
+        // never wrong. Moving this assignment inside the async body restores the
+        // bug with the expression pin still green.
+        assert!(
+            js.contains("\nconst startedAt = Date.now();"),
+            "the origin must be taken at MODULE scope, i.e. process start"
         );
     }
 
