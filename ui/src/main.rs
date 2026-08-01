@@ -171,11 +171,32 @@ fn App() -> Element {
         .as_ref()
         .map(|s| s.live_entries().count())
         .unwrap_or(0);
-    let external_hidden = STATE
+    // Whether the toggle row renders at all: the WHOLE index, independent of
+    // the query and of the toggle itself. Query-independent so the row cannot
+    // vanish out from under a search (a query matching zero externals must
+    // not also hide the only control that explains why); toggle-independent
+    // so turning it on cannot make the row (and with it, the only way to turn
+    // it back off) disappear.
+    let total_external = STATE
         .read()
         .as_ref()
         .map(|s| {
             s.live_entries()
+                .filter(|e| !passes_external_filter(e, false))
+                .count()
+        })
+        .unwrap_or(0);
+    // What the label claims: how many hidden web links match the CURRENT
+    // query, not the whole index. Using the unscoped count here reads as a
+    // promise the toggle does not keep — search for something no external
+    // entry matches and it would still claim N are hidden, then reveal zero
+    // new results when clicked.
+    let external_matching_query = STATE
+        .read()
+        .as_ref()
+        .map(|s| {
+            s.live_entries()
+                .filter(|e| matches_query(e, &q))
                 .filter(|e| !passes_external_filter(e, false))
                 .count()
         })
@@ -217,8 +238,11 @@ fn App() -> Element {
                 oninput: move |e| query.set(e.value()),
             }
             // Only shown when there is something to toggle: a reader with zero
-            // external entries in the index has nothing to decide.
-            if external_hidden > 0 {
+            // external entries in the index has nothing to decide. Gated on
+            // `total_external`, deliberately not the query-scoped count below
+            // — this row is the only way to turn the toggle back off, so it
+            // must stay put regardless of what the search box currently says.
+            if total_external > 0 {
                 div { class: "filter-row",
                     input {
                         r#type: "checkbox",
@@ -230,7 +254,7 @@ fn App() -> Element {
                         if show_external() {
                             "Showing regular web links too"
                         } else {
-                            "Freenet only — {external_hidden} web link{plural_s(external_hidden)} hidden"
+                            "Freenet only — {external_matching_query} web link{plural_s(external_matching_query)} hidden"
                         }
                     }
                 }
@@ -247,7 +271,19 @@ fn App() -> Element {
             }
             if entries.is_empty() {
                 div { class: "empty",
-                    if STATE.read().is_some() { "Nothing matches." } else { "Loading…" }
+                    if STATE.read().is_none() {
+                        "Loading…"
+                    } else if !show_external() && external_matching_query > 0 {
+                        // The filter, not the search, is why the grid is
+                        // empty — everything that DID match got hidden by the
+                        // toggle above. Distinguished from "nothing matches"
+                        // because the fix is different: click the toggle, not
+                        // change the search.
+                        "Nothing on Freenet matches — {external_matching_query} web \
+                         link{plural_s(external_matching_query)} do, hidden above."
+                    } else {
+                        "Nothing matches."
+                    }
                 }
             } else {
                 div { class: "grid",
@@ -474,7 +510,19 @@ const SHOW_EXTERNAL_BY_DEFAULT: bool = false;
 /// `wasm32` target to even compile, since it touches `web_sys::window()` and
 /// friends unconditionally.
 fn passes_external_filter(e: &IndexEntry, show_external: bool) -> bool {
-    show_external || e.kind != Kind::External
+    // Keys on `locator`, not `kind`, matching the existing check at the Open
+    // link (`let external = matches!(entry.locator, Locator::External { .. })`)
+    // rather than inventing a second one. They are independent fields with no
+    // enforced invariant tying them together — nothing in `IndexEntry::check`,
+    // `atlasctl add`, or the on-chain contract requires `kind` to agree with
+    // what `locator` actually opens — and the crawler has at least one path
+    // that can label a real Freenet locator "external" (an `app:` locator that
+    // fails `map_locator`'s reversal falls into the scheme-blind
+    // `"external"` fallback). `kind` is a DISPLAY taxonomy; whether a link
+    // takes you off Freenet is `locator`'s question, and getting this wrong in
+    // that direction — a "Freenet only" filter hiding real Freenet content —
+    // is the one failure mode this feature must never have.
+    show_external || !matches!(e.locator, Locator::External { .. })
 }
 
 fn plural_s(n: usize) -> &'static str {
@@ -505,6 +553,9 @@ fn matches_query(e: &IndexEntry, q: &str) -> bool {
 mod tests {
     use super::*;
 
+    /// `kind` and `locator` set to agree, matching how the crawler's normal
+    /// paths pair them. Use [`entry_mismatched`] to construct the disagreeing
+    /// case the filter has to get right anyway.
     fn entry(kind: Kind) -> IndexEntry {
         let locator = match kind {
             Kind::External => Locator::External {
@@ -515,6 +566,10 @@ mod tests {
                 path: "/".to_string(),
             },
         };
+        entry_with(kind, locator)
+    }
+
+    fn entry_with(kind: Kind, locator: Locator) -> IndexEntry {
         IndexEntry {
             subject_id: SubjectId::parse("28VTg95wG2zvE").expect("valid test subject id"),
             version: 1,
@@ -561,6 +616,116 @@ mod tests {
                 "{kind:?} must pass once show_external is true"
             );
         }
+    }
+
+    /// `kind` and `locator` are independent fields — nothing in `IndexEntry::
+    /// check`, `atlasctl add`, or the on-chain contract requires them to
+    /// agree — and the crawler has at least one path that mislabels a real
+    /// `app:`/`freenet:` locator as `Kind::External` (an `app:` locator that
+    /// fails `map_locator`'s reversal falls into a scheme-blind "external"
+    /// fallback). The filter must follow `locator`, the field that actually
+    /// decides where Open navigates, not `kind`, a display label — or a
+    /// "Freenet only" filter could hide real Freenet content, the one
+    /// failure mode this feature must never have.
+    #[test]
+    fn the_filter_follows_locator_not_kind_when_they_disagree() {
+        let mislabeled_freenet_site = entry_with(
+            Kind::External,
+            Locator::Freenet {
+                contract_id: "EqJ5YpEEV3XLqEvKWLQHFhGAac2qXzSUoE6k2zbdnXBr".to_string(),
+                path: "/".to_string(),
+            },
+        );
+        assert!(
+            passes_external_filter(&mislabeled_freenet_site, false),
+            "a Freenet locator must pass the Freenet-only filter even if its \
+             `kind` says External"
+        );
+
+        let mislabeled_web_page = entry_with(
+            Kind::Site,
+            Locator::External {
+                url: "https://example.com".to_string(),
+            },
+        );
+        assert!(
+            !passes_external_filter(&mislabeled_web_page, false),
+            "an External locator must be hidden by the Freenet-only filter \
+             even if its `kind` says Site"
+        );
+    }
+
+    /// `App` needs a live Dioxus render to test directly, so the wiring
+    /// between it and the pure functions above is otherwise unverified —
+    /// exactly the gap that let each of these four call-site mutations
+    /// survive every other test in this module while trying them by hand:
+    /// deleting the entries-chain filter call entirely (the feature vanishes,
+    /// external links reappear, nothing red); the `total_external` count
+    /// reading `show_external()` instead of the hardcoded `false` (turning
+    /// the toggle into a one-way trap — see the comment on that binding); the
+    /// render guard's `> 0` loosened to `>= 0` (the row renders even with
+    /// nothing to show, reading "0 web links hidden"); and the toggle's
+    /// initial value bypassing `SHOW_EXTERNAL_BY_DEFAULT` for a bare literal
+    /// (silently shipping with the whole feature defeated). Source-scraped,
+    /// scoped to `App`'s own body so it cannot pass by matching code in
+    /// `EntryCard` or elsewhere — the region ends at the next top-level `fn`,
+    /// which is `EntryCard`'s.
+    #[test]
+    fn app_wires_the_filter_up_correctly() {
+        let src = include_str!("main.rs");
+        let production = src
+            .split("\nmod tests")
+            .next()
+            .expect("source must have a pre-test region");
+        assert!(
+            !production.contains("fn app_wires_the_filter_up_correctly"),
+            "the scan region must exclude the test module, or the pin matches itself"
+        );
+        let at = production
+            .find("fn App() -> Element {")
+            .expect("App must exist");
+        let body = &production[at..];
+        let end = body
+            .find("\nfn ")
+            .map(|e| at + e)
+            .unwrap_or(production.len());
+        let body = &production[at..end];
+        assert!(
+            body.contains("use_signal(|| SHOW_EXTERNAL_BY_DEFAULT)"),
+            "the toggle's initial value must be the named default constant"
+        );
+        assert!(
+            body.contains(".filter(|e| passes_external_filter(e, show_external()))"),
+            "the entries grid must actually be filtered by the toggle"
+        );
+        // Matched as one line, not the multi-line block rustfmt actually
+        // produces around it — the exact indentation/wrapping is not stable
+        // across a `cargo fmt` run, but this inner expression's own text is.
+        //
+        // COUNT, not `contains`: this exact snippet legitimately appears
+        // TWICE in a healthy `App` — once for `total_external` (the row-
+        // visibility gate) and once for `external_matching_query` (the label
+        // text). A bare `contains` stays satisfied by whichever one was NOT
+        // mutated, so mutating either `false` to `show_external()` — turning
+        // either the gate or the label into a query/toggle-dependent value —
+        // would pass a `contains` check and fail to fail.
+        assert_eq!(
+            body.matches(".filter(|e| !passes_external_filter(e, false))")
+                .count(),
+            2,
+            "both `total_external` and `external_matching_query` must be \
+             computed with a hardcoded false, not the live toggle value — \
+             using show_external() in either turns a query or the toggle \
+             itself into something that can make the row (or its count) \
+             behave inconsistently, including the one-way-trap case where \
+             turning the toggle ON removes the only way to turn it back OFF"
+        );
+        assert!(
+            body.contains("if total_external > 0 {"),
+            "the toggle row must be gated on the query-independent, toggle- \
+             independent count, or it can vanish out from under a search or \
+             the toggle itself"
+        );
     }
 
     #[test]

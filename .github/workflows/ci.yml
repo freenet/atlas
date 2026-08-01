@@ -13,6 +13,15 @@ jobs:
   check:
     name: fmt, clippy, test
     runs-on: ubuntu-latest
+    # `atlas-ui` is a wasm32-only BINARY (its real `main` and everything that
+    # touches `web_sys`/`WebApi` are `#[cfg(target_arch = "wasm32")]`), but its
+    # pure logic — the filter feature's tests among them — has a native stub
+    # `main` and compiles clean on the host target specifically so it can be
+    # covered here. `env!("ATLAS_INDEX_ID")` still has to resolve for the crate
+    # to build at all on ANY target; the wasm job's own placeholder comment
+    # explains why this one is deliberately obviously-fake.
+    env:
+      ATLAS_INDEX_ID: PLACEHOLDERnotARealIndexId111111111111111111
     steps:
       - uses: actions/checkout@v4
       # No toolchain action: rust-toolchain.toml pins the channel, components and
@@ -25,13 +34,13 @@ jobs:
       - name: cargo fmt
         run: cargo fmt --all -- --check
 
-      # The contract and the UI target wasm32 and are covered by their own jobs;
-      # linting them for the host target would fail on wasm-only deps.
+      # The contract targets wasm32 only (no native stub) and is covered by its
+      # own job; linting it for the host target would fail on wasm-only deps.
       - name: cargo clippy (native crates)
-        run: cargo clippy --locked --workspace --exclude atlas-ui --exclude atlas-index-contract --all-targets
+        run: cargo clippy --locked --workspace --exclude atlas-index-contract --all-targets
 
       - name: cargo test (native crates)
-        run: cargo test --locked --workspace --exclude atlas-ui --exclude atlas-index-contract
+        run: cargo test --locked --workspace --exclude atlas-index-contract
 
   wasm:
     name: wasm builds
