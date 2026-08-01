@@ -153,13 +153,16 @@ fn App() -> Element {
     });
     let mut query = use_signal(String::new);
     let q = query().to_lowercase();
-    // Off by default per user feedback (Ivvor, River Official, 2026-07-31): a
-    // `Kind::External` entry is an ordinary https:// page, not something on
-    // Freenet, and mixed into results-by-default it reads as "Atlas found this
-    // on Freenet" when it did not. Session-only (a `use_signal`, not persisted)
-    // — the ask was for the DEFAULT to change, not for hiding external results
-    // permanently; anyone who wants them is one click away every time.
-    let mut show_external = use_signal(|| false);
+    // Session-only (a `use_signal`, not persisted) — the ask was for the
+    // DEFAULT to change, not for hiding external results permanently; anyone
+    // who wants them is one click away every time. `SHOW_EXTERNAL_BY_DEFAULT`
+    // is a named constant, not a literal `false` here, specifically so a test
+    // can pin it directly: this function's own component-level default is not
+    // otherwise reachable from a test (`App` needs a live Dioxus render), and
+    // a mutation flipping this literal to `true` — silently shipping with the
+    // filter showing everything, defeating the entire point of the feature —
+    // passed every OTHER test in this file when tried.
+    let mut show_external = use_signal(|| SHOW_EXTERNAL_BY_DEFAULT);
 
     // Total live entries (unfiltered) for the header count, and the filtered set
     // shown in the grid.
@@ -457,6 +460,13 @@ fn kind_label(kind: Kind) -> &'static str {
     }
 }
 
+/// Per user feedback (Ivvor, River Official, 2026-07-31): "I think Atlas
+/// should only show Freenet links by default. The regular web links could be
+/// confusing." A `Kind::External` entry is an ordinary https:// page, not
+/// something the crawler found ON Freenet, and mixed into results by default
+/// it reads as "Atlas found this on Freenet" when it did not.
+const SHOW_EXTERNAL_BY_DEFAULT: bool = false;
+
 /// Should `e` be shown given the current "show external (web) links" setting?
 ///
 /// Pulled out as a plain function (no `web_sys`/Dioxus dependency) so it is
@@ -522,9 +532,23 @@ mod tests {
     /// default), a `Site`/`App` entry stays and an `External` one is hidden.
     #[test]
     fn freenet_entries_pass_the_default_filter_external_does_not() {
-        assert!(passes_external_filter(&entry(Kind::Site), false));
-        assert!(passes_external_filter(&entry(Kind::App), false));
-        assert!(!passes_external_filter(&entry(Kind::External), false));
+        // Against the NAMED CONSTANT `App` actually uses, not a literal `false`
+        // — `App`'s own `use_signal` initial value isn't otherwise reachable
+        // from a test, so pinning the constant is what stands in for it. A
+        // mutation flipping `SHOW_EXTERNAL_BY_DEFAULT` to `true` (shipping
+        // with the feature silently defeated) fails here specifically.
+        assert!(passes_external_filter(
+            &entry(Kind::Site),
+            SHOW_EXTERNAL_BY_DEFAULT
+        ));
+        assert!(passes_external_filter(
+            &entry(Kind::App),
+            SHOW_EXTERNAL_BY_DEFAULT
+        ));
+        assert!(!passes_external_filter(
+            &entry(Kind::External),
+            SHOW_EXTERNAL_BY_DEFAULT
+        ));
     }
 
     /// The toggle is an OVERRIDE, not a permanent removal: with it on, nothing
