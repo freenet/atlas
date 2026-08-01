@@ -1,17 +1,30 @@
 #![allow(non_snake_case)]
+// Only the pure functions this file exports are exercised on the host target
+// (`cargo test -p atlas-ui`, no CI job runs this crate's tests on native, but
+// it is how the filter logic below was actually verified) — the real app is
+// wasm32-only, so its own entry points are legitimately unreferenced from a
+// native `main`.
+#![cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 //! Atlas Discover: a read-only front door to Freenet. Connects to the local node
 //! over the WebSocket command API, GET+SUBSCRIBEs the index contract, and renders
 //! browse + client-side search + Open. No identity, no writes, no delegate.
 
+#[cfg(target_arch = "wasm32")]
 use std::cell::RefCell;
 
+#[cfg(test)]
+use atlas_common::SubjectId;
 use atlas_common::{IndexEntry, IndexState, Kind, Locator};
 use dioxus::prelude::*;
+#[cfg(target_arch = "wasm32")]
 use freenet_stdlib::client_api::{
     ClientRequest, ContractRequest, ContractResponse, Error, HostResponse, WebApi,
 };
+#[cfg(target_arch = "wasm32")]
 use freenet_stdlib::prelude::ContractInstanceId;
+#[cfg(target_arch = "wasm32")]
 use wasm_bindgen::JsValue;
+#[cfg(target_arch = "wasm32")]
 use wasm_bindgen_futures::spawn_local;
 
 /// The index contract instance id, baked in at build time. REQUIRED: there is
@@ -55,6 +68,7 @@ const _: () = assert!(
 static STATE: GlobalSignal<Option<IndexState>> = Signal::global(|| None);
 static STATUS: GlobalSignal<String> = Signal::global(|| "connecting…".to_string());
 
+#[cfg(target_arch = "wasm32")]
 thread_local! {
     static API: RefCell<Option<WebApi>> = const { RefCell::new(None) };
 }
@@ -111,13 +125,20 @@ body { margin:0; background:var(--bg); color:var(--fg); line-height:1.5;
   transition:border-color .15s; }
 .open:hover { border-color:var(--dim); }
 .open.unavail { color:var(--faint); border-style:dashed; cursor:default; }
+.filter-row { display:flex; align-items:center; gap:.5rem; margin-top:.6rem;
+  color:var(--dim); font-size:.8rem; }
+.filter-row input { accent-color:var(--fg); }
+.filter-row label { cursor:pointer; }
 .empty { color:var(--dim); padding:3rem 0; text-align:center; }
 .foot { margin-top:2.5rem; padding-top:1.2rem; border-top:1px solid var(--line);
   color:var(--faint); font-size:.76rem; line-height:1.6; }
 "#;
 
+#[cfg(not(target_arch = "wasm32"))]
+fn main() {}
+
+#[cfg(target_arch = "wasm32")]
 fn main() {
-    #[cfg(target_arch = "wasm32")]
     std::panic::set_hook(Box::new(|info| {
         web_sys::console::error_1(&format!("atlas panic: {info}").into());
     }));
@@ -125,12 +146,20 @@ fn main() {
 }
 
 fn App() -> Element {
+    #[cfg(target_arch = "wasm32")]
     use_hook(|| {
         set_shell_title("Atlas");
         connect();
     });
     let mut query = use_signal(String::new);
     let q = query().to_lowercase();
+    // Off by default per user feedback (Ivvor, River Official, 2026-07-31): a
+    // `Kind::External` entry is an ordinary https:// page, not something on
+    // Freenet, and mixed into results-by-default it reads as "Atlas found this
+    // on Freenet" when it did not. Session-only (a `use_signal`, not persisted)
+    // — the ask was for the DEFAULT to change, not for hiding external results
+    // permanently; anyone who wants them is one click away every time.
+    let mut show_external = use_signal(|| false);
 
     // Total live entries (unfiltered) for the header count, and the filtered set
     // shown in the grid.
@@ -138,6 +167,15 @@ fn App() -> Element {
         .read()
         .as_ref()
         .map(|s| s.live_entries().count())
+        .unwrap_or(0);
+    let external_hidden = STATE
+        .read()
+        .as_ref()
+        .map(|s| {
+            s.live_entries()
+                .filter(|e| !passes_external_filter(e, false))
+                .count()
+        })
         .unwrap_or(0);
     let entries: Vec<IndexEntry> = match STATE.read().as_ref() {
         Some(state) => {
@@ -147,7 +185,10 @@ fn App() -> Element {
                     .cmp(&a.featured)
                     .then(b.added_at.cmp(&a.added_at))
             });
-            v.into_iter().filter(|e| matches_query(e, &q)).collect()
+            v.into_iter()
+                .filter(|e| passes_external_filter(e, show_external()))
+                .filter(|e| matches_query(e, &q))
+                .collect()
         }
         None => Vec::new(),
     };
@@ -171,6 +212,25 @@ fn App() -> Element {
                 placeholder: "Search apps, sites, and more…",
                 value: "{query}",
                 oninput: move |e| query.set(e.value()),
+            }
+            // Only shown when there is something to toggle: a reader with zero
+            // external entries in the index has nothing to decide.
+            if external_hidden > 0 {
+                div { class: "filter-row",
+                    input {
+                        r#type: "checkbox",
+                        id: "show-external",
+                        checked: show_external(),
+                        onchange: move |e| show_external.set(e.checked()),
+                    }
+                    label { r#for: "show-external",
+                        if show_external() {
+                            "Showing regular web links too"
+                        } else {
+                            "Freenet only — {external_hidden} web link{plural_s(external_hidden)} hidden"
+                        }
+                    }
+                }
             }
             // Only surface connection status while not yet ready (connecting,
             // looking for the index, errors); hide it in the normal case.
@@ -272,6 +332,7 @@ fn EntryCard(entry: IndexEntry) -> Element {
 /// to "Freenet"), so we both set our own document title and postMessage the
 /// title to the parent shell via its `__freenet_shell__` bridge (same mechanism
 /// River uses).
+#[cfg(target_arch = "wasm32")]
 fn set_shell_title(title: &str) {
     let Some(window) = web_sys::window() else {
         return;
@@ -299,6 +360,7 @@ fn set_shell_title(title: &str) {
     let _ = target.post_message(&JsValue::from(msg), "*");
 }
 
+#[cfg(target_arch = "wasm32")]
 fn connect() {
     let url = match ws_url() {
         Some(u) => u,
@@ -347,6 +409,7 @@ fn connect() {
     API.with(|a| *a.borrow_mut() = Some(api));
 }
 
+#[cfg(target_arch = "wasm32")]
 async fn request_index() {
     let id = match INDEX_ID.parse::<ContractInstanceId>() {
         Ok(i) => i,
@@ -368,6 +431,7 @@ async fn request_index() {
     }
 }
 
+#[cfg(target_arch = "wasm32")]
 fn ws_url() -> Option<String> {
     let win = web_sys::window()?;
     let loc = win.location();
@@ -393,6 +457,24 @@ fn kind_label(kind: Kind) -> &'static str {
     }
 }
 
+/// Should `e` be shown given the current "show external (web) links" setting?
+///
+/// Pulled out as a plain function (no `web_sys`/Dioxus dependency) so it is
+/// unit-testable on the native target — the rest of this file needs the
+/// `wasm32` target to even compile, since it touches `web_sys::window()` and
+/// friends unconditionally.
+fn passes_external_filter(e: &IndexEntry, show_external: bool) -> bool {
+    show_external || e.kind != Kind::External
+}
+
+fn plural_s(n: usize) -> &'static str {
+    if n == 1 {
+        ""
+    } else {
+        "s"
+    }
+}
+
 fn matches_query(e: &IndexEntry, q: &str) -> bool {
     if q.is_empty() {
         return true;
@@ -400,4 +482,67 @@ fn matches_query(e: &IndexEntry, q: &str) -> bool {
     e.title.to_lowercase().contains(q)
         || e.snippet.to_lowercase().contains(q)
         || e.tags.iter().any(|t| t.to_lowercase().contains(q))
+}
+
+// Native-only: everything above this point that touches `web_sys` needs the
+// `wasm32` target to compile at all, so these run against the pure functions
+// only (`passes_external_filter`, `plural_s`, `matches_query`, `kind_label`),
+// via `cargo test -p atlas-ui` on the host target. There is no test harness in
+// this crate for the rendered component tree itself — see the doc comment on
+// `passes_external_filter` for why the filter decision was pulled out as a
+// plain function rather than tested through `EntryCard`/`App`.
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn entry(kind: Kind) -> IndexEntry {
+        let locator = match kind {
+            Kind::External => Locator::External {
+                url: "https://example.com".to_string(),
+            },
+            _ => Locator::Freenet {
+                contract_id: "EqJ5YpEEV3XLqEvKWLQHFhGAac2qXzSUoE6k2zbdnXBr".to_string(),
+                path: "/".to_string(),
+            },
+        };
+        IndexEntry {
+            subject_id: SubjectId::parse("28VTg95wG2zvE").expect("valid test subject id"),
+            version: 1,
+            kind,
+            title: "Test".to_string(),
+            snippet: "Test".to_string(),
+            tags: Vec::new(),
+            locator,
+            featured: false,
+            added_at: 0,
+        }
+    }
+
+    /// The whole feature request in one assertion: with the toggle off (the
+    /// default), a `Site`/`App` entry stays and an `External` one is hidden.
+    #[test]
+    fn freenet_entries_pass_the_default_filter_external_does_not() {
+        assert!(passes_external_filter(&entry(Kind::Site), false));
+        assert!(passes_external_filter(&entry(Kind::App), false));
+        assert!(!passes_external_filter(&entry(Kind::External), false));
+    }
+
+    /// The toggle is an OVERRIDE, not a permanent removal: with it on, nothing
+    /// is filtered by kind at all.
+    #[test]
+    fn every_kind_passes_once_the_toggle_is_on() {
+        for kind in [Kind::App, Kind::Site, Kind::External] {
+            assert!(
+                passes_external_filter(&entry(kind), true),
+                "{kind:?} must pass once show_external is true"
+            );
+        }
+    }
+
+    #[test]
+    fn plural_s_only_omits_on_exactly_one() {
+        assert_eq!(plural_s(0), "s");
+        assert_eq!(plural_s(1), "");
+        assert_eq!(plural_s(2), "s");
+    }
 }
