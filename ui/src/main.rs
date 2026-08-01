@@ -1,10 +1,4 @@
 #![allow(non_snake_case)]
-// Only the pure functions this file exports are exercised on the host target
-// (`cargo test -p atlas-ui`, no CI job runs this crate's tests on native, but
-// it is how the filter logic below was actually verified) — the real app is
-// wasm32-only, so its own entry points are legitimately unreferenced from a
-// native `main`.
-#![cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 //! Atlas Discover: a read-only front door to Freenet. Connects to the local node
 //! over the WebSocket command API, GET+SUBSCRIBEs the index contract, and renders
 //! browse + client-side search + Open. No identity, no writes, no delegate.
@@ -22,7 +16,7 @@ use freenet_stdlib::client_api::{
 };
 #[cfg(target_arch = "wasm32")]
 use freenet_stdlib::prelude::ContractInstanceId;
-#[cfg(target_arch = "wasm32")]
+// Not gated to wasm32: used by `set_shell_title`, which compiles on native too.
 use wasm_bindgen::JsValue;
 #[cfg(target_arch = "wasm32")]
 use wasm_bindgen_futures::spawn_local;
@@ -65,7 +59,18 @@ const _: () = assert!(
     "ATLAS_INDEX_ID must be a base58 contract instance id (40-44 chars); an empty value usually means the command substitution supplying it failed"
 );
 
+// `allow(dead_code)` below is scoped per-item, not crate-wide, and only for
+// `not(target_arch = "wasm32")`. These items are unreferenced from native's
+// stub `main` (see below) but exist so `cargo test -p atlas-ui` can exercise
+// the pure logic that references them. On wasm32 the real `main` uses all of
+// them, so the allow evaluates to nothing there — it must stay that way,
+// since the wasm32 dead_code lint (promoted to an error by CI's `-D
+// warnings`) is what catches an item accidentally left unreachable by a
+// mis-gated `#[cfg]` on the real app. Do not widen this to crate scope or
+// flip its polarity.
+#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 static STATE: GlobalSignal<Option<IndexState>> = Signal::global(|| None);
+#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 static STATUS: GlobalSignal<String> = Signal::global(|| "connecting…".to_string());
 
 #[cfg(target_arch = "wasm32")]
@@ -73,6 +78,7 @@ thread_local! {
     static API: RefCell<Option<WebApi>> = const { RefCell::new(None) };
 }
 
+#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 const CSS: &str = r#"
 :root { --bg:#fff; --fg:#16181d; --dim:#6b7280; --faint:#9aa1ab;
   --line:#e7e9ee; --card:#fff; --card-hover:#fafafb; --feat:#f7f7f9; }
@@ -134,8 +140,19 @@ body { margin:0; background:var(--bg); color:var(--fg); line-height:1.5;
   color:var(--faint); font-size:.76rem; line-height:1.6; }
 "#;
 
+// This binary exists on native only so `cargo test -p atlas-ui` can run the
+// pure-function tests (the test harness supplies its own `main` and never
+// calls this one). Panic rather than exit cleanly: before this file grew a
+// native stub, a non-wasm32 build of this crate failed to compile outright,
+// and this repo has a standing rule against turning a loud build failure
+// into a silent no-op (see the `ATLAS_INDEX_ID` comment above) — if `dx`'s
+// platform selection ever resolves to something other than `web` for this
+// crate, this should still fail loudly instead of shipping a binary that
+// does nothing.
 #[cfg(not(target_arch = "wasm32"))]
-fn main() {}
+fn main() {
+    panic!("atlas-ui is a wasm32-only web app; this native binary exists only so `cargo test -p atlas-ui` can run its pure-function tests");
+}
 
 #[cfg(target_arch = "wasm32")]
 fn main() {
@@ -145,6 +162,7 @@ fn main() {
     launch(App);
 }
 
+#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 fn App() -> Element {
     #[cfg(target_arch = "wasm32")]
     use_hook(|| {
@@ -300,6 +318,7 @@ fn App() -> Element {
 }
 
 #[component]
+#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 fn EntryCard(entry: IndexEntry) -> Element {
     let external = matches!(entry.locator, Locator::External { .. });
     // Resolution goes through the state's app registry, so an app-hosted entry
@@ -371,7 +390,14 @@ fn EntryCard(entry: IndexEntry) -> Element {
 /// to "Freenet"), so we both set our own document title and postMessage the
 /// title to the parent shell via its `__freenet_shell__` bridge (same mechanism
 /// River uses).
-#[cfg(target_arch = "wasm32")]
+///
+/// Not gated to wasm32: `web_sys`/`js_sys`/`wasm_bindgen` compile fine on the
+/// host target (they emit no-op/panicking stubs off-wasm), and this function
+/// is never actually called from native's stub `main` — only `connect` and
+/// `request_index` genuinely need `wasm32` to compile, because they reach
+/// `freenet_stdlib::client_api::WebApi`, whose native implementation takes a
+/// different argument list.
+#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 fn set_shell_title(title: &str) {
     let Some(window) = web_sys::window() else {
         return;
@@ -470,7 +496,8 @@ async fn request_index() {
     }
 }
 
-#[cfg(target_arch = "wasm32")]
+// Not gated to wasm32 — see the rationale comment on `set_shell_title` above.
+#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 fn ws_url() -> Option<String> {
     let win = web_sys::window()?;
     let loc = win.location();
@@ -488,6 +515,7 @@ fn ws_url() -> Option<String> {
     Some(url)
 }
 
+#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 fn kind_label(kind: Kind) -> &'static str {
     match kind {
         Kind::App => "app",
@@ -506,9 +534,9 @@ const SHOW_EXTERNAL_BY_DEFAULT: bool = false;
 /// Should `e` be shown given the current "show external (web) links" setting?
 ///
 /// Pulled out as a plain function (no `web_sys`/Dioxus dependency) so it is
-/// unit-testable on the native target — the rest of this file needs the
-/// `wasm32` target to even compile, since it touches `web_sys::window()` and
-/// friends unconditionally.
+/// unit-testable on the native target — `connect` and `request_index` still
+/// need `wasm32` to compile (they reach `freenet_stdlib::client_api::WebApi`,
+/// whose native signature differs), but that isn't a `web_sys` constraint.
 fn passes_external_filter(e: &IndexEntry, show_external: bool) -> bool {
     // Keys on `locator`, not `kind`, matching the existing check at the Open
     // link (`let external = matches!(entry.locator, Locator::External { .. })`)
@@ -533,6 +561,7 @@ fn plural_s(n: usize) -> &'static str {
     }
 }
 
+#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 fn matches_query(e: &IndexEntry, q: &str) -> bool {
     if q.is_empty() {
         return true;
