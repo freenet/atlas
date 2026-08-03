@@ -1696,9 +1696,18 @@ fn run_once(
             // was stored in a form nothing else would ever produce, so it could
             // not be matched against `seen` and did not survive a reload
             // unchanged. A curated line may be `freenet:<id>` as well as https.
-            let (loc, kind) = match normalize_mapped(line, &registry) {
-                Some((loc, kind)) => (loc, kind),
-                None => (line.to_string(), "external"),
+            // A curated line that does not normalise is SKIPPED, not queued
+            // verbatim. It used to fall back to `("external")`, which was the
+            // one remaining way an off-Freenet URL could enter the index now
+            // that `normalize_href` refuses them -- and it would enter unchecked,
+            // in a form nothing else could ever produce or match against `seen`.
+            let Some((loc, kind)) = normalize_mapped(line, &registry) else {
+                eprintln!(
+                    "sources: skipping {line:?} -- not a Freenet locator. Atlas indexes \
+                     Freenet, not the web; an https:// source line no longer has anywhere \
+                     to go."
+                );
+                continue;
             };
             trusted.insert(loc.clone());
             if !suppressed.contains(&loc) && pending.add(&loc, kind, CURATED_AUTHOR) {
@@ -3917,12 +3926,21 @@ fn normalize_href(href: &str) -> Option<(String, &'static str)> {
         }
         return None;
     }
-    if href.starts_with("https://") {
-        return Some((
-            href.split('#').next().unwrap_or(href).to_string(),
-            "external",
-        ));
-    }
+    // An off-Freenet `https://` link is NOT a locator Atlas indexes.
+    //
+    // Atlas is an index of Freenet, not of the web. Capturing external links
+    // meant the index carried entries that take a reader off the network
+    // entirely (Ladybird, a GitHub issue form, an unrelated news article), which
+    // the UI then had to apologise for with a "Freenet only -- N web links
+    // hidden" toggle. The toggle was treating the symptom; the entries should
+    // never have been captured.
+    //
+    // Refusing them HERE, at normalisation, is what makes that true everywhere
+    // at once: every capture path (room messages, hub pages, curated source
+    // lines) funnels through this function, so there is no second door left
+    // open. `Locator::External` deliberately REMAINS in the schema so existing
+    // entries stay parseable and therefore tombstoneable -- nothing produces one
+    // any more.
     None
 }
 
@@ -4851,7 +4869,9 @@ mod tests {
             .map_locator(&format!("freenet:{DELTA}/AmcVD92D3U"))
             .is_none());
         // Not a freenet locator at all.
-        assert!(reg.map_locator("https://example.com").is_none());
+        assert!(reg
+            .map_locator("freenet:771DvtPMwt2PumPyrFvsz7fpvU1gogcmb5qtS1yYEEHL/")
+            .is_none());
         // An empty registry maps nothing, so the crawler degrades to the old
         // behaviour rather than failing.
         let empty = AppRegistryView::default();
@@ -5104,7 +5124,7 @@ mod tests {
         assert_ne!(a, b, "two sites must not share a bucket");
         assert_ne!(a, "@unparsed");
         assert_ne!(
-            host_bucket("https://x^1"),
+            host_bucket("freenet:771DvtPMwt2PumPyrFvsz7fpvU1gogcmb5qtS1yYEEHM/^1"),
             a,
             "junk must not share it either"
         );
@@ -5443,6 +5463,24 @@ mod tests {
 
     const ID: &str = "771DvtPMwt2PumPyrFvsz7fpvU1gogcmb5qtS1yYEEH9";
 
+    /// Base58 alphabet, for minting DISTINCT contract ids in fixtures.
+    const B58: &[u8] = b"123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
+
+    /// A distinct, valid contract id per `n`.
+    ///
+    /// Distinct IDS, not just distinct paths: `host_bucket` keys a `freenet:`
+    /// locator on its contract id (main.rs `host_bucket`), so every path under
+    /// one id shares a single spend bucket. Fixtures that previously used
+    /// different HOSTNAMES to get different buckets must therefore map to
+    /// different ids, or the per-host/per-author fairness tests they belong to
+    /// would silently collapse into one bucket and stop testing anything.
+    fn fid(n: usize) -> String {
+        let mut s = ID.to_string();
+        s.pop();
+        s.push(B58[n % B58.len()] as char);
+        s
+    }
+
     #[test]
     fn normalize_href_variants() {
         assert_eq!(
@@ -5460,16 +5498,18 @@ mod tests {
             )),
             Some((format!("freenet:{ID}/"), "site"))
         );
-        // external https, fragment dropped
-        assert_eq!(
-            normalize_href("https://example.com/p#frag"),
-            Some(("https://example.com/p".to_string(), "external"))
-        );
-        // skipped: relative, anchor, mailto, non-tls
+        // skipped: relative, anchor, mailto, non-tls, and any off-Freenet
+        // https link -- Atlas indexes Freenet, not the web, so an external
+        // URL has nowhere to go any more.
         assert_eq!(normalize_href("/relative"), None);
         assert_eq!(normalize_href("#x"), None);
         assert_eq!(normalize_href("mailto:a@b.c"), None);
         assert_eq!(normalize_href("http://insecure.example"), None);
+        // An off-Freenet https link -- this used to be captured as
+        // `("https://example.com/p", "external")` with the fragment dropped.
+        // Atlas indexes Freenet, not the web, so it is now refused outright.
+        assert_eq!(normalize_href("https://example.com/p#frag"), None);
+        assert_eq!(normalize_href("https://example.com/"), None);
         // bad contract id length -> not a freenet locator
         assert_eq!(normalize_href("freenet:tooShort"), None);
     }
@@ -5478,16 +5518,22 @@ mod tests {
     fn extract_locators_dedups_and_skips() {
         let html = format!(
             r##"<a href="freenet:{ID}">a</a> <a href="freenet:{ID}">dup</a>
-               <a href="https://a.com/">b</a> <a href="#">skip</a> <a href="/rel">skip</a>"##
+               <a href="https://b.example/">web</a> <a href="#">skip</a> <a href="/rel">skip</a>"##
         );
         let locs = extract_locators(&html);
-        assert_eq!(locs.len(), 2, "one freenet + one https, duplicate removed");
+        assert_eq!(
+            locs.len(),
+            1,
+            "only the freenet link survives -- duplicate collapsed, and the \
+             https link is no longer a locator at all: {locs:?}"
+        );
         assert!(locs
             .iter()
             .any(|(l, k)| l == &format!("freenet:{ID}") && *k == "site"));
-        assert!(locs
-            .iter()
-            .any(|(l, k)| l == "https://a.com/" && *k == "external"));
+        assert!(
+            !locs.iter().any(|(l, _)| l.starts_with("https://")),
+            "an off-Freenet link must never reach the queue: {locs:?}"
+        );
     }
 
     #[test]
@@ -5846,29 +5892,30 @@ mod tests {
     fn scan_urls_extracts_and_normalizes() {
         let text = format!(
             "Check https://github.com/freenet/river and <freenet:{ID}/about> too. \
-             Dup: https://github.com/freenet/river. Markdown [link](https://example.com/p#frag)! \
-             bare freenet:{ID}",
+             Markdown [link](freenet:{ID}/p)! bare freenet:{ID}",
         );
         let urls = scan_urls(&text);
-        assert!(
-            urls.contains(&("https://github.com/freenet/river".to_string(), "external")),
-            "got {urls:?}"
-        );
+        // Angle-bracket wrapping stripped.
         assert!(
             urls.contains(&(format!("freenet:{ID}/about"), "site")),
             "got {urls:?}"
         );
-        // https fragment stripped, wrapping paren/`!` removed.
+        // Markdown paren wrapping and the trailing `!` stripped.
         assert!(
-            urls.contains(&("https://example.com/p".to_string(), "external")),
+            urls.contains(&(format!("freenet:{ID}/p"), "site")),
             "got {urls:?}"
         );
+        // Bare locator, and the duplicate of it collapsed.
         assert!(
             urls.contains(&(format!("freenet:{ID}"), "site")),
             "got {urls:?}"
         );
-        // Duplicate https link collapsed.
-        assert_eq!(urls.len(), 4, "expected 4 distinct urls, got {urls:?}");
+        // The https link is NOT extracted: Atlas indexes Freenet, not the web.
+        assert!(
+            !urls.iter().any(|(l, _)| l.starts_with("https://")),
+            "an off-Freenet link must never be scanned out of a message: {urls:?}"
+        );
+        assert_eq!(urls.len(), 3, "expected 3 distinct locators, got {urls:?}");
     }
 
     #[test]
@@ -5939,23 +5986,28 @@ mod tests {
         let mut ledger = SpendLedger::load(f.path());
         // Run cap 20, host share 3.
         let mut b = Budget::new(&mut ledger, 20, 1000, 3);
+        // One publisher = one contract id. `host_bucket` keys a freenet locator
+        // on its contract id, so these four share a bucket while differing by
+        // path -- the same relationship the old `https://spam.example/{i}`
+        // fixtures had via a shared hostname.
+        let flood = fid(1);
         for i in 0..3 {
             assert!(
-                b.try_take(&format!("https://spam.example/{i}")).is_ok(),
+                b.try_take(&format!("freenet:{flood}/{i}")).is_ok(),
                 "first {} should be allowed",
                 i + 1
             );
         }
-        // Fourth from the same host is refused…
+        // Fourth from the same publisher is refused…
         assert!(matches!(
-            b.try_take("https://spam.example/4"),
+            b.try_take(&format!("freenet:{flood}/4")),
             Err(Denied::HostShare)
         ));
         // …and crucially did NOT consume the run budget, so other publishers
         // still get served: a flood rations itself rather than starving the run.
         assert_eq!(b.attempts, 3);
         assert_eq!(b.remaining, 17);
-        assert!(b.try_take("https://other.example/1").is_ok());
+        assert!(b.try_take(&format!("freenet:{}/1", fid(2))).is_ok());
     }
 
     #[test]
@@ -5963,10 +6015,14 @@ mod tests {
         let f = TmpFile::new("runcap");
         let mut ledger = SpendLedger::load(f.path());
         let mut b = Budget::new(&mut ledger, 2, 1000, 99);
-        assert!(b.try_take("https://a.example/1").is_ok());
-        assert!(b.try_take("https://b.example/1").is_ok());
+        assert!(b
+            .try_take("freenet:771DvtPMwt2PumPyrFvsz7fpvU1gogcmb5qtS1yYEEHS/1")
+            .is_ok());
+        assert!(b
+            .try_take("freenet:771DvtPMwt2PumPyrFvsz7fpvU1gogcmb5qtS1yYEEHN/1")
+            .is_ok());
         assert!(matches!(
-            b.try_take("https://c.example/1"),
+            b.try_take("freenet:771DvtPMwt2PumPyrFvsz7fpvU1gogcmb5qtS1yYEEHU/1"),
             Err(Denied::Exhausted)
         ));
         assert!(b.exhausted());
@@ -6047,7 +6103,7 @@ mod tests {
         // And no spending is authorised while it is broken.
         let mut b = Budget::new(&mut ledger, 20, 200, 3);
         assert!(matches!(
-            b.try_take("https://example.com/"),
+            b.try_take("freenet:771DvtPMwt2PumPyrFvsz7fpvU1gogcmb5qtS1yYEEHL/"),
             Err(Denied::Exhausted)
         ));
     }
@@ -6062,10 +6118,10 @@ mod tests {
         let mut ledger = SpendLedger::load(&bad);
         let mut b = Budget::new(&mut ledger, 20, 200, 99);
         // First take goes through but its append fails, tripping `broken`.
-        let _ = b.try_take("https://a.example/");
+        let _ = b.try_take("freenet:771DvtPMwt2PumPyrFvsz7fpvU1gogcmb5qtS1yYEEHS/");
         assert!(b.ledger.broken, "failed append must mark the ledger broken");
         assert!(matches!(
-            b.try_take("https://b.example/"),
+            b.try_take("freenet:771DvtPMwt2PumPyrFvsz7fpvU1gogcmb5qtS1yYEEHN/"),
             Err(Denied::Exhausted)
         ));
     }
@@ -6156,7 +6212,9 @@ mod tests {
     fn overlong_locators_are_rejected() {
         let long = format!("https://example.com/{}", "a".repeat(MAX_LOCATOR_LEN));
         assert!(normalize_href(&long).is_none());
-        assert!(normalize_href("https://example.com/ok").is_some());
+        assert!(
+            normalize_href("freenet:771DvtPMwt2PumPyrFvsz7fpvU1gogcmb5qtS1yYEEH1/ok").is_some()
+        );
     }
 
     #[test]
@@ -6179,10 +6237,18 @@ mod tests {
         let mut p = Pending::load(f.path());
         // A spammer posts 100 links BEFORE anyone else posts theirs.
         for i in 0..100 {
-            p.add(&format!("https://spam.example/{i}"), "external", "SPAMMER");
+            p.add(&format!("https://spam.example/{i}"), "site", "SPAMMER");
         }
-        p.add("https://good.example/a", "external", "ALICE");
-        p.add("https://good.example/b", "external", "BOB");
+        p.add(
+            "freenet:771DvtPMwt2PumPyrFvsz7fpvU1gogcmb5qtS1yYEEHa/a",
+            "site",
+            "ALICE",
+        );
+        p.add(
+            "freenet:771DvtPMwt2PumPyrFvsz7fpvU1gogcmb5qtS1yYEEHa/b",
+            "site",
+            "BOB",
+        );
 
         let order = p.drain_order();
         // Alice's and Bob's links must come up in the first few slots, not
@@ -6204,18 +6270,26 @@ mod tests {
         let f = TmpFile::new("pending-persist");
         {
             let mut p = Pending::load(f.path());
-            p.add("https://a.example/1", "external", "ALICE");
+            p.add(
+                "freenet:771DvtPMwt2PumPyrFvsz7fpvU1gogcmb5qtS1yYEEH4/1",
+                "site",
+                "ALICE",
+            );
             p.add(&format!("freenet:{ID}/x"), "site", "BOB");
             assert!(p.save());
         }
         let p = Pending::load(f.path());
         assert_eq!(p.len(), 2);
-        assert!(p.contains("https://a.example/1"));
+        assert!(p.contains("freenet:771DvtPMwt2PumPyrFvsz7fpvU1gogcmb5qtS1yYEEH4/1"));
+        // Select BOB's entry by its exact locator. This used to key on
+        // `starts_with("freenet:")` because the other entry was an https URL --
+        // now that both are freenet locators, a scheme test would silently pick
+        // ALICE's and stop proving that per-entry author/kind round-trip at all.
         let entry = p
             .drain_order()
             .into_iter()
-            .find(|(l, _, _)| l.starts_with("freenet:"))
-            .unwrap();
+            .find(|(l, _, _)| l == &format!("freenet:{ID}/x"))
+            .expect("BOB's entry must survive the restart");
         assert_eq!(entry.1, "site", "kind must round-trip");
         assert_eq!(entry.2, "BOB", "author must round-trip");
     }
@@ -6224,15 +6298,19 @@ mod tests {
     fn pending_gives_up_after_max_attempts() {
         let f = TmpFile::new("pending-attempts");
         let mut p = Pending::load(f.path());
-        p.add("https://flaky.example/1", "external", "ALICE");
+        p.add(
+            "freenet:771DvtPMwt2PumPyrFvsz7fpvU1gogcmb5qtS1yYEEHb/1",
+            "site",
+            "ALICE",
+        );
         for _ in 0..MAX_ATTEMPTS - 1 {
-            assert!(!p.record_failure("https://flaky.example/1"));
+            assert!(!p.record_failure("freenet:771DvtPMwt2PumPyrFvsz7fpvU1gogcmb5qtS1yYEEHb/1"));
         }
         assert!(
-            p.record_failure("https://flaky.example/1"),
+            p.record_failure("freenet:771DvtPMwt2PumPyrFvsz7fpvU1gogcmb5qtS1yYEEHb/1"),
             "must give up on the final attempt"
         );
-        assert!(!p.contains("https://flaky.example/1"));
+        assert!(!p.contains("freenet:771DvtPMwt2PumPyrFvsz7fpvU1gogcmb5qtS1yYEEHb/1"));
     }
 
     /// A site is described from ALL its pages, not just the landing page. Judging
@@ -6630,7 +6708,12 @@ mod tests {
         {
             let (mut q, released, exhausted) = Quarantine::load(f.path(), at, &none);
             assert!(released.is_empty() && exhausted.is_empty());
-            let _ = q.hold("https://flaky.example/1", "external", "ALICE", at);
+            let _ = q.hold(
+                "freenet:771DvtPMwt2PumPyrFvsz7fpvU1gogcmb5qtS1yYEEH5/1",
+                "site",
+                "ALICE",
+                at,
+            );
             assert!(q.save());
         }
         // One second short of due: still held, nothing released.
@@ -6638,7 +6721,7 @@ mod tests {
         assert!(released.is_empty(), "must not release before it is due");
         assert_eq!(
             q.held().collect::<HashSet<_>>(),
-            HashSet::from(["https://flaky.example/1".to_string()]),
+            HashSet::from(["freenet:771DvtPMwt2PumPyrFvsz7fpvU1gogcmb5qtS1yYEEH5/1".to_string()]),
             "a held locator must suppress capture so discovery cannot re-queue it"
         );
 
@@ -6649,8 +6732,8 @@ mod tests {
             released,
             vec![(
                 0,
-                "https://flaky.example/1".to_string(),
-                "external",
+                "freenet:771DvtPMwt2PumPyrFvsz7fpvU1gogcmb5qtS1yYEEH5/1".to_string(),
+                "site",
                 "ALICE".to_string()
             )],
             "kind and author must round-trip so a room link can be re-queued"
@@ -6671,11 +6754,11 @@ mod tests {
     fn quarantine_backs_off_and_finally_gives_up_for_good() {
         let f = TmpFile::new("quarantine-cycles");
         let none: HashSet<String> = HashSet::new();
-        let loc = "https://dead.example/1";
+        let loc = "freenet:771DvtPMwt2PumPyrFvsz7fpvU1gogcmb5qtS1yYEEH6/1";
         let mut now = 1_000_000_000u64;
 
         let (mut q, _, _) = Quarantine::load(f.path(), now, &none);
-        let _ = q.hold(loc, "external", "ALICE", now);
+        let _ = q.hold(loc, "site", "ALICE", now);
         assert!(q.save());
         // The initial hold schedules the FIRST retry one base cooldown out, so
         // advance to it before the first cycle.
@@ -6760,18 +6843,22 @@ mod tests {
         let f = TmpFile::new("release-refused-q");
         let none: HashSet<String> = HashSet::new();
         let now = 2_000_000_000u64;
-        let loc = "https://refused.example/1".to_string();
+        let loc = "freenet:771DvtPMwt2PumPyrFvsz7fpvU1gogcmb5qtS1yYEEH7/1".to_string();
 
         {
             let (mut q, _, _) = Quarantine::load(f.path(), now, &none);
-            let _ = q.hold(&loc, "external", "ALICE", now);
+            let _ = q.hold(&loc, "site", "ALICE", now);
             assert!(q.save());
         }
 
         // Fill ALICE's bucket so the release cannot be placed.
         let mut pending = Pending::load(TmpFile::new("release-refused-p").path());
         for i in 0..MAX_PENDING_PER_AUTHOR {
-            pending.add(&format!("https://filler.example/{i}"), "external", "ALICE");
+            pending.add(
+                &format!("freenet:771DvtPMwt2PumPyrFvsz7fpvU1gogcmb5qtS1yYEEHM/{i}"),
+                "site",
+                "ALICE",
+            );
         }
 
         let due = now + QUARANTINE_SECS;
@@ -6808,11 +6895,11 @@ mod tests {
     fn an_unplaceable_locator_still_converges() {
         let f = TmpFile::new("defer-converge");
         let none: HashSet<String> = HashSet::new();
-        let loc = "https://unplaceable.example/1";
+        let loc = "freenet:771DvtPMwt2PumPyrFvsz7fpvU1gogcmb5qtS1yYEEH8/1";
         let mut now = 1_000_000u64;
 
         let (mut q, _, _) = Quarantine::load(f.path(), now, &none);
-        assert!(q.hold(loc, "external", "ALICE", now).is_none());
+        assert!(q.hold(loc, "site", "ALICE", now).is_none());
 
         // Refused every single time. The LAST refusal is the one that tips it
         // over, and it stamps the new schedule from the clock at that moment —
@@ -6851,11 +6938,11 @@ mod tests {
     fn a_successful_placement_resets_the_refusal_count() {
         let f = TmpFile::new("defer-reset");
         let none: HashSet<String> = HashSet::new();
-        let loc = "https://intermittent.example/1";
+        let loc = "freenet:771DvtPMwt2PumPyrFvsz7fpvU1gogcmb5qtS1yYEEH9/1";
         let mut now = 1_000_000u64;
 
         let (mut q, _, _) = Quarantine::load(f.path(), now, &none);
-        assert!(q.hold(loc, "external", "ALICE", now).is_none());
+        assert!(q.hold(loc, "site", "ALICE", now).is_none());
         for _ in 0..MAX_CONSECUTIVE_DEFERS - 1 {
             q.defer_placement(loc, now);
             now += REFUSED_RETRY_SECS;
@@ -6883,11 +6970,11 @@ mod tests {
     fn an_undrained_entry_never_burns_a_cycle_however_long_it_waits() {
         let f = TmpFile::new("undrained-forever");
         let none: HashSet<String> = HashSet::new();
-        let loc = "https://waiting.example/1";
+        let loc = "freenet:771DvtPMwt2PumPyrFvsz7fpvU1gogcmb5qtS1yYEEHA/1";
         let mut now = 1_000_000u64;
 
         let (mut q, _, _) = Quarantine::load(f.path(), now, &none);
-        assert!(q.hold(loc, "external", "ALICE", now).is_none());
+        assert!(q.hold(loc, "site", "ALICE", now).is_none());
         for _ in 0..MAX_CONSECUTIVE_DEFERS * 3 {
             q.defer_undrained(loc, now);
             now += REFUSED_RETRY_SECS;
@@ -6909,20 +6996,20 @@ mod tests {
     fn requeue_released_places_what_it_can_and_forgets_what_is_decided() {
         let f = TmpFile::new("requeue-ok-q");
         let now = 1_000u64;
-        let fresh = "https://fresh.example/1".to_string();
-        let decided = "https://decided.example/1".to_string();
+        let fresh = "freenet:771DvtPMwt2PumPyrFvsz7fpvU1gogcmb5qtS1yYEEHc/1".to_string();
+        let decided = "freenet:771DvtPMwt2PumPyrFvsz7fpvU1gogcmb5qtS1yYEEHd/1".to_string();
         let none: HashSet<String> = HashSet::new();
         let seen: HashSet<String> = [decided.clone()].into_iter().collect();
 
         let mut pending = Pending::load(TmpFile::new("requeue-ok-p").path());
         let (mut q, _, _) = Quarantine::load(f.path(), now, &none);
-        let _ = q.hold(&fresh, "external", "ALICE", now);
-        let _ = q.hold(&decided, "external", "ALICE", now);
+        let _ = q.hold(&fresh, "site", "ALICE", now);
+        let _ = q.hold(&decided, "site", "ALICE", now);
 
         let (requeued, held_back) = requeue_released(
             vec![
-                (0, fresh.clone(), "external", "ALICE".to_string()),
-                (0, decided.clone(), "external", "ALICE".to_string()),
+                (0, fresh.clone(), "site", "ALICE".to_string()),
+                (0, decided.clone(), "site", "ALICE".to_string()),
             ],
             &seen,
             &mut pending,
@@ -6954,10 +7041,10 @@ mod tests {
     fn capture_filter_suppresses_held_but_not_unrelated_locators() {
         let none: HashSet<String> = HashSet::new();
         let (mut q, _, _) = Quarantine::load(TmpFile::new("capfilter-q").path(), 0, &none);
-        let held = "https://held.example/1".to_string();
-        let indexed = "https://indexed.example/1".to_string();
-        let free = "https://free.example/1".to_string();
-        let _ = q.hold(&held, "external", "ALICE", 1_000);
+        let held = "freenet:771DvtPMwt2PumPyrFvsz7fpvU1gogcmb5qtS1yYEEHe/1".to_string();
+        let indexed = "freenet:771DvtPMwt2PumPyrFvsz7fpvU1gogcmb5qtS1yYEEHf/1".to_string();
+        let free = "freenet:771DvtPMwt2PumPyrFvsz7fpvU1gogcmb5qtS1yYEEHg/1".to_string();
+        let _ = q.hold(&held, "site", "ALICE", 1_000);
         let seen: HashSet<String> = [indexed.clone()].into_iter().collect();
 
         let f = capture_filter(&seen, &q);
@@ -6994,7 +7081,7 @@ mod tests {
                 // Spread across authors so the GLOBAL bound is what this
                 // exercises, not the per-author one.
                 format!(
-                    "{due}\t0\t0\texternal\tA{}\thttps://q.example/{i}\n",
+                    "{due}\t0\t0\tsite\tA{}\tfreenet:771DvtPMwt2PumPyrFvsz7fpvU1gogcmb5qtS1yYEEHL/{i}\n",
                     i % 60
                 )
             })
@@ -7007,7 +7094,9 @@ mod tests {
         let held: HashSet<String> = q.held().collect();
         for i in 0..soon {
             assert!(
-                held.contains(&format!("https://q.example/{i}")),
+                held.contains(&format!(
+                    "freenet:771DvtPMwt2PumPyrFvsz7fpvU1gogcmb5qtS1yYEEHL/{i}"
+                )),
                 "a soonest-due entry must survive the trim (i={i})"
             );
         }
@@ -7037,7 +7126,7 @@ mod tests {
                 // Spread across authors so the GLOBAL bound is what this
                 // exercises, not the per-author one.
                 format!(
-                    "{}\t0\t0\texternal\tA{}\thttps://q.example/{i}\n",
+                    "{}\t0\t0\tsite\tA{}\tfreenet:771DvtPMwt2PumPyrFvsz7fpvU1gogcmb5qtS1yYEEHL/{i}\n",
                     now - 1,
                     i % 60
                 )
@@ -7089,8 +7178,8 @@ mod tests {
     fn hold_refuses_a_separator_bearing_author_without_losing_the_locator() {
         let none: HashSet<String> = HashSet::new();
         let (mut q, _, _) = Quarantine::load(TmpFile::new("hold-sep").path(), 0, &none);
-        let loc = "https://a.example/1";
-        let victim = q.hold(loc, "external", "AL\tICE", 1_000);
+        let loc = "freenet:771DvtPMwt2PumPyrFvsz7fpvU1gogcmb5qtS1yYEEHS/1";
+        let victim = q.hold(loc, "site", "AL\tICE", 1_000);
         assert_eq!(
             victim.as_deref(),
             Some(loc),
@@ -7116,7 +7205,7 @@ mod tests {
         let body: String = (0..MAX_PENDING_PER_AUTHOR + 50)
             .map(|i| {
                 format!(
-                    "{}\t0\t0\texternal\tSPAMMER\thttps://s.example/{i:04}\n",
+                    "{}\t0\t0\tsite\tSPAMMER\tfreenet:771DvtPMwt2PumPyrFvsz7fpvU1gogcmb5qtS1yYEEHK/{i:04}\n",
                     now + 1_000 + i as u64
                 )
             })
@@ -7149,14 +7238,14 @@ mod tests {
     fn a_long_backlog_never_exhausts_an_undrained_locator() {
         let f = TmpFile::new("backlog-undrained");
         let none: HashSet<String> = HashSet::new();
-        let loc = "https://queued.example/1".to_string();
+        let loc = "freenet:771DvtPMwt2PumPyrFvsz7fpvU1gogcmb5qtS1yYEEHB/1".to_string();
         let mut now = 1_000_000u64;
 
         let mut pending = Pending::load(TmpFile::new("backlog-p").path());
-        pending.add(&loc, "external", "ALICE");
+        pending.add(&loc, "site", "ALICE");
 
         let (mut q, _, _) = Quarantine::load(f.path(), now, &none);
-        assert!(q.hold(&loc, "external", "ALICE", now).is_none());
+        assert!(q.hold(&loc, "site", "ALICE", now).is_none());
         assert!(q.save());
 
         // Far more looks than the refusal budget, always finding it still queued.
@@ -7193,11 +7282,11 @@ mod tests {
         for (label, line) in [
             (
                 "4-field",
-                format!("{due}\texternal\tALICE\thttps://old.example/1\n"),
+                format!("{due}\texternal\tALICE\tfreenet:771DvtPMwt2PumPyrFvsz7fpvU1gogcmb5qtS1yYEEHC/1\n"),
             ),
             (
                 "5-field",
-                format!("{due}\t2\texternal\tALICE\thttps://old.example/1\n"),
+                format!("{due}\t2\texternal\tALICE\tfreenet:771DvtPMwt2PumPyrFvsz7fpvU1gogcmb5qtS1yYEEHC/1\n"),
             ),
         ] {
             let f = TmpFile::new("quarantine-upgrade");
@@ -7279,7 +7368,7 @@ mod tests {
             // low-numbered entries and the survivor loop below catches it.
             if let Some(v) = q.hold(
                 &format!("https://s.example/{i}"),
-                "external",
+                "site",
                 "SPAMMER",
                 1_000 + i as u64 * 60,
             ) {
@@ -7327,15 +7416,15 @@ mod tests {
         let none: HashSet<String> = HashSet::new();
         let f = TmpFile::new("rehold");
         let (mut q, _, _) = Quarantine::load(f.path(), 0, &none);
-        let loc = "https://flaky.example/1";
+        let loc = "freenet:771DvtPMwt2PumPyrFvsz7fpvU1gogcmb5qtS1yYEEH5/1";
         let now = 1_000_000u64;
 
-        assert!(q.hold(loc, "external", "ALICE", now).is_none());
+        assert!(q.hold(loc, "site", "ALICE", now).is_none());
         q.mark_attempted(loc, now);
         q.mark_attempted(loc, now);
 
         // A second give-up on the same locator.
-        assert!(q.hold(loc, "external", "ALICE", now).is_none());
+        assert!(q.hold(loc, "site", "ALICE", now).is_none());
 
         assert!(q.save());
         let (_, released, _) = Quarantine::load(f.path(), due_after(2, now), &none);
@@ -7356,7 +7445,7 @@ mod tests {
             assert!(
                 q.hold(
                     &format!("https://c.example/{i}"),
-                    "external",
+                    "site",
                     CURATED_AUTHOR,
                     1_000
                 )
@@ -7376,13 +7465,13 @@ mod tests {
         let f = TmpFile::new("undrained-q");
         let none: HashSet<String> = HashSet::new();
         let now = 1_000_000u64;
-        let loc = "https://queued.example/1".to_string();
+        let loc = "freenet:771DvtPMwt2PumPyrFvsz7fpvU1gogcmb5qtS1yYEEHB/1".to_string();
 
         let mut pending = Pending::load(TmpFile::new("undrained-p").path());
-        pending.add(&loc, "external", "ALICE");
+        pending.add(&loc, "site", "ALICE");
 
         let (mut q, _, _) = Quarantine::load(f.path(), now, &none);
-        let _ = q.hold(&loc, "external", "ALICE", now);
+        let _ = q.hold(&loc, "site", "ALICE", now);
         assert!(q.save());
 
         let due = now + QUARANTINE_SECS;
@@ -7412,7 +7501,11 @@ mod tests {
     fn a_corrupt_cycle_count_does_not_blacklist() {
         let f = TmpFile::new("quarantine-badcycles");
         let none: HashSet<String> = HashSet::new();
-        fs::write(f.path(), "0\t99\t0\texternal\tALICE\thttps://a.example/1\n").unwrap();
+        fs::write(
+            f.path(),
+            "0\t99\t0\texternal\tALICE\tfreenet:771DvtPMwt2PumPyrFvsz7fpvU1gogcmb5qtS1yYEEH4/1\n",
+        )
+        .unwrap();
         let (q, released, decided) = Quarantine::load(f.path(), 1_785_000_000, &none);
         assert!(
             decided.is_empty(),
@@ -7427,12 +7520,7 @@ mod tests {
         let none: HashSet<String> = HashSet::new();
         let (mut q, _, _) = Quarantine::load(TmpFile::new("quarantine-author").path(), 0, &none);
         for i in 0..MAX_PENDING_PER_AUTHOR + 50 {
-            let _ = q.hold(
-                &format!("https://s.example/{i}"),
-                "external",
-                "SPAMMER",
-                1_000,
-            );
+            let _ = q.hold(&format!("https://s.example/{i}"), "site", "SPAMMER", 1_000);
         }
         assert_eq!(
             q.held().count(),
@@ -7453,7 +7541,7 @@ mod tests {
         fs::write(
             f.path(),
             format!(
-                "{}\t0\t0\texternal\tALICE\thttps://a.example/1\n",
+                "{}\t0\t0\texternal\tALICE\tfreenet:771DvtPMwt2PumPyrFvsz7fpvU1gogcmb5qtS1yYEEH4/1\n",
                 now + 3_000_000_000u64
             ),
         )
@@ -7658,6 +7746,37 @@ mod tests {
     /// Still circular (delete this too and it goes), so be precise about what it
     /// buys: it raises an ACCIDENTAL deletion to a deliberate one. It is not a
     /// guarantee.
+    /// A curated sources line that does not normalise must be SKIPPED.
+    ///
+    /// It used to fall back to `(line, "external")`, which -- now that
+    /// `normalize_href` refuses off-Freenet URLs -- was the last remaining door
+    /// through which an https URL could enter the index, and it entered
+    /// UNCHECKED and in a form nothing else could produce or match against
+    /// `seen`.
+    ///
+    /// Source-scraped rather than behavioural: the branch lives inside
+    /// `run_once`, which needs a node, a renderer and a filesystem to drive.
+    /// Restoring the fallback fails no other test in this file (verified by
+    /// mutation), so without this pin the regression is silent.
+    #[test]
+    fn a_curated_source_line_that_does_not_normalise_is_skipped() {
+        let src = strip_comments(include_str!("main.rs"));
+        let at = src.find("fn run_once(").expect("run_once exists");
+        let body = &src[at..];
+        let end = body.find("\nfn ").map(|e| at + e).unwrap_or(src.len());
+        let body = &src[at..end];
+        assert!(
+            !body.contains("\"external\""),
+            "run_once must not mint an \"external\" locator: Atlas indexes \
+             Freenet, not the web"
+        );
+        assert!(
+            body.contains("let Some((loc, kind)) = normalize_mapped(line, &registry) else {"),
+            "the curated-source branch must SKIP a line that does not normalise, \
+             not queue it verbatim"
+        );
+    }
+
     #[test]
     fn the_source_pins_are_all_present() {
         let src = include_str!("main.rs");
@@ -7669,6 +7788,7 @@ mod tests {
             "fn room_candidate_keys_tries_current_generation_first",
             "fn a_non_current_generation_resolving_is_logged_loudly",
             "fn the_room_crawl_actually_cross_checks_the_key",
+            "fn a_curated_source_line_that_does_not_normalise_is_skipped",
             "fn riverctls_answer_wins_when_the_bundle_is_stale",
             "fn the_probe_handle_is_fresh_every_run",
             "fn a_too_short_probe_result_is_not_a_usable_baseline",
@@ -7759,7 +7879,7 @@ mod tests {
     #[test]
     fn quarantine_purges_locators_already_decided() {
         let f = TmpFile::new("quarantine-purge");
-        let loc = "https://decided.example/1".to_string();
+        let loc = "freenet:771DvtPMwt2PumPyrFvsz7fpvU1gogcmb5qtS1yYEEHD/1".to_string();
         fs::write(f.path(), format!("0\t0\t0\texternal\tALICE\t{loc}\n")).unwrap();
 
         let none: HashSet<String> = HashSet::new();
@@ -7800,13 +7920,13 @@ mod tests {
             dirty: true,
         };
         q.entries.insert(
-            "https://a.example/1".to_string(),
+            "freenet:771DvtPMwt2PumPyrFvsz7fpvU1gogcmb5qtS1yYEEHS/1".to_string(),
             QuarantineEntry {
                 due_at: 0,
                 cycles: 0,
                 defers: 0,
-                kind: "external",
-                author: "X\n99999999999\t0\texternal\tY\thttps://forged.example/".to_string(),
+                kind: "site",
+                author: "X\n99999999999\t0\texternal\tY\tfreenet:771DvtPMwt2PumPyrFvsz7fpvU1gogcmb5qtS1yYEEHh/".to_string(),
             },
         );
         assert!(q.save());
@@ -7823,7 +7943,7 @@ mod tests {
         let none: HashSet<String> = HashSet::new();
         fs::write(
             f.path(),
-            "not-a-number\t0\t0\texternal\tALICE\thttps://a.example/1\n",
+            "not-a-number\t0\t0\texternal\tALICE\tfreenet:771DvtPMwt2PumPyrFvsz7fpvU1gogcmb5qtS1yYEEH4/1\n",
         )
         .unwrap();
         let (_, released, _) = Quarantine::load(f.path(), 1_785_000_000, &none);
@@ -7843,7 +7963,12 @@ mod tests {
         let none: HashSet<String> = HashSet::new();
         let (mut q, released, _) = Quarantine::load(&bad, 1_785_000_000, &none);
         assert!(released.is_empty(), "an unreadable file releases nothing");
-        let _ = q.hold("https://a.example/1", "external", "ALICE", 1_785_000_000);
+        let _ = q.hold(
+            "freenet:771DvtPMwt2PumPyrFvsz7fpvU1gogcmb5qtS1yYEEHS/1",
+            "site",
+            "ALICE",
+            1_785_000_000,
+        );
         assert!(
             !q.save(),
             "a failed write must be reported, not swallowed as a warning"
@@ -7855,11 +7980,15 @@ mod tests {
         let f = TmpFile::new("pending-bound");
         let mut p = Pending::load(f.path());
         for i in 0..MAX_PENDING_PER_AUTHOR + 50 {
-            p.add(&format!("https://s.example/{i}"), "external", "SPAMMER");
+            p.add(&format!("https://s.example/{i}"), "site", "SPAMMER");
         }
         assert_eq!(p.len(), MAX_PENDING_PER_AUTHOR);
         // A different author is unaffected by the spammer hitting their bound.
-        assert!(p.add("https://good.example/", "external", "ALICE"));
+        assert!(p.add(
+            "freenet:771DvtPMwt2PumPyrFvsz7fpvU1gogcmb5qtS1yYEEHa/",
+            "site",
+            "ALICE"
+        ));
     }
 
     /// Round-robin within one run is not enough: bucket order follows discovery
@@ -7874,8 +8003,8 @@ mod tests {
             for a in 0..authors {
                 for i in 0..3 {
                     p.add(
-                        &format!("https://h{a}-{i}.example/"),
-                        "external",
+                        &format!("freenet:{}/", fid(a * 10 + i)),
+                        "site",
                         &format!("AUTHOR{a}"),
                     );
                 }
@@ -7917,7 +8046,7 @@ mod tests {
             for i in 0..per {
                 p.add(
                     &format!("https://s{a}-{i}.example/"),
-                    "external",
+                    "site",
                     &format!("SYBIL{a}"),
                 );
             }
@@ -7925,12 +8054,20 @@ mod tests {
         assert_eq!(p.len(), MAX_PENDING_TOTAL);
         // A brand-new author still gets in…
         assert!(
-            p.add("https://fresh.example/", "external", "ALICE"),
+            p.add(
+                "freenet:771DvtPMwt2PumPyrFvsz7fpvU1gogcmb5qtS1yYEEHc/",
+                "site",
+                "ALICE"
+            ),
             "a full queue must not lock out new links"
         );
         // …and so does the operator's own curated source.
         assert!(
-            p.add("https://curated.example/", "external", CURATED_AUTHOR),
+            p.add(
+                "freenet:771DvtPMwt2PumPyrFvsz7fpvU1gogcmb5qtS1yYEEHi/",
+                "site",
+                CURATED_AUTHOR
+            ),
             "curated sources must never be refused"
         );
         assert!(p.len() <= MAX_PENDING_TOTAL);
@@ -7944,17 +8081,17 @@ mod tests {
         let f = TmpFile::new("pending-curated-full");
         let mut p = Pending::load(f.path());
         for i in 0..MAX_PENDING_CURATED {
-            p.add(
-                &format!("https://c{i}.example/"),
-                "external",
-                CURATED_AUTHOR,
-            );
+            p.add(&format!("https://c{i}.example/"), "site", CURATED_AUTHOR);
         }
         // Curated is capped by its reservation, not unbounded.
         assert_eq!(p.len(), MAX_PENDING_CURATED);
         assert!(p.len() < MAX_PENDING_TOTAL);
         assert!(
-            p.add("https://room.example/", "external", "ALICE"),
+            p.add(
+                "freenet:771DvtPMwt2PumPyrFvsz7fpvU1gogcmb5qtS1yYEEHj/",
+                "site",
+                "ALICE"
+            ),
             "a curated backlog must not shut out room links"
         );
     }
@@ -7970,8 +8107,8 @@ mod tests {
         for a in 0..authors {
             for i in 0..3 {
                 p.add(
-                    &format!("https://h{a}-{i}.example/"),
-                    "external",
+                    &format!("freenet:{}/", fid(a * 10 + i)),
+                    "site",
                     &format!("AUTHOR{a}"),
                 );
             }
@@ -7991,11 +8128,7 @@ mod tests {
         let mut p = Pending::load(f.path());
         for i in 0..MAX_PENDING_PER_AUTHOR + 10 {
             assert!(
-                p.add(
-                    &format!("https://c{i}.example/"),
-                    "external",
-                    CURATED_AUTHOR
-                ),
+                p.add(&format!("https://c{i}.example/"), "site", CURATED_AUTHOR),
                 "curated entry {i} refused"
             );
         }
@@ -8005,14 +8138,19 @@ mod tests {
     fn hostile_locators_are_rejected_before_they_reach_the_queue() {
         // A newline would inject a second row into the tab-separated pending
         // file, minting an arbitrary author bucket and retry count.
-        assert!(normalize_href("https://evil.example/\n0\tsite\tVICTIM\thttps://x/").is_none());
-        assert!(normalize_href("https://evil.example/\r\nx").is_none());
+        assert!(normalize_href("freenet:771DvtPMwt2PumPyrFvsz7fpvU1gogcmb5qtS1yYEEHE/\n0\tsite\tVICTIM\tfreenet:771DvtPMwt2PumPyrFvsz7fpvU1gogcmb5qtS1yYEEHF/").is_none());
+        assert!(
+            normalize_href("freenet:771DvtPMwt2PumPyrFvsz7fpvU1gogcmb5qtS1yYEEHE/\r\nx").is_none()
+        );
         // `..` escapes the contract web root at fetch time, turning a posted
         // link into an arbitrary GET against the local node.
         assert!(normalize_href(&format!("freenet:{ID}/../../../v1/secret")).is_none());
         // …including when the traversal hides behind a query or fragment.
         assert!(normalize_href(&format!("freenet:{ID}/a/../../x?q=1")).is_none());
-        assert!(normalize_href("https://example.com/a/../../etc/passwd").is_none());
+        assert!(normalize_href(
+            "freenet:771DvtPMwt2PumPyrFvsz7fpvU1gogcmb5qtS1yYEEH1/a/../../etc/passwd"
+        )
+        .is_none());
         // …and when it is percent-encoded. Verified against the url crate:
         // `%2e%2e` normalizes to a `..` segment, so a literal-substring guard
         // let this straight through to an arbitrary GET on the local node.
@@ -8022,18 +8160,25 @@ mod tests {
         // A double dot that is not its own segment is legitimate and must NOT
         // be dropped — the url crate leaves it intact.
         assert!(normalize_href(&format!("freenet:{ID}/docs/1.2..1.3/")).is_some());
-        assert!(normalize_href("https://example.com/v/1.2..1.3/notes").is_some());
-        assert!(normalize_href("https://example.com/a..b").is_some());
+        assert!(normalize_href(
+            "freenet:771DvtPMwt2PumPyrFvsz7fpvU1gogcmb5qtS1yYEEH1/v/1.2..1.3/notes"
+        )
+        .is_some());
+        assert!(
+            normalize_href("freenet:771DvtPMwt2PumPyrFvsz7fpvU1gogcmb5qtS1yYEEH1/a..b").is_some()
+        );
         // Ordinary locators still pass.
         assert!(normalize_href(&format!("freenet:{ID}/about")).is_some());
-        assert!(normalize_href("https://example.com/a/b").is_some());
+        assert!(
+            normalize_href("freenet:771DvtPMwt2PumPyrFvsz7fpvU1gogcmb5qtS1yYEEH1/a/b").is_some()
+        );
     }
 
     #[test]
     fn traversal_hidden_in_a_query_or_fragment_is_rejected() {
         // The guard used to read only the part before `?`/`#` while the gateway
         // branch searched the WHOLE href for `/v1/contract/web/`. So the guard
-        // saw `https://ok.example/`, passed it, and the locator was then mined
+        // saw `freenet:771DvtPMwt2PumPyrFvsz7fpvU1gogcmb5qtS1yYEEHG/`, passed it, and the locator was then mined
         // out of the query — yielding `freenet:<id>/../../../../v1/secret`,
         // which the URL parser collapses to `/v1/secret` on our own node. The
         // response body would have gone to the LLM and into the public index.
@@ -8072,11 +8217,17 @@ mod tests {
             normalize_href(&format!("freenet:{ID}/?q=1#AmcVD/2/links")).expect("indexes");
         assert_eq!(loc, format!("freenet:{ID}/#AmcVD/2/links"));
         // But a gateway prefix that only appears INSIDE the fragment is not a
-        // gateway link at all — it stays the external URL it actually is.
-        let (loc, kind) =
-            normalize_href(&format!("https://ok.example/p#/v1/contract/web/{ID}/x")).unwrap();
-        assert_eq!(kind, "external");
-        assert_eq!(loc, "https://ok.example/p");
+        // gateway link at all. It used to normalize to the external URL it
+        // actually is; now that off-Freenet links are refused outright it is
+        // simply dropped. Either way the property under test is the same and is
+        // the one that matters: the `{ID}` buried in the fragment must NEVER be
+        // mined into a `freenet:` locator.
+        let mined = normalize_href(&format!("https://ok.example/p#/v1/contract/web/{ID}/x"));
+        assert!(
+            mined.is_none(),
+            "an off-Freenet URL must not be indexed, and its fragment must not \
+             be mined for a contract id: {mined:?}"
+        );
     }
 
     #[test]
@@ -8122,7 +8273,7 @@ mod tests {
             format!(
                 "0\tsite\tAUTHOR\tfreenet:{ID}/../../v1/secret\n\
                  0\tsite\tAUTHOR\tfreenet:{ID}/%2e%2e/v1/secret\n\
-                 0\texternal\tAUTHOR\thttps://good.example/page\n\
+                 0\texternal\tAUTHOR\tfreenet:771DvtPMwt2PumPyrFvsz7fpvU1gogcmb5qtS1yYEEHH/page\n\
                  0\tsite\tAUTHOR\tfreenet:{ID}/ok\n"
             ),
         )
@@ -8130,7 +8281,7 @@ mod tests {
         let p = Pending::load(path);
         assert!(!p.contains(&format!("freenet:{ID}/../../v1/secret")));
         assert!(!p.contains(&format!("freenet:{ID}/%2e%2e/v1/secret")));
-        assert!(p.contains("https://good.example/page"));
+        assert!(p.contains("freenet:771DvtPMwt2PumPyrFvsz7fpvU1gogcmb5qtS1yYEEHH/page"));
         assert!(p.contains(&format!("freenet:{ID}/ok")));
         assert_eq!(p.len(), 2);
     }
@@ -8166,10 +8317,10 @@ mod tests {
         // Still not over-rejecting: a legitimate encoded slash in a query is
         // extremely common (`?redirect=https%3A%2F%2Fx`) and must survive.
         assert!(
-            normalize_href("https://example.com/go?redirect=https%3A%2F%2Fx.example").is_some()
+            normalize_href("freenet:771DvtPMwt2PumPyrFvsz7fpvU1gogcmb5qtS1yYEEH1/go?redirect=https%3A%2F%2Fx.example").is_some()
         );
-        assert!(normalize_href("https://gitlab.com/api/v4/projects/group%2Fsub%2Fproj").is_some());
-        assert!(normalize_href("https://github.com/freenet/freenet-core/compare/v1..v2").is_some());
+        assert!(normalize_href("freenet:771DvtPMwt2PumPyrFvsz7fpvU1gogcmb5qtS1yYEEHJ/api/v4/projects/group%2Fsub%2Fproj").is_some());
+        assert!(normalize_href("freenet:771DvtPMwt2PumPyrFvsz7fpvU1gogcmb5qtS1yYEEH3/freenet/freenet-core/compare/v1..v2").is_some());
     }
 
     #[test]
@@ -8245,7 +8396,7 @@ mod tests {
             format!("freenet:{ID}/#route/1"),
             format!("freenet:{ID}/a?q=1#r"),
             format!("https://gw.example/v1/contract/web/{ID}/x#r"),
-            "https://example.com/a?b=c#d".to_string(),
+            "freenet:771DvtPMwt2PumPyrFvsz7fpvU1gogcmb5qtS1yYEEHL/a?b=c#d".to_string(),
             format!("freenet:{ID}"),
         ] {
             let Some((canon, kind)) = normalize_href(&input) else {
@@ -8266,24 +8417,35 @@ mod tests {
 
     #[test]
     fn a_locator_that_merely_normalizes_differently_is_kept() {
-        // Re-validation must not become a second way to lose links. A curated
-        // sources line carrying a `#fragment` normalizes to a different string;
-        // dropping it would discard the operator's own link on every restart.
+        // Re-validation must not become a second way to lose links. A stored
+        // locator in GATEWAY form normalizes to a different string (`freenet:`
+        // form); dropping it instead of rewriting would discard the link on
+        // every restart.
+        //
+        // This used to use an https `#fragment`, which normalized differently
+        // because the fragment was stripped. That case is gone twice over:
+        // https is no longer a locator at all, and a `freenet:` fragment is
+        // deliberately KEPT (it is the app's own route, not a document anchor).
+        // The gateway-URL rewrite is the normalization that still exists, so it
+        // is what this test now exercises.
         let tmp = TmpFile::new("rewrite");
         let path = tmp.path();
         fs::write(
             path,
-            "0\texternal\t@curated\thttps://example.org/docs#intro\n\
-             0\texternal\t@curated\thttps://example.org/keep\n",
+            format!(
+                "0\tsite\t@curated\t/v1/contract/web/{ID}/docs\n\
+                 0\tsite\t@curated\tfreenet:{ID}/keep\n"
+            ),
         )
         .unwrap();
         let p = Pending::load(path);
         assert_eq!(p.len(), 2, "neither entry may be dropped");
         assert!(
-            p.contains("https://example.org/docs"),
-            "it should be rewritten to its canonical form, not discarded"
+            p.contains(&format!("freenet:{ID}/docs")),
+            "the gateway-form entry should be rewritten to its canonical \
+             `freenet:` form, not discarded"
         );
-        assert!(p.contains("https://example.org/keep"));
+        assert!(p.contains(&format!("freenet:{ID}/keep")));
     }
 
     #[test]
@@ -8296,7 +8458,7 @@ mod tests {
         let tmp = TmpFile::new("starve");
         let mut p = Pending::load(tmp.path());
         for a in ["A", "B", "C", "D"] {
-            assert!(p.add(&format!("https://x.example/{a}"), "external", a));
+            assert!(p.add(&format!("https://x.example/{a}"), "site", a));
         }
         // Serve every author but the last one in this run's order.
         let order = p.drain_order();
@@ -8332,7 +8494,7 @@ mod tests {
             "%zz",
             "%2z",
             "…%a…",
-            "https://example.com/%aé/x",
+            "freenet:771DvtPMwt2PumPyrFvsz7fpvU1gogcmb5qtS1yYEEHL/%aé/x",
         ] {
             let _ = has_dot_segment(hostile);
             let _ = normalize_href(hostile);

@@ -129,6 +129,11 @@ enum Cmd {
         /// index, making it findable by cross-node GETs.
         #[arg(long)]
         subscribe: bool,
+        /// Emit machine-readable JSON including each entry's VERSION, which the
+        /// human listing omits. `atlasctl remove` needs the current version to
+        /// supersede a subject, so without this a bulk removal has to guess it.
+        #[arg(long)]
+        json: bool,
     },
     /// Print the index contract id (no network).
     Key,
@@ -271,7 +276,7 @@ async fn main() -> Result<()> {
             expect_version,
         } => app_set(&cli, &dir, app, None, *expect_version).await,
         Cmd::Apps { json } => apps(&cli, &dir, *json).await,
-        Cmd::Show { subscribe } => show(&cli, &dir, *subscribe).await,
+        Cmd::Show { subscribe, json } => show(&cli, &dir, *subscribe, *json).await,
         Cmd::Key => {
             let params = params_bytes(&dir, &cli.slug)?;
             let key = NodeClient::contract_key(CONTRACT_WASM, &params);
@@ -836,19 +841,41 @@ async fn remove(cli: &Cli, dir: &Path, subject: &str, cur_version: u64) -> Resul
     Ok(())
 }
 
-async fn show(cli: &Cli, dir: &Path, subscribe: bool) -> Result<()> {
+async fn show(cli: &Cli, dir: &Path, subscribe: bool, json: bool) -> Result<()> {
     let params = params_bytes(dir, &cli.slug)?;
     let key = NodeClient::contract_key(CONTRACT_WASM, &params);
     let mut client = NodeClient::connect(&cli.node).await?;
     let bytes = client.get(&key, subscribe).await?;
     if bytes.is_empty() {
-        println!("(index is empty / not initialized)");
+        if json {
+            println!("[]");
+        } else {
+            println!("(index is empty / not initialized)");
+        }
         return Ok(());
     }
     let state: IndexState =
         ciborium::de::from_reader(&bytes[..]).context("decoding index state")?;
     let mut entries: Vec<_> = state.live_entries().collect();
     entries.sort_by_key(|e| std::cmp::Reverse(e.added_at));
+    if json {
+        let rows: Vec<serde_json::Value> = entries
+            .iter()
+            .map(|e| {
+                serde_json::json!({
+                    "subject_id": e.subject_id.as_str(),
+                    "version": e.version,
+                    "kind": format!("{:?}", e.kind),
+                    "title": e.title,
+                    "locator": e.locator.to_uri(),
+                    "featured": e.featured,
+                    "added_at": e.added_at,
+                })
+            })
+            .collect();
+        println!("{}", serde_json::to_string_pretty(&rows)?);
+        return Ok(());
+    }
     println!("{} live entries:", entries.len());
     let mut unresolvable = 0;
     for e in entries {

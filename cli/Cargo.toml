@@ -10,6 +10,7 @@ name = "atlasctl"
 path = "src/main.rs"
 
 [dependencies]
+serde_json = "1"
 atlas-common = { workspace = true, features = ["rng"] }
 ciborium.workspace = true
 ed25519-dalek = { workspace = true, features = ["rand_core"] }
