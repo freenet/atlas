@@ -7777,6 +7777,40 @@ mod tests {
         );
     }
 
+    /// The whole-href dot-segment scan has NO other coverage.
+    ///
+    /// `normalize_href` scans the ENTIRE href for dot segments before it splits
+    /// off the query/fragment, and that scan was previously pinned only by
+    /// assertions on bare `https://ok.example/?u=../..` inputs. Those became
+    /// vacuous the moment off-Freenet URLs started being refused outright: they
+    /// return `None` via the blanket https rejection whether the scan works or
+    /// not, so deleting the scan failed ZERO tests (verified by mutation in an
+    /// isolated worktree).
+    ///
+    /// A `freenet:` locator is the case that still reaches the scan, and it is
+    /// the one that matters: without the whole-href check,
+    /// `freenet:<id>/a#../../x` normalizes to a locator whose FRAGMENT carries
+    /// a traversal, which is then handed to the gateway at fetch time.
+    #[test]
+    fn a_dot_segment_hidden_in_a_freenet_locators_query_or_fragment_is_refused() {
+        for hidden in [
+            format!("freenet:{ID}/a#../../x"),
+            format!("freenet:{ID}/a?q=../../x"),
+            format!("/v1/contract/web/{ID}/a#../../x"),
+            // Percent-encoded, because the scan decodes to a fixed point first;
+            // a substring test for ".." would miss this and the WHATWG parser
+            // still normalizes past the web root.
+            format!("/v1/contract/web/{ID}/a#%2e%2e/%2e%2e/x"),
+            format!("http://gw.example/v1/contract/web/{ID}/a#../../x"),
+        ] {
+            assert_eq!(
+                normalize_href(&hidden),
+                None,
+                "a dot segment anywhere in {hidden:?} must refuse the whole href"
+            );
+        }
+    }
+
     #[test]
     fn the_source_pins_are_all_present() {
         let src = include_str!("main.rs");
@@ -7789,6 +7823,7 @@ mod tests {
             "fn a_non_current_generation_resolving_is_logged_loudly",
             "fn the_room_crawl_actually_cross_checks_the_key",
             "fn a_curated_source_line_that_does_not_normalise_is_skipped",
+            "fn a_dot_segment_hidden_in_a_freenet_locators_query_or_fragment_is_refused",
             "fn riverctls_answer_wins_when_the_bundle_is_stale",
             "fn the_probe_handle_is_fresh_every_run",
             "fn a_too_short_probe_result_is_not_a_usable_baseline",
@@ -8183,14 +8218,30 @@ mod tests {
         // which the URL parser collapses to `/v1/secret` on our own node. The
         // response body would have gone to the LLM and into the public index.
         let atk = format!("/v1/contract/web/{ID}/../../../../v1/secret");
+        // These four are VACUOUS on their own now: a bare non-gateway https URL
+        // is refused unconditionally, so they return None whether or not the
+        // whole-href scan works. Kept because they still document the original
+        // attack shapes -- but the scan itself is pinned by
+        // `a_dot_segment_hidden_in_a_freenet_locators_query_or_fragment_is_refused`
+        // and by the gateway-form counterparts immediately below, which reach
+        // the scan instead of the blanket refusal.
         assert!(normalize_href(&format!("https://ok.example/?u={atk}")).is_none());
         assert!(normalize_href(&format!("https://ok.example/#{atk}")).is_none());
         assert!(normalize_href(&format!("https://ok.example/?a=1#{atk}")).is_none());
-        // Percent-encoded, same hiding place.
         assert!(normalize_href(&format!(
             "https://ok.example/?u=/v1/contract/web/{ID}/%2e%2e/%2e%2e/v1/secret"
         ))
         .is_none());
+        // The non-vacuous counterparts: same attack, gateway-form host, so the
+        // gateway branch is reached and only the dot-segment scan can refuse it.
+        assert!(
+            normalize_href(&format!("http://gw.example/v1/contract/web/{ID}/p?u={atk}")).is_none(),
+            "traversal hidden in a GATEWAY url's query must be refused"
+        );
+        assert!(
+            normalize_href(&format!("http://gw.example/v1/contract/web/{ID}/p#{atk}")).is_none(),
+            "traversal hidden in a GATEWAY url's fragment must be refused"
+        );
         // Encoded SEPARATORS, not just encoded dots. Splitting the path before
         // decoding made `..%2f..%2f..%2fetc%2fpasswd` a single segment that
         // decoded to something longer than `..`, so it was never flagged — and
