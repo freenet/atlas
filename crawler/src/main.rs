@@ -5858,11 +5858,17 @@ mod tests {
     /// contract-key`. Returns its path.
     fn stub_riverctl(key: &str) -> String {
         use std::io::Write as _;
-        let dir = std::env::temp_dir().join(format!(
-            "atlas-riverctl-stub-{}-{}",
-            std::process::id(),
-            key
-        ));
+        // UNIQUE PER CALL, not per (pid, key). Three tests stub the same key,
+        // cargo runs them on parallel threads, and they all resolved to one
+        // path -- so one thread's `File::create` truncated the stub while
+        // another was mid-`Command::output()` executing it, failing with
+        // ETXTBSY ("Text file busy"). It passed when run alone and failed in the
+        // full suite, which is the signature of exactly this. A per-call counter
+        // makes the paths disjoint.
+        static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let seq = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir =
+            std::env::temp_dir().join(format!("atlas-riverctl-stub-{}-{seq}", std::process::id(),));
         std::fs::create_dir_all(&dir).expect("stub dir");
         let path = dir.join("riverctl");
         let mut f = std::fs::File::create(&path).expect("stub file");
