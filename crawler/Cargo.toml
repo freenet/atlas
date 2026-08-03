@@ -19,20 +19,6 @@ serde = { workspace = true }
 serde_json = "1"
 url = "2"
 
-freenet-stdlib = { workspace = true, features = ["net"] }
-ciborium = { workspace = true }
-# The current room-contract WASM is bundled (`crawler/contracts/room_contract.wasm`,
-# read via `include_bytes!` relative to `src/main.rs`) and hashed at runtime to
-# derive the CURRENT room-contract key, mirroring how riverctl itself derives
-# it — see the doc comment on `ROOM_CONTRACT_WASM`.
-blake3 = { workspace = true }
-# The workspace pins this with default-features off so the contract WASM stays
-# lean; the crawler is a native binary and needs `std` for error interop.
-ed25519-dalek = { workspace = true, features = ["std"] }
-bs58 = { workspace = true }
-tokio = { version = "1", features = ["rt-multi-thread", "time", "net", "io-util"] }
-tokio-tungstenite = { version = "0.27", features = ["rustls-tls-webpki-roots"] }
-
 [dev-dependencies]
 tempfile = "3"
 # Test-only: the differential assertion that the CONTRACT-enforced path guards in

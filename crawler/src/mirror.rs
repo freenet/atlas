@@ -20,15 +20,24 @@
 //! address again.
 //!
 //! **Trust boundary, stated rather than quietly dropped.** The old path verified
-//! each message's ed25519 signature against its author's key, as defence against
-//! a compromised or buggy local node lying about the bytes in a GET — the stake
-//! being that `author` feeds the per-author spend share, so an unverified author
-//! is a rate-limit bucket anyone could forge. Reading the mirror moves that
-//! check upstream: the room contract enforces signatures at the state-transition
-//! layer, and the mirror ingests through a root-owned `riverctl` in the same
-//! security domain as this crawler, reading the same local node. The exposure is
-//! therefore unchanged in kind, but this crate no longer performs the check
-//! itself, and that is a deliberate transfer rather than an oversight.
+//! each message's ed25519 signature against its author's key. The threat that
+//! guarded against was specifically A LYING LOCAL NODE — not invalid network
+//! state — because `author` feeds the per-author spend share, so a forged author
+//! is a rate-limit bucket anyone could mint. Naming it precisely matters,
+//! because "the contract enforces signatures" answers a DIFFERENT question
+//! (what other peers accept), not this one.
+//!
+//! Reading the mirror does not widen that exposure, for a reason worth being
+//! explicit about: the old code was never independent of the local node anyway.
+//! It took the room CONFIGURATION signature, the contract key resolution and the
+//! entire WS transport from that same node; a node willing to forge a message
+//! author could equally forge the member list the signature was checked against.
+//! What changes is only WHERE the check lives — the mirror ingests through a
+//! root-owned `riverctl` in the same security domain, reading the same node.
+//!
+//! So this is a deliberate transfer, not an oversight, and not a new hole. If
+//! the local node ever stops being trusted, the fix belongs in the mirror (one
+//! place) rather than in each consumer.
 
 use anyhow::{Context, Result};
 use rusqlite::{Connection, OpenFlags};

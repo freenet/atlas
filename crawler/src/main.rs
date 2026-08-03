@@ -2935,16 +2935,8 @@ fn crawl_hub(
     captured
 }
 
-/// Poll a River room and CAPTURE the `https://` / `freenet:` URLs posted in its
-/// messages into the pending queue. Discovery only — nothing is fetched,
-/// described, or billed here; that happens later when the pending queue is
-/// drained under the spend caps.
-///
-/// This runs on every tick regardless of remaining budget, and that is the
-/// point. A room keeps only its most recent messages (100 by default) and
-/// evicts oldest-first, so a link we decline to *look at* today may simply not
-/// exist tomorrow. Capturing is free (one contract GET), so there is no reason
-/// Ingest links posted in a River room, reading river-mirror's replica.
+/// Capture the `freenet:` / `app:` locators posted in a River room, reading
+/// river-mirror's replica.
 ///
 /// Replaces deriving the room's contract key from a bundled `room_contract.wasm`
 /// and GETting it ourselves. That path silently read an ABANDONED generation
@@ -2954,10 +2946,12 @@ fn crawl_hub(
 /// attest a generation it cannot verify; `mirror::messages_since` fails closed
 /// on that attestation.
 ///
-/// Discovery only, and unconditional: capturing is free (one local SQLite read
-/// now, not even a network GET), and a room evicts messages past
-/// `max_recent_messages`, so a link we decline to LOOK at today may not exist
-/// tomorrow.
+/// Discovery only, and it runs regardless of remaining budget: nothing is
+/// fetched, described or billed here. Capturing is now a local SQLite read
+/// rather than a network GET, and the room evicts messages past
+/// `max_recent_messages`, so a link we decline to LOOK at today may simply not
+/// exist tomorrow. The mirror retains them past that window, which is why this
+/// already sees more history than the room itself holds.
 fn crawl_river_room(
     cli: &Cli,
     owner_vk_b58: &str,
