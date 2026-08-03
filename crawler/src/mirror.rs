@@ -107,6 +107,16 @@ fn open_checked(db: &Path, room: &str) -> Result<Result<Connection, MirrorUnusab
     }
     let age = reconcile_age_secs(&last_ok);
     match age {
+        // A FUTURE timestamp is not "very fresh", it is a corrupt or
+        // clock-skewed one. Treating it as fresh would make a garbled value the
+        // most trusted possible state.
+        Some(a) if a < 0 => {
+            return Ok(Err(MirrorUnusable(format!(
+                "mirror's last_reconcile_ok_at is {}s in the FUTURE -- corrupt or \
+                 clock-skewed",
+                -a
+            ))))
+        }
         None => {
             return Ok(Err(MirrorUnusable(
                 "mirror has never completed a reconcile".into(),
@@ -334,6 +344,32 @@ mod tests {
             .err()
             .unwrap();
         assert!(err.0.contains("never completed"), "{}", err.0);
+    }
+
+    /// The crawler/mirror compat-break detector. Untested until now, which is
+    /// the exact gap this kind of guard is prone to.
+    #[test]
+    fn an_unknown_schema_version_is_refused() {
+        let f = fixture(1, &now_rfc3339(), &[(1, "A", "x", 0)]);
+        Connection::open(f.path())
+            .unwrap()
+            .execute("UPDATE meta SET value='2' WHERE key='schema_version'", [])
+            .unwrap();
+        let err = messages_since(f.path(), "room", 0, 100)
+            .unwrap()
+            .err()
+            .unwrap();
+        assert!(err.0.contains("schema version 2"), "{}", err.0);
+    }
+
+    #[test]
+    fn a_future_reconcile_timestamp_is_refused_not_treated_as_fresh() {
+        let f = fixture(1, "2099-01-01T00:00:00+00:00", &[(1, "A", "x", 0)]);
+        let err = messages_since(f.path(), "room", 0, 100)
+            .unwrap()
+            .err()
+            .unwrap();
+        assert!(err.0.contains("FUTURE"), "{}", err.0);
     }
 
     #[test]

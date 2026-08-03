@@ -2987,10 +2987,19 @@ fn crawl_river_room(
 
     let mut captured = 0usize;
     let mut highest = cursor;
+    let mut blocked = false;
     for m in &msgs {
         // Ordered by `seq`, so the FIRST poster of a duplicate URL is seen first
-        // and is the one charged. `seq` is the mirror's own arrival order, which
-        // -- unlike the message's claimed timestamp -- is not author-controlled.
+        // and is the one charged.
+        //
+        // `seq` is the mirror's INGESTION order, not true post order: a message
+        // backfilled by reconcile after a stream stall is stamped when reconcile
+        // caught up, so an unlucky stall can let a later re-poster be charged
+        // instead. That is a narrower failure than the `(time, id)` sort it
+        // replaces -- which was author-controlled and therefore forgeable -- but
+        // it is not perfect, and it is a rate-limit attribution question, not a
+        // correctness one.
+        let mut all_placed = true;
         for (loc, kind) in scan_urls(&m.content) {
             let loc = map_or_collapse(loc, registry);
             if seen.contains(&loc) || pending.contains(&loc) {
@@ -2998,9 +3007,33 @@ fn crawl_river_room(
             }
             if pending.add(&loc, kind, &m.author_id) {
                 captured += 1;
+            } else {
+                // REFUSED for capacity (per-author cap, or the global cap with
+                // eviction also failing) -- not deduped. The locator is not
+                // recorded anywhere.
+                all_placed = false;
             }
         }
-        highest = highest.max(m.seq);
+        // Do NOT advance past a message whose links we failed to place.
+        //
+        // `Pending`'s own doc comment is explicit that "deferring without
+        // recording it is a delayed silent drop, not a deferral" -- and the old
+        // full-room-rescan design honoured that by re-seeing every live message
+        // every run, so a capacity-refused link was retried until quota freed.
+        // A cursor that advanced unconditionally would reintroduce exactly that
+        // silent drop by a different route, and a worse one: the message is
+        // sitting durably in the mirror the whole time, just never looked at
+        // again.
+        //
+        // Once blocked we keep SCANNING (later captures are still worth having,
+        // and re-reading them next run is deduped) but stop moving the cursor,
+        // so the refused message is re-read once there is room.
+        if !all_placed {
+            blocked = true;
+        }
+        if !blocked {
+            highest = m.seq;
+        }
     }
     // Advance ONLY after the captures are in `pending`, which `run_once`
     // persists before spending a token. A crash between the two re-reads the
@@ -7274,12 +7307,44 @@ mod tests {
         );
     }
 
+    /// THE regression for the cursor's worst failure mode.
+    ///
+    /// `Pending::add` returns false for CAPACITY (per-author cap, or the global
+    /// cap when eviction also fails), not only for duplicates. If the cursor
+    /// advanced past such a message, its link would never be captured and never
+    /// re-read -- a permanent silent drop, of exactly the kind `Pending`'s own
+    /// doc comment says must never happen. The old full-room-rescan design was
+    /// immune because it re-saw every live message every run.
+    ///
+    /// Source-scraped: `crawl_river_room` needs a populated mirror and a live
+    /// queue, so the behaviour is pinned at its decision point instead.
+    #[test]
+    fn the_cursor_does_not_advance_past_links_it_failed_to_place() {
+        let src = strip_comments(include_str!("main.rs"));
+        let at = src
+            .find("fn crawl_river_room(")
+            .expect("crawl_river_room exists");
+        let body = &src[at..];
+        let end = body.find("\nfn ").map(|e| at + e).unwrap_or(src.len());
+        let body = &src[at..end];
+        assert!(
+            !body.contains("highest = highest.max(m.seq);"),
+            "the cursor must NOT advance unconditionally -- that silently drops \
+             any link refused for capacity"
+        );
+        assert!(
+            body.contains("blocked = true;") && body.contains("if !blocked {"),
+            "a message with an unplaced link must stop the cursor advancing"
+        );
+    }
+
     #[test]
     fn the_source_pins_are_all_present() {
         let src = include_str!("main.rs");
         for pin in [
             "fn a_curated_source_line_that_does_not_normalise_is_skipped",
             "fn the_room_crawl_reads_the_mirror_and_maps_locators",
+            "fn the_cursor_does_not_advance_past_links_it_failed_to_place",
             "fn a_dot_segment_hidden_in_a_freenet_locators_query_or_fragment_is_refused",
             "fn a_hub_that_does_not_normalise_is_refused_not_crawled_raw",
             "fn the_probe_handle_is_fresh_every_run",
