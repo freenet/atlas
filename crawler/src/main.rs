@@ -6252,6 +6252,27 @@ mod tests {
 
     #[test]
     fn overlong_locators_are_rejected() {
+        // The freenet-form case is the load-bearing one: it REACHES the length
+        // check. The https case below cannot -- an off-Freenet URL is refused
+        // unconditionally, so it returns None whether the length guard runs or
+        // not, and with the guard disabled the whole suite still passed.
+        // `MAX_LOCATOR_LEN` has exactly one production use site, so that left it
+        // with zero coverage. Same defect as the query/fragment assertions.
+        let long_freenet = format!("freenet:{ID}/{}", "a".repeat(MAX_LOCATOR_LEN));
+        assert!(
+            long_freenet.len() > MAX_LOCATOR_LEN,
+            "fixture must actually exceed the bound it tests"
+        );
+        assert!(
+            normalize_href(&long_freenet).is_none(),
+            "a freenet locator past MAX_LOCATOR_LEN must be refused"
+        );
+        // Just under the bound still indexes, so the guard is a bound and not a
+        // blanket refusal.
+        let just_under = format!("freenet:{ID}/{}", "a".repeat(MAX_LOCATOR_LEN - 60));
+        assert!(just_under.len() < MAX_LOCATOR_LEN);
+        assert!(normalize_href(&just_under).is_some());
+        // Vacuous on its own now, kept because it documents the original shape.
         let long = format!("https://example.com/{}", "a".repeat(MAX_LOCATOR_LEN));
         assert!(normalize_href(&long).is_none());
         assert!(

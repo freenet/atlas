@@ -131,10 +131,6 @@ body { margin:0; background:var(--bg); color:var(--fg); line-height:1.5;
   transition:border-color .15s; }
 .open:hover { border-color:var(--dim); }
 .open.unavail { color:var(--faint); border-style:dashed; cursor:default; }
-.filter-row { display:flex; align-items:center; gap:.5rem; margin-top:.6rem;
-  color:var(--dim); font-size:.8rem; }
-.filter-row input { accent-color:var(--fg); }
-.filter-row label { cursor:pointer; }
 .empty { color:var(--dim); padding:3rem 0; text-align:center; }
 .foot { margin-top:2.5rem; padding-top:1.2rem; border-top:1px solid var(--line);
   color:var(--faint); font-size:.76rem; line-height:1.6; }
