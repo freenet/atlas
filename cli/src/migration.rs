@@ -47,6 +47,11 @@ use freenet_stdlib::prelude::{ContractKey, Parameters};
 ///   pre-bump snapshot, so it is worth merging, but it is NOT what the published UI
 ///   reads.
 pub const LEGACY_INDEX_CODE_HASHES: &[&str] = &[
+    // Retired 2026-08-03 by the freenet-stdlib 0.8.3 -> 0.8.5 bump, which the
+    // crawler's river-core 0.1.19 requirement forced. The contract's own source
+    // did not change; stdlib is a workspace dependency of it, so the artifact
+    // (and therefore the index address) moved anyway.
+    "4oYXG4CMegsqQ2Hn1vXfkcnCpTnMTfeyTUTWgTabbBAA",
     "C6vpLoy2sdzbw9crd9wiAtUJQdeofN4NrANbqAGcLGTU",
     "GDt9A4DteAP6SYPmFXzoTScQuPfwufMaoZxxJaDDB1Yt",
 ];
@@ -68,13 +73,24 @@ mod tests {
     // The retired WASMs, preserved so each registered code hash can be verified
     // against the real bytes it claims to describe. Newest-first, matching the
     // order of `LEGACY_INDEX_CODE_HASHES`.
+    // Named `-app-registry` rather than plain `-v0.8.3-stdlib`: BOTH this
+    // generation and the one below were built against stdlib 0.8.3 (this one was
+    // retired by the 0.8.5 bump, the other by the app-registry source change),
+    // so the stdlib version alone no longer distinguishes them.
+    const LEGACY_V083_APP_REGISTRY_WASM: &[u8] = include_bytes!(
+        "../../contracts/index-contract/legacy/atlas_index_contract-v0.8.3-stdlib-app-registry.wasm"
+    );
     const LEGACY_V083_WASM: &[u8] = include_bytes!(
         "../../contracts/index-contract/legacy/atlas_index_contract-v0.8.3-stdlib.wasm"
     );
     const LEGACY_V06_WASM: &[u8] = include_bytes!(
         "../../contracts/index-contract/legacy/atlas_index_contract-v0.6.0-stdlib.wasm"
     );
-    const PRESERVED_LEGACY_WASMS: &[&[u8]] = &[LEGACY_V083_WASM, LEGACY_V06_WASM];
+    const PRESERVED_LEGACY_WASMS: &[&[u8]] = &[
+        LEGACY_V083_APP_REGISTRY_WASM,
+        LEGACY_V083_WASM,
+        LEGACY_V06_WASM,
+    ];
     // The current WASM the CLI embeds.
     const CURRENT_WASM: &[u8] =
         include_bytes!("../../contracts/index-contract/atlas_index_contract.wasm");
