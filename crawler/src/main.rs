@@ -2860,8 +2860,27 @@ fn crawl_hub(
     // specific URL (a particular page of a particular site), and mapping would drop
     // the path — which is exactly what we want for a link we are cataloguing and
     // exactly wrong for one we are about to fetch.
-    let hub_canon = normalize_href(hub).map(|(l, _)| l);
-    let hub = hub_canon.as_deref().unwrap_or(hub);
+    //
+    // A hub that does not normalise is REFUSED, not crawled from the raw line.
+    // The `unwrap_or(hub)` fallback that used to stand here was the last
+    // capture path still open to an off-Freenet URL: a `hub https://…` sources
+    // line never passes through `normalize_mapped` (it is dispatched before
+    // that, on the `hub ` prefix), so once `normalize_href` began refusing
+    // https it returned None for every such hub and the raw string was used
+    // anyway -- fetched, and then queued as its own indexable subject via
+    // `pending.add(&hub_subject, "site", …)` below, since `hub_subject_of` is a
+    // passthrough for anything not `freenet:`-prefixed.
+    //
+    // Symmetric with the curated-sources refusal in `run_once`: an operator
+    // line that cannot be normalised is skipped loudly rather than trusted.
+    let Some(hub_canon) = normalize_href(hub).map(|(l, _)| l) else {
+        eprintln!(
+            "hub {hub:?}: not a Freenet locator, skipping. Atlas indexes Freenet, \
+             not the web; an https:// hub has nowhere to go."
+        );
+        return 0;
+    };
+    let hub = hub_canon.as_str();
     // Enumerate the site's other pages when the hub is app-hosted. An app whose
     // internal navigation is not `<a href>` cannot be walked by following links, so
     // without this the crawl sees exactly the one page it was pointed at.
@@ -7834,6 +7853,33 @@ mod tests {
         }
     }
 
+    /// The last capture path that stayed open after https was refused.
+    ///
+    /// A `hub <url>` sources line is dispatched on its own prefix and never
+    /// reaches `normalize_mapped`, so once `normalize_href` began refusing
+    /// https, `crawl_hub`'s `unwrap_or(hub)` fallback silently used the RAW
+    /// line -- fetching it, and queueing it as its own indexable subject with
+    /// kind "site" (`hub_subject_of` is a passthrough for anything not
+    /// `freenet:`-prefixed). Source-scraped because `crawl_hub` needs a node, a
+    /// renderer and a live fetch to drive.
+    #[test]
+    fn a_hub_that_does_not_normalise_is_refused_not_crawled_raw() {
+        let src = strip_comments(include_str!("main.rs"));
+        let at = src.find("fn crawl_hub(").expect("crawl_hub exists");
+        let body = &src[at..];
+        let end = body.find("\nfn ").map(|e| at + e).unwrap_or(src.len());
+        let body = &src[at..end];
+        assert!(
+            !body.contains("unwrap_or(hub)"),
+            "crawl_hub must not fall back to the raw, unnormalised hub line -- \
+             that is a capture path for an off-Freenet URL"
+        );
+        assert!(
+            body.contains("let Some(hub_canon) = normalize_href(hub)"),
+            "crawl_hub must REFUSE a hub that does not normalise"
+        );
+    }
+
     #[test]
     fn the_source_pins_are_all_present() {
         let src = include_str!("main.rs");
@@ -7847,6 +7893,7 @@ mod tests {
             "fn the_room_crawl_actually_cross_checks_the_key",
             "fn a_curated_source_line_that_does_not_normalise_is_skipped",
             "fn a_dot_segment_hidden_in_a_freenet_locators_query_or_fragment_is_refused",
+            "fn a_hub_that_does_not_normalise_is_refused_not_crawled_raw",
             "fn riverctls_answer_wins_when_the_bundle_is_stale",
             "fn the_probe_handle_is_fresh_every_run",
             "fn a_too_short_probe_result_is_not_a_usable_baseline",
