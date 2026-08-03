@@ -69,14 +69,10 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+mod mirror;
+
 use anyhow::{anyhow, bail, Context, Result};
 use clap::Parser;
-use ed25519_dalek::VerifyingKey;
-use freenet_stdlib::client_api::{
-    ClientRequest, ContractRequest, ContractResponse, HostResponse, WebApi,
-};
-use freenet_stdlib::prelude::{ContractInstanceId, ContractKey};
-use river_core::ChatRoomStateV1;
 
 const MAX_FETCH_BYTES: usize = 512 * 1024;
 /// Cap on the headless renderer's JSON output. Generous next to MAX_FETCH_BYTES
@@ -104,11 +100,19 @@ struct Cli {
     /// Path to the atlasctl binary.
     #[arg(long, default_value = "atlasctl")]
     atlasctl: String,
-    /// Path to the riverctl binary, used ONLY to cross-check the room-contract
-    /// key against an independently-maintained source. See
-    /// [`riverctl_room_key`] for why a self-contained check cannot work.
-    #[arg(long, default_value = "riverctl")]
-    riverctl: String,
+    /// river-mirror's SQLite replica. River-room ingestion reads THIS instead of
+    /// deriving the room's contract key and GETting it: the mirror owns room
+    /// resolution, with a generation attestation this crate cannot perform for
+    /// itself. See `mirror.rs`.
+    #[arg(
+        long,
+        default_value = "/home/ian/.local/state/river-mirror/room.sqlite"
+    )]
+    mirror_db: PathBuf,
+    /// Where the per-room mirror cursor is stored
+    /// (default: <key_dir>/crawler-mirror-cursor.txt).
+    #[arg(long)]
+    mirror_cursor: Option<PathBuf>,
     /// Node binary used to drive the headless renderer.
     #[arg(long, default_value = "node")]
     node_bin: String,
@@ -2931,299 +2935,6 @@ fn crawl_hub(
     captured
 }
 
-/// The current River room-contract WASM, bundled the same way `riverctl`
-/// bundles it (`cli/contracts/room_contract.wasm`, `include_bytes!`).
-///
-/// A hand-copied HASH constant was tried here first and was wrong from the
-/// day it was written: it named code hash `74f3dff1…` (river-core's registry
-/// calls this generation "V26", retired 2026-07-16), introduced into this
-/// crate on 2026-07-25 — a day on which `river-core 0.1.17` (already the
-/// pinned dependency, no bump needed) already listed THREE newer generations
-/// as legacy. The room had moved on before the constant existed. River-room
-/// ingestion itself only started running in production on 2026-07-30 (see
-/// `crawler-sources.txt`), so the live exposure was five hourly runs
-/// (17:55-21:05 that day) before this was caught and fixed — but the
-/// underlying defect, "this constant cannot be kept in sync by hand", was
-/// present from the start and would have caused the identical silent failure
-/// whenever ingestion first ran. `river-core`'s own doc comment on
-/// `LEGACY_ROOM_CONTRACT_CODE_HASHES` names the fix directly: "the current
-/// generation's hash is intentionally absent — it is computed at runtime from
-/// the bundled WASM bytes." A client is expected to CARRY THE WASM, not a
-/// hash of it, precisely so this can never go stale by omission the way the
-/// constant did.
-///
-/// Every run this was live looked identical to a quiet room: "10 candidate
-/// link(s), 0 newly captured", the same line a genuinely quiet room would log.
-/// `crawl_river_room` now also logs which candidate generation resolved and
-/// warns loudly when it is not the current one, so a stale bundle is visible
-/// on the FIRST run it causes, not only via a test someone has to think to
-/// run.
-///
-/// Re-sync procedure, unchanged from what the failed constant needed: after a
-/// River re-key, `cp river/main/cli/contracts/room_contract.wasm
-/// crawler/contracts/room_contract.wasm`, then refresh
-/// `OFFICIAL_CURRENT_KEY` from `riverctl debug contract-key`.
-/// `the_bundled_wasm_is_not_yet_legacy` is what makes forgetting the WASM copy
-/// LOUD instead of silent: it fails the moment `river-core` is bumped past a
-/// bump that retires this exact generation. That check is gated on bumping
-/// `river-core`, though, which is itself a manual step — it narrows the
-/// detection window from "as long as nobody notices" to "as long as nobody
-/// bumps a dependency", not to zero.
-const ROOM_CONTRACT_WASM: &[u8] = include_bytes!("../contracts/room_contract.wasm");
-
-/// BLAKE3 code hash of [`ROOM_CONTRACT_WASM`], computed once per process.
-///
-/// Not a `const`: BLAKE3 hashing is not `const fn`, so this runs at first use
-/// via `OnceLock` rather than at compile time — the same tradeoff riverctl's
-/// own `ROOM_CONTRACT_WASM` handling makes (see `cli/src/api.rs`).
-fn current_room_contract_code_hash() -> &'static [u8; 32] {
-    static HASH: std::sync::OnceLock<[u8; 32]> = std::sync::OnceLock::new();
-    HASH.get_or_init(|| *blake3::hash(ROOM_CONTRACT_WASM).as_bytes())
-}
-
-/// Parse a base58 ed25519 verifying key (a River room owner VK).
-fn parse_owner_vk(s: &str) -> Result<VerifyingKey> {
-    let bytes = bs58::decode(s)
-        .into_vec()
-        .with_context(|| "owner vk is not valid base58")?;
-    let arr: [u8; 32] = bytes
-        .as_slice()
-        .try_into()
-        .map_err(|_| anyhow!("owner vk decodes to {} bytes, expected 32", bytes.len()))?;
-    VerifyingKey::from_bytes(&arr).with_context(|| "owner vk is not a valid ed25519 point")
-}
-
-/// The room-contract keys to probe for `owner_vk`, newest generation first:
-/// the current generation (derived from the bundled
-/// [`ROOM_CONTRACT_WASM`]) then every legacy generation from `river-core`'s
-/// registry (newest-first). This is what makes ingestion re-key-proof: after a
-/// River re-key the room state migrates to a new key, and we find it via the
-/// current-generation derivation as long as the bundled WASM is current, or
-/// via the legacy fallback in the meantime.
-fn room_candidate_keys(owner_vk: &VerifyingKey) -> Vec<ContractKey> {
-    let mut keys = vec![river_core::migration::contract_key_for_code_hash(
-        owner_vk,
-        current_room_contract_code_hash(),
-    )];
-    keys.extend(river_core::migration::legacy_contract_keys_for_owner(
-        owner_vk,
-    ));
-    keys
-}
-
-/// Ask `riverctl` which contract key the room ACTUALLY lives at right now.
-///
-/// This exists because no self-contained check can answer that question. When
-/// River re-keys the room contract, the new key is derived from a WASM this
-/// crate does not have and from a `river-core` registry entry that does not
-/// exist yet — so the live key is not merely un-derived here, it is
-/// *underivable*. [`room_candidate_keys`] can enumerate the current bundled
-/// generation and every RETIRED one, and the live key is in neither set. That
-/// is precisely how the Official room was read from a dead generation for
-/// three days (fix: 3ed8529) and, before that, for thirteen (362e135).
-///
-/// Every guard that failed in those incidents was self-contained, and each
-/// failed the same way — its inputs rot from the one cause it is meant to
-/// detect:
-///
-///   - `the_bundled_wasm_is_not_yet_legacy` asks "is my WASM retired?", but can
-///     only answer from the `river-core` registry it was compiled against. Pin
-///     an older `river-core` and the answer is permanently "no".
-///   - `room_key_derivation_matches_the_live_network` compares the derived key
-///     to `OFFICIAL_CURRENT_KEY`. Both are in-repo values refreshed by the same
-///     human in the same edit, so they agree with each other while both being
-///     wrong.
-///   - The runtime "resolved via LEGACY generation" warning fires when
-///     resolution lands on a candidate other than index 0 — but a stale bundle
-///     is what DEFINES index 0, so it logged "generation 0/32" throughout.
-///
-/// `riverctl` breaks that pattern because it is maintained on a genuinely
-/// independent track: `riverctl-autoupdate.sh` reinstalls it hourly from
-/// crates.io and — critically — refuses to stamp itself healthy unless the
-/// freshly-derived key returns a live room with real members. It answers "where
-/// is the room?" rather than "are my own build inputs stale?", which is the
-/// only form of the question a stale artifact cannot get wrong.
-///
-/// Failure here is deliberately NOT fatal. Discovery is free and a room evicts
-/// messages past `max_recent_messages`, so a link not captured today may not
-/// exist tomorrow; refusing to crawl because a cross-check tool is missing
-/// would lose data permanently to protect against reading a *possibly* stale
-/// room. The caller logs loudly and falls back to derived candidates.
-///
-/// Trusting `riverctl`'s answer is safe even though it is a subprocess: the key
-/// only selects which contract to GET, and [`fetch_room_state`] still rejects
-/// any state whose configuration is not signed by the expected `owner_vk`. A
-/// wrong or hostile key yields no room, never a forged one.
-fn riverctl_room_instance_id(riverctl: &str, owner_vk_b58: &str) -> Result<ContractInstanceId> {
-    let output = Command::new(riverctl)
-        .arg("--no-version-check")
-        .arg("debug")
-        .arg("contract-key")
-        .arg(owner_vk_b58)
-        .env("RIVERCTL_NO_VERSION_CHECK", "1")
-        .stdin(std::process::Stdio::null())
-        .output()
-        .with_context(|| format!("could not run {riverctl}"))?;
-    anyhow::ensure!(
-        output.status.success(),
-        "riverctl debug contract-key exited {}",
-        output.status
-    );
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    parse_riverctl_contract_key(&stdout)
-}
-
-/// Pull the contract id out of `riverctl debug contract-key` output.
-///
-/// Split out from the spawn so the parse is testable without a riverctl on the
-/// box — the format is riverctl's to change, and a silent parse failure here
-/// would disable the cross-check exactly like the guards it replaces.
-fn parse_riverctl_contract_key(stdout: &str) -> Result<ContractInstanceId> {
-    let key_b58 = stdout
-        .lines()
-        .find_map(|line| line.trim().strip_prefix("Contract key:"))
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .ok_or_else(|| anyhow!("no 'Contract key:' line in riverctl output"))?;
-    // Decode and length-check by hand rather than using
-    // `ContractInstanceId::from_base58`. That helper decodes `onto` a pre-zeroed
-    // 32-byte buffer and only errors when the input is too LONG, so a TRUNCATED
-    // key is silently zero-padded into a well-formed id for some other contract
-    // — a garbled line would become a confident probe of the wrong address
-    // instead of an error. Same explicit shape as `parse_owner_vk`.
-    let bytes = bs58::decode(key_b58)
-        .into_vec()
-        .with_context(|| format!("riverctl contract key {key_b58:?} is not valid base58"))?;
-    let arr: [u8; 32] = bytes.as_slice().try_into().map_err(|_| {
-        anyhow!(
-            "riverctl contract key {key_b58:?} decodes to {} bytes, expected 32",
-            bytes.len()
-        )
-    })?;
-    Ok(ContractInstanceId::new(arr))
-}
-
-/// The candidate ids to probe, with `riverctl`'s authoritative answer promoted
-/// to the front when it disagrees with our own derivation.
-///
-/// Returns the list plus a note when something is off, so the caller can log it
-/// once, loudly, at the point of drift.
-fn cross_checked_candidate_ids(
-    derived: Vec<ContractInstanceId>,
-    owner_vk_b58: &str,
-    riverctl: &str,
-) -> (Vec<ContractInstanceId>, Option<String>) {
-    let mut ids = derived;
-    match riverctl_room_instance_id(riverctl, owner_vk_b58) {
-        Ok(authoritative) => {
-            if ids.first() == Some(&authoritative) {
-                return (ids, None);
-            }
-            let note = format!(
-                "bundled room_contract.wasm is STALE: riverctl says the room is at {} \
-                 but our derivation says {}. Using riverctl's answer so ingestion keeps \
-                 working; refresh the bundle (cp river/main/cli/contracts/\
-                 room_contract.wasm crawler/contracts/room_contract.wasm, then update \
-                 OFFICIAL_CURRENT_KEY) to silence this",
-                authoritative,
-                ids.first()
-                    .map(|id| id.to_string())
-                    .unwrap_or_else(|| "<none>".into()),
-            );
-            // Promote, don't just prepend: the authoritative id may already sit
-            // in the legacy list, and probing it twice would waste a round-trip
-            // and make `resolved_idx` ambiguous.
-            ids.retain(|id| id != &authoritative);
-            ids.insert(0, authoritative);
-            (ids, Some(note))
-        }
-        Err(error) => {
-            let note = format!(
-                "could not cross-check the room key with riverctl ({error:#}); falling \
-                 back to the bundled derivation, which CANNOT detect a re-key on its own"
-            );
-            (ids, Some(note))
-        }
-    }
-}
-
-/// GET a River room's state from the local node, trying each candidate key
-/// (current then legacy) until one returns a real, owner-signed room. Returns
-/// the deserialized state with its computed actions-state rebuilt, or `None` if
-/// no candidate resolved to a live room owned by `owner_vk`.
-///
-/// Mirrors riverctl's legacy-recovery probe (`cli/src/api.rs`): `return_contract
-/// _code: true` so a legacy generation the node hasn't cached can still resolve,
-/// and an owner-signature check on the configuration to reject empty/uninitialised
-/// contracts. Read-only — never subscribes, never PUTs.
-async fn fetch_room_state(
-    node_url: &str,
-    owner_vk: &VerifyingKey,
-    candidates: &[ContractInstanceId],
-) -> Result<Option<(ChatRoomStateV1, usize)>> {
-    // A fresh connection PER CANDIDATE, not one socket shared across the whole
-    // probe. Responses were previously correlated to requests only by arrival
-    // order on one socket, so a single 30s timeout desynchronised every
-    // candidate after it: the next iteration read the TIMED-OUT candidate's
-    // late reply, failed the `key.id() != id` check below, and the loop never
-    // recovered — one slow GET on the FIRST (current-generation) candidate
-    // silently discarded a room that exists and fell through to "no live room
-    // found". A fresh socket per candidate cannot desync; the cost is bounded
-    // (discovery-only, one River room configured today) and paid rarely, since
-    // resolving now succeeds on the first candidate whenever the bundled WASM
-    // is current.
-    for (idx, id) in candidates.iter().enumerate() {
-        let (ws, _) = match tokio_tungstenite::connect_async(node_url).await {
-            Ok(c) => c,
-            Err(_) => continue,
-        };
-        let mut api = WebApi::start(ws);
-        let req = ContractRequest::Get {
-            key: *id,
-            return_contract_code: true,
-            subscribe: false,
-            blocking_subscribe: false,
-        };
-        if api.send(ClientRequest::ContractOp(req)).await.is_err() {
-            continue;
-        }
-        let resp = match tokio::time::timeout(Duration::from_secs(30), api.recv()).await {
-            Ok(Ok(r)) => r,
-            _ => continue,
-        };
-        let HostResponse::ContractResponse(ContractResponse::GetResponse { key, state, .. }) = resp
-        else {
-            continue;
-        };
-        if key.id() != id {
-            continue;
-        }
-        let mut room_state = match ciborium::de::from_reader::<ChatRoomStateV1, _>(&state[..]) {
-            Ok(s) => s,
-            Err(_) => continue,
-        };
-        // A real room always carries an owner-signed configuration; an absent or
-        // never-initialised contract does not. This also rejects a same-key hit
-        // that isn't actually this owner's room.
-        if room_state.configuration.verify_signature(owner_vk).is_err() {
-            continue;
-        }
-        // Sort locally rather than trusting the order the state arrived in.
-        // Per-author attribution and the queue's discovery order both depend on
-        // this ordering, so it should be a local guarantee, not an assumption
-        // about a remote peer. Matches the contract's own comparator.
-        room_state.recent_messages.messages.sort_by(|a, b| {
-            a.message
-                .time
-                .cmp(&b.message.time)
-                .then_with(|| a.id().cmp(&b.id()))
-        });
-        room_state.recent_messages.rebuild_actions_state();
-        return Ok(Some((room_state, idx)));
-    }
-    Ok(None)
-}
-
 /// Poll a River room and CAPTURE the `https://` / `freenet:` URLs posted in its
 /// messages into the pending queue. Discovery only — nothing is fetched,
 /// described, or billed here; that happens later when the pending queue is
@@ -3233,7 +2944,20 @@ async fn fetch_room_state(
 /// point. A room keeps only its most recent messages (100 by default) and
 /// evicts oldest-first, so a link we decline to *look at* today may simply not
 /// exist tomorrow. Capturing is free (one contract GET), so there is no reason
-/// to skip it, and skipping it is how links get lost.
+/// Ingest links posted in a River room, reading river-mirror's replica.
+///
+/// Replaces deriving the room's contract key from a bundled `room_contract.wasm`
+/// and GETting it ourselves. That path silently read an ABANDONED generation
+/// twice -- 13 days, then 3 days -- because a stale bundle is what DEFINES
+/// "current", so no check this crate could run was able to see it. The mirror
+/// resolves the room via an independently-maintained riverctl and refuses to
+/// attest a generation it cannot verify; `mirror::messages_since` fails closed
+/// on that attestation.
+///
+/// Discovery only, and unconditional: capturing is free (one local SQLite read
+/// now, not even a network GET), and a room evicts messages past
+/// `max_recent_messages`, so a link we decline to LOOK at today may not exist
+/// tomorrow.
 fn crawl_river_room(
     cli: &Cli,
     owner_vk_b58: &str,
@@ -3241,138 +2965,104 @@ fn crawl_river_room(
     pending: &mut Pending,
     registry: &AppRegistryView,
 ) -> usize {
-    let owner_vk = match parse_owner_vk(owner_vk_b58) {
-        Ok(vk) => vk,
-        Err(e) => {
-            eprintln!("river-room {owner_vk_b58}: bad owner vk: {e:#}");
-            return 0;
-        }
-    };
-    let candidate_keys = room_candidate_keys(&owner_vk);
-    let derived_ids: Vec<ContractInstanceId> = candidate_keys.iter().map(|k| *k.id()).collect();
-    let (candidate_ids, drift) =
-        cross_checked_candidate_ids(derived_ids, owner_vk_b58, &cli.riverctl);
-    if let Some(note) = drift {
-        eprintln!("river-room {owner_vk_b58}: WARNING {note}");
-    }
+    let cursor_path = cli
+        .mirror_cursor
+        .clone()
+        .unwrap_or_else(|| default_state_path(cli, "crawler-mirror-cursor.txt"));
+    let cursor = read_cursor(&cursor_path, owner_vk_b58);
 
-    // The WS GET is async; run it on a short-lived runtime and return the owned
-    // state, so the blocking-reqwest indexing below never runs inside a tokio
-    // context. block_on of a blocking client inside a runtime would panic.
-    let state = match tokio::runtime::Runtime::new() {
-        Ok(rt) => rt.block_on(fetch_room_state(&cli.node, &owner_vk, &candidate_ids)),
-        Err(e) => {
-            eprintln!("river-room {owner_vk_b58}: runtime: {e:#}");
-            return 0;
-        }
-    };
-    let (state, resolved_idx) = match state {
-        Ok(Some(s)) => s,
-        Ok(None) => {
+    let msgs = match mirror::messages_since(&cli.mirror_db, owner_vk_b58, cursor, MIRROR_BATCH) {
+        Ok(Ok(m)) => m,
+        Ok(Err(unusable)) => {
+            // Loud, and we do NOT advance the cursor: the links are still in the
+            // mirror and will be picked up once it is healthy again.
             eprintln!(
-                "river-room {owner_vk_b58}: no live room found (tried {} candidate key(s))",
-                candidate_ids.len()
+                "river-room {owner_vk_b58}: mirror unusable, skipping -- {}",
+                unusable.0
             );
             return 0;
         }
         Err(e) => {
-            eprintln!("river-room {owner_vk_b58}: fetch failed: {e:#}");
+            eprintln!("river-room {owner_vk_b58}: could not read mirror: {e:#}");
             return 0;
         }
     };
-    // The only way to see WHICH generation actually answered. A silently-stale
-    // bundled WASM (the exact incident this module exists to prevent
-    // recurring) looks identical to a healthy run without this: the room
-    // still resolves, still has messages, still logs a plausible-looking
-    // candidate count — just from an abandoned pre-re-key copy. Candidate 0 is
-    // always the current-generation derivation (`room_candidate_keys`), so
-    // landing anywhere else means the bundled WASM needs updating NOW, not
-    // whenever someone happens to notice a quiet room that should not be
-    // quiet.
-    if resolved_idx != 0 {
-        eprintln!(
-            "river-room {owner_vk_b58}: WARNING resolved via LEGACY generation \
-             (candidate {resolved_idx}/{}) — crawler/contracts/room_contract.wasm \
-             is stale; see crawler/contracts/README.md",
-            candidate_ids.len()
-        );
+    if msgs.is_empty() {
+        return 0;
     }
 
-    let links = extract_message_urls(&state, &owner_vk, registry);
-    let mut captured = 0;
-    for (loc, kind, author) in &links {
-        if seen.contains(loc) || pending.contains(loc) {
-            continue;
+    let mut captured = 0usize;
+    let mut highest = cursor;
+    for m in &msgs {
+        // Ordered by `seq`, so the FIRST poster of a duplicate URL is seen first
+        // and is the one charged. `seq` is the mirror's own arrival order, which
+        // -- unlike the message's claimed timestamp -- is not author-controlled.
+        for (loc, kind) in scan_urls(&m.content) {
+            let loc = map_or_collapse(loc, registry);
+            if seen.contains(&loc) || pending.contains(&loc) {
+                continue;
+            }
+            if pending.add(&loc, kind, &m.author_id) {
+                captured += 1;
+            }
         }
-        if pending.add(loc, kind, author) {
-            captured += 1;
-        }
+        highest = highest.max(m.seq);
+    }
+    // Advance ONLY after the captures are in `pending`, which `run_once`
+    // persists before spending a token. A crash between the two re-reads the
+    // same window next run; dedup makes that harmless. Advancing first would
+    // lose links permanently.
+    if let Err(e) = write_cursor(&cursor_path, owner_vk_b58, highest) {
+        eprintln!(
+            "river-room {owner_vk_b58}: WARNING could not persist cursor ({e:#}); \
+                   the next run will re-scan from {cursor}"
+        );
     }
     eprintln!(
-        "river-room {owner_vk_b58}: {} candidate link(s), {captured} newly captured \
-         (generation {resolved_idx}/{})",
-        links.len(),
-        candidate_ids.len()
+        "river-room {owner_vk_b58}: {} new message(s) from the mirror, {captured} link(s) captured (cursor {cursor} -> {highest})",
+        msgs.len()
     );
     captured
 }
 
-/// Extract outbound locators from a room's messages: the `https://` and
-/// `freenet:` URLs posted in message text. Walks the visible (non-action,
-/// non-deleted) messages, takes each one's effective (edit-aware) public text,
-/// and scans it for URLs. Private/encrypted messages yield no text and are
-/// skipped. Dedups across the whole room.
-///
-/// Each result carries the id of the member who posted it, so spend can be
-/// rationed per author (`--per-author-max`). Messages iterate in the room's
-/// canonical order (oldest first, by `(time, id)`), so on a duplicate URL the
-/// EARLIEST poster is the one charged — re-posting someone else's link cannot
-/// be used to burn a third party's share.
-fn extract_message_urls(
-    state: &ChatRoomStateV1,
-    owner_vk: &VerifyingKey,
-    registry: &AppRegistryView,
-) -> Vec<(String, &'static str, String)> {
-    let messages = &state.recent_messages;
-    let members = state.members.members_by_member_id();
-    let owner_id = river_core::room_state::member::MemberId::from(owner_vk);
-    let mut out: Vec<(String, &'static str, String)> = Vec::new();
-    let mut seen = HashSet::new();
-    for msg in messages.display_messages() {
-        // Authenticate every message against its author's key. We already
-        // decline to trust the served state for the room configuration; the
-        // message log deserves the same treatment, and doubly so because
-        // `author` is the key for the per-author spend share — an unverified
-        // author field is a rate limit anyone can attribute to anyone.
-        let author_vk = if msg.message.author == owner_id {
-            Some(*owner_vk)
-        } else {
-            members.get(&msg.message.author).map(|m| m.member.member_vk)
-        };
-        let Some(author_vk) = author_vk else {
-            continue;
-        };
-        if msg.validate(&author_vk).is_err() {
-            continue;
-        }
-        let Some(text) = messages.effective_text(msg) else {
-            continue;
-        };
-        let author = msg.message.author.to_string();
-        for (loc, kind) in scan_urls(&text) {
-            // Map onto a registered app, same as hub links and curated lines. Without
-            // this a Delta URL posted in the room is indexed under its container and
-            // becomes a SECOND entry for a site the hub crawl files under `app:delta/…`
-            // — the dedup collapse this work exists to prevent, via a different door.
-            // For anything NOT registered, `map_or_collapse` still folds different
-            // fragments of one unregistered SPA together, same reasoning.
-            let loc = map_or_collapse(loc, registry);
-            if seen.insert(loc.clone()) {
-                out.push((loc, kind, author.clone()));
-            }
-        }
-    }
-    out
+/// Bound one pass so a large backlog cannot build an unbounded capture batch.
+/// The remainder is picked up on the next tick.
+const MIRROR_BATCH: usize = 500;
+
+/// Same defaulting rule the other state files use.
+fn default_state_path(cli: &Cli, name: &str) -> PathBuf {
+    let key_dir = cli.key_dir.clone().unwrap_or_else(|| {
+        let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
+        PathBuf::from(home).join(".config/atlas")
+    });
+    key_dir.join(name)
+}
+
+/// `<room> <seq>` per line, so one file can track several rooms.
+fn read_cursor(path: &Path, room: &str) -> i64 {
+    let Ok(text) = fs::read_to_string(path) else {
+        return 0;
+    };
+    text.lines()
+        .find_map(|l| {
+            let (r, v) = l.split_once(char::is_whitespace)?;
+            (r == room).then(|| v.trim().parse().ok())?
+        })
+        .unwrap_or(0)
+}
+
+fn write_cursor(path: &Path, room: &str, seq: i64) -> Result<()> {
+    let mut lines: Vec<String> = fs::read_to_string(path)
+        .unwrap_or_default()
+        .lines()
+        .filter(|l| !l.starts_with(&format!("{room} ")))
+        .map(str::to_string)
+        .collect();
+    lines.push(format!("{room} {seq}"));
+    let tmp = sibling_tmp(path);
+    fs::write(&tmp, lines.join("\n") + "\n")?;
+    fs::rename(&tmp, path)?;
+    Ok(())
 }
 
 /// Scan freeform message text for locators. Tokenizes on
@@ -5177,44 +4867,6 @@ mod tests {
         assert_eq!(loc, format!("freenet:{CALLIOPE}/"));
     }
 
-    /// The THIRD call site, source-pinned rather than exercised end to end:
-    /// `extract_message_urls` needs a real signed `ChatRoomStateV1` to drive
-    /// directly, which nothing in this test module builds — the cost of adding
-    /// that scaffolding for one call site is disproportionate to what it
-    /// protects. This is the same tradeoff `the_indexing_path_enumerates_an_
-    /// app_resource` makes for a different hard-to-drive function; same fix.
-    ///
-    /// Scoped to the function's own body (not the whole file), so this cannot
-    /// pass by matching `map_or_collapse` calls at the OTHER two call sites —
-    /// only a revert of THIS one is what turns it red.
-    #[test]
-    fn extract_message_urls_routes_through_map_or_collapse() {
-        let src = include_str!("main.rs");
-        let production = src
-            .split("\nmod tests")
-            .next()
-            .expect("source must have a pre-test region");
-        assert!(
-            !production.contains("fn extract_message_urls_routes_through"),
-            "the scan region must exclude the test module, or the pin matches itself"
-        );
-        let at = production
-            .find("fn extract_message_urls(")
-            .expect("extract_message_urls must exist");
-        let body = &production[at..];
-        let end = body
-            .find("\nfn ")
-            .map(|e| at + e)
-            .unwrap_or(production.len());
-        let body = strip_comments(&production[at..end]);
-        assert!(
-            body.contains("map_or_collapse(loc, registry)"),
-            "a link posted in a River room must go through map_or_collapse, or a \
-             fragment-routed unregistered site's pages split back into separate \
-             listings through this one door"
-        );
-    }
-
     /// The exact shape reported live: five distinct locators for one unregistered
     /// image board — the bare root, a share page, a general board, and two
     /// individual thread pages — all under one contract with an empty server path
@@ -5618,290 +5270,6 @@ mod tests {
 
     // --- River-room ingestion (Atlas issue #2) ---
 
-    /// The Freenet Official room's stable owner VerifyingKey (from the
-    /// `river-official-room` runbook; the key gkapi signs invites with).
-    const OFFICIAL_OWNER_VK: &str = "4uNUKFzZQCnzo4K2ecZ16cMsYEEfoaRS35z6exEsbvm4";
-
-    /// The live contract key for [`OFFICIAL_OWNER_VK`] under the bundled WASM,
-    /// per `riverctl debug contract-key 4uNUKFzZQCnzo4K2ecZ16cMsYEEfoaRS35z6exEsbvm4`
-    /// — the network, not this file's own computation. Refresh from that
-    /// command (not from re-running this crate's own derivation) whenever
-    /// `crawler/contracts/room_contract.wasm` is updated, or this reverts to
-    /// comparing the code against itself, which is the exact defect it
-    /// replaces.
-    const OFFICIAL_CURRENT_KEY: &str = "9rhuzMSn4v4AugF5FhrjuB1tGP936TaP6Dp7fXijNPUL";
-
-    /// The bundled WASM is a checked-in binary a human `cp`s in — the only
-    /// integrity check on its CONTENT before this. Catches an empty, truncated,
-    /// or wrong-file `cp` (a plausible mistake: this repo also has
-    /// `contracts/index-contract/` and `contracts/web-container/`, either of
-    /// which would compile and hash cleanly if copied here by accident) as a
-    /// compile-adjacent sanity check, cheaply, before the real key-derivation
-    /// pin below has to catch it.
-    #[test]
-    fn the_bundled_wasm_looks_like_a_wasm_module() {
-        assert!(
-            ROOM_CONTRACT_WASM.starts_with(b"\0asm"),
-            "crawler/contracts/room_contract.wasm does not start with the WASM \
-             magic bytes — wrong file committed?"
-        );
-        assert!(
-            ROOM_CONTRACT_WASM.len() > 100_000,
-            "room_contract.wasm is suspiciously small ({} bytes) — truncated copy?",
-            ROOM_CONTRACT_WASM.len()
-        );
-    }
-
-    /// The independent cross-check the disclosed coverage gap needed.
-    ///
-    /// `the_bundled_wasm_is_not_yet_legacy` below proves the bundle is not
-    /// KNOWN-stale; it cannot prove the bundle is CORRECT — a zeroed, corrupt,
-    /// or wrong-but-differently-hashed WASM passes it just as cleanly as a
-    /// genuine one, because "absent from the legacy list" is satisfied by
-    /// nearly any garbage. This test pins the actual derived key against
-    /// [`OFFICIAL_CURRENT_KEY`], sourced from `riverctl` — a party that does
-    /// not read this file — so it fails on a wrong-file `cp`, a corrupt
-    /// download, or a broken hash computation, none of which the other two
-    /// tests can see.
-    #[test]
-    fn room_key_derivation_matches_the_live_network() {
-        let owner = parse_owner_vk(OFFICIAL_OWNER_VK).expect("official owner vk parses");
-        let key = river_core::migration::contract_key_for_code_hash(
-            &owner,
-            current_room_contract_code_hash(),
-        );
-        assert_eq!(
-            key.id().to_string(),
-            OFFICIAL_CURRENT_KEY,
-            "current-generation derivation must reproduce the live Official room \
-             key — if `room_contract.wasm` was just updated, refresh \
-             OFFICIAL_CURRENT_KEY from `riverctl debug contract-key`; if it was \
-             NOT updated, something is wrong with the derivation itself"
-        );
-    }
-
-    /// The structural check that outlives any one WASM refresh.
-    ///
-    /// [`room_key_derivation_matches_the_live_network`] pins a value that goes
-    /// stale the moment River re-keys again — exactly the shape that let the
-    /// PREVIOUS version of this test agree with a hand-copied hash constant for
-    /// five hourly runs (2026-07-30 17:55-21:05) before this fix landed,
-    /// without ever touching the network. `river-core`'s own registry is the
-    /// one input here that updates independently of this file: it appends a
-    /// hash exactly when a re-key retires it, so the day this crate's
-    /// `river-core` dependency is bumped past whatever bump retires today's
-    /// bundled WASM, this fails with the word "legacy" in the message, at the
-    /// point of drift rather than at the point someone happens to notice a
-    /// room that has gone quiet in a way it should not have.
-    ///
-    /// Concretely: the constant this whole module replaces (code hash
-    /// `74f3dff1…`, river-core's registry name "V26", retired 2026-07-16) was
-    /// ALREADY present in `river-core 0.1.17` — the version this crate had
-    /// pinned since the day the constant was introduced. This assertion would
-    /// have failed on that dependency with no version bump at all.
-    #[test]
-    fn the_bundled_wasm_is_not_yet_legacy() {
-        let hash = *current_room_contract_code_hash();
-        assert!(
-            !river_core::migration::LEGACY_ROOM_CONTRACT_CODE_HASHES.contains(&hash),
-            "crawler/contracts/room_contract.wasm has been superseded (its hash is \
-             now in river-core's legacy registry) — copy the current WASM from \
-             river/main/cli/contracts/room_contract.wasm, refresh \
-             OFFICIAL_CURRENT_KEY from `riverctl debug contract-key`, and \
-             re-run this test"
-        );
-    }
-
-    /// The room-contract keys to probe must actually start with the current
-    /// generation, not skip straight to a legacy one — and there must be a
-    /// legacy fallback at all, or a stale bundle has no recovery path.
-    #[test]
-    fn room_candidate_keys_tries_current_generation_first() {
-        let owner = parse_owner_vk(OFFICIAL_OWNER_VK).expect("official owner vk parses");
-        let current = river_core::migration::contract_key_for_code_hash(
-            &owner,
-            current_room_contract_code_hash(),
-        );
-        let candidates = room_candidate_keys(&owner);
-        assert_eq!(
-            candidates[0].id(),
-            current.id(),
-            "the first candidate must be the current-generation derivation"
-        );
-        assert!(
-            candidates.len() > 1,
-            "expected current + legacy candidate keys, got {}",
-            candidates.len()
-        );
-    }
-
-    fn test_id(seed: u8) -> ContractInstanceId {
-        ContractInstanceId::new([seed; 32])
-    }
-
-    #[test]
-    fn a_riverctl_contract_key_line_parses() {
-        // Exactly the shape riverctl emits today, leading blank line and all.
-        let out = "Room owner key: 4uNUKFzZQCnzo4K2ecZ16cMsYEEfoaRS35z6exEsbvm4\n\
-                   Contract key: 9rhuzMSn4v4AugF5FhrjuB1tGP936TaP6Dp7fXijNPUL\n";
-        let id = parse_riverctl_contract_key(out).expect("parses");
-        assert_eq!(
-            id.to_string(),
-            "9rhuzMSn4v4AugF5FhrjuB1tGP936TaP6Dp7fXijNPUL"
-        );
-    }
-
-    /// A parse that silently yields "no answer" would disable the cross-check
-    /// and put us straight back in the failure it exists to prevent, so every
-    /// malformed shape must be a hard error rather than a `None` that the
-    /// caller treats as "nothing to compare".
-    #[test]
-    fn a_malformed_riverctl_answer_is_an_error_not_a_shrug() {
-        for bad in [
-            "",
-            "Room owner key: abc\n",
-            "Contract key:\n",
-            "Contract key: not-base58-!!!\n",
-            "Contract key: tooshort\n",
-        ] {
-            assert!(
-                parse_riverctl_contract_key(bad).is_err(),
-                "{bad:?} must not parse into a usable key"
-            );
-        }
-    }
-
-    /// THE regression test for the three-day dead-room read (3ed8529).
-    ///
-    /// The bundled derivation says one thing, riverctl says another; riverctl
-    /// wins, and the drift is reported. Before this cross-check existed, the
-    /// derived id was used unconditionally and the run looked perfectly healthy
-    /// while reading an abandoned contract.
-    #[test]
-    fn riverctls_answer_wins_when_the_bundle_is_stale() {
-        let live = test_id(1);
-        let stale = test_id(2);
-        let legacy = test_id(3);
-        let (ids, note) = cross_checked_candidate_ids(
-            vec![stale, legacy],
-            OFFICIAL_OWNER_VK,
-            // A stub standing in for riverctl: prints the live key and exits 0.
-            &stub_riverctl(&live.to_string()),
-        );
-        assert_eq!(ids[0], live, "riverctl's answer must be probed FIRST");
-        assert!(
-            ids.contains(&stale) && ids.contains(&legacy),
-            "the derived candidates must be kept as fallbacks, not discarded"
-        );
-        let note = note.expect("a stale bundle must be reported, not silently corrected");
-        assert!(
-            note.contains("STALE"),
-            "the drift note must name the problem loudly: {note}"
-        );
-    }
-
-    #[test]
-    fn agreement_is_silent_and_changes_nothing() {
-        let live = test_id(1);
-        let legacy = test_id(3);
-        let (ids, note) = cross_checked_candidate_ids(
-            vec![live, legacy],
-            OFFICIAL_OWNER_VK,
-            &stub_riverctl(&live.to_string()),
-        );
-        assert_eq!(ids, vec![live, legacy], "agreement must not reorder");
-        assert!(note.is_none(), "agreement must not warn: {note:?}");
-    }
-
-    /// Promotion must not leave a duplicate behind: probing the same id twice
-    /// wastes a round-trip and makes `resolved_idx` ambiguous, which is the
-    /// value the LEGACY warning is computed from.
-    #[test]
-    fn promoting_an_id_already_in_the_legacy_list_does_not_duplicate_it() {
-        let live = test_id(1);
-        let stale = test_id(2);
-        let (ids, note) = cross_checked_candidate_ids(
-            vec![stale, live],
-            OFFICIAL_OWNER_VK,
-            &stub_riverctl(&live.to_string()),
-        );
-        assert_eq!(ids, vec![live, stale]);
-        assert_eq!(
-            ids.iter().filter(|id| **id == live).count(),
-            1,
-            "the promoted id must appear exactly once"
-        );
-        assert!(note.is_some());
-    }
-
-    /// A missing/broken riverctl must NOT stop the crawl. Discovery is free and
-    /// a room evicts old messages, so refusing to crawl would lose links
-    /// permanently to guard against a room that is probably fine. It must still
-    /// say so loudly, because in that state we are blind to a re-key again.
-    #[test]
-    fn an_unavailable_riverctl_degrades_loudly_but_still_crawls() {
-        let stale = test_id(2);
-        let (ids, note) = cross_checked_candidate_ids(
-            vec![stale],
-            OFFICIAL_OWNER_VK,
-            "/nonexistent/riverctl-does-not-exist",
-        );
-        assert_eq!(ids, vec![stale], "must fall back to the derived candidates");
-        let note = note.expect("an unavailable cross-check must be reported");
-        assert!(
-            note.contains("CANNOT detect a re-key"),
-            "the note must say what protection was lost: {note}"
-        );
-    }
-
-    /// Write a throwaway shell stub that impersonates `riverctl debug
-    /// contract-key`. Returns its path.
-    fn stub_riverctl(key: &str) -> String {
-        use std::io::Write as _;
-        // UNIQUE PER CALL, not per (pid, key). Three tests stub the same key,
-        // cargo runs them on parallel threads, and they all resolved to one
-        // path -- so one thread's `File::create` truncated the stub while
-        // another was mid-`Command::output()` executing it, failing with
-        // ETXTBSY ("Text file busy"). It passed when run alone and failed in the
-        // full suite, which is the signature of exactly this. A per-call counter
-        // makes the paths disjoint.
-        static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-        let seq = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let dir =
-            std::env::temp_dir().join(format!("atlas-riverctl-stub-{}-{seq}", std::process::id(),));
-        std::fs::create_dir_all(&dir).expect("stub dir");
-        let path = dir.join("riverctl");
-        let mut f = std::fs::File::create(&path).expect("stub file");
-        writeln!(f, "#!/bin/sh\necho \"Contract key: {key}\"").expect("write stub");
-        drop(f);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt as _;
-            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
-                .expect("chmod stub");
-        }
-        path.to_string_lossy().into_owned()
-    }
-
-    /// The cross-check is only worth anything if the room crawl actually calls
-    /// it. A unit test of the helper alone stays green if someone deletes the
-    /// call site and goes back to using the derived ids directly — which is
-    /// precisely the bug, restored. Source-scrape the call site.
-    #[test]
-    fn the_room_crawl_actually_cross_checks_the_key() {
-        let src = strip_comments(include_str!("main.rs"));
-        let body = src
-            .split_once("fn crawl_river_room(")
-            .expect("crawl_river_room exists")
-            .1;
-        let body = &body[..body.find("\nfn ").unwrap_or(body.len())];
-        assert!(
-            body.contains("cross_checked_candidate_ids("),
-            "crawl_river_room must route its candidate ids through the riverctl \
-             cross-check, not use the bundled derivation directly"
-        );
-    }
-
     /// The detection gap review flagged as the highest-value fix in this
     /// module: `fetch_room_state` cannot itself distinguish "resolved via the
     /// current generation" from "silently fell through to an abandoned one",
@@ -5909,32 +5277,6 @@ mod tests {
     /// way. The caller has to check `resolved_idx` and say something. Source-
     /// scraped because there is no network-mocked test harness in this file
     /// for `crawl_river_room` to exercise the real branch through.
-    #[test]
-    fn a_non_current_generation_resolving_is_logged_loudly() {
-        let src = include_str!("main.rs");
-        let production = src
-            .split("\nmod tests")
-            .next()
-            .expect("source must have a pre-test region");
-        assert!(
-            !production.contains("fn a_non_current_generation_resolving_is_logged"),
-            "the scan region must exclude the test module, or the pin matches itself"
-        );
-        let production = strip_comments(production);
-        assert!(
-            production.contains("if resolved_idx != 0 {") && production.contains("WARNING"),
-            "crawl_river_room must warn when the resolved candidate is not the \
-             current generation, or a stale bundled WASM goes back to looking \
-             identical to a healthy run"
-        );
-    }
-
-    #[test]
-    fn parse_owner_vk_rejects_garbage() {
-        assert!(parse_owner_vk("not base58 !!!").is_err());
-        // Valid base58 but wrong length.
-        assert!(parse_owner_vk("abc").is_err());
-    }
 
     #[test]
     fn scan_urls_extracts_and_normalizes() {
@@ -7907,21 +7249,45 @@ mod tests {
         );
     }
 
+    /// The room crawl must READ THE MIRROR and must route what it finds through
+    /// `map_or_collapse`.
+    ///
+    /// Two properties in one pin because they fail the same way -- silently.
+    /// Reverting to a direct contract GET would restore the dead-generation bug
+    /// this migration exists to remove; skipping `map_or_collapse` would file a
+    /// Delta link under its shared container instead of its own `app:` locator,
+    /// creating a duplicate entry for a site the hub crawl already lists.
+    /// Source-scraped because `crawl_river_room` needs a populated mirror and a
+    /// live queue to drive.
+    #[test]
+    fn the_room_crawl_reads_the_mirror_and_maps_locators() {
+        let src = strip_comments(include_str!("main.rs"));
+        let at = src
+            .find("fn crawl_river_room(")
+            .expect("crawl_river_room exists");
+        let body = &src[at..];
+        let end = body.find("\nfn ").map(|e| at + e).unwrap_or(src.len());
+        let body = &src[at..end];
+        assert!(
+            body.contains("mirror::messages_since("),
+            "the room crawl must read river-mirror, not derive a contract key \
+             and GET the room itself"
+        );
+        assert!(
+            body.contains("map_or_collapse("),
+            "captured room locators must be mapped onto their registered app, \
+             or a Delta link becomes a second entry under its container id"
+        );
+    }
+
     #[test]
     fn the_source_pins_are_all_present() {
         let src = include_str!("main.rs");
         for pin in [
-            "fn extract_message_urls_routes_through_map_or_collapse",
-            "fn the_bundled_wasm_is_not_yet_legacy",
-            "fn room_key_derivation_matches_the_live_network",
-            "fn the_bundled_wasm_looks_like_a_wasm_module",
-            "fn room_candidate_keys_tries_current_generation_first",
-            "fn a_non_current_generation_resolving_is_logged_loudly",
-            "fn the_room_crawl_actually_cross_checks_the_key",
             "fn a_curated_source_line_that_does_not_normalise_is_skipped",
+            "fn the_room_crawl_reads_the_mirror_and_maps_locators",
             "fn a_dot_segment_hidden_in_a_freenet_locators_query_or_fragment_is_refused",
             "fn a_hub_that_does_not_normalise_is_refused_not_crawled_raw",
-            "fn riverctls_answer_wins_when_the_bundle_is_stale",
             "fn the_probe_handle_is_fresh_every_run",
             "fn a_too_short_probe_result_is_not_a_usable_baseline",
             "fn a_truncated_walk_is_refused_rather_than_decided",

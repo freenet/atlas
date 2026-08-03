@@ -10,6 +10,8 @@ name = "atlas-crawler"
 path = "src/main.rs"
 
 [dependencies]
+# Read-only access to the river-mirror SQLite replica (see `mirror.rs`).
+rusqlite = { version = "0.32", features = ["bundled"] }
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
@@ -17,13 +19,6 @@ serde = { workspace = true }
 serde_json = "1"
 url = "2"
 
-# River-room ingestion (Atlas issue #2). river-core re-exports `ChatRoomStateV1`
-# and (behind the `migration` feature) the owner-VK-anchored room-contract key
-# derivation used to survive River re-keys. river-core 0.1.13 requires
-# freenet-stdlib ^0.8.3, which matches the workspace pin (and the version the
-# local node speaks), so the crawler's WS client and the room-state types share
-# one stdlib.
-river-core = { version = "0.1.13", features = ["migration"] }
 freenet-stdlib = { workspace = true, features = ["net"] }
 ciborium = { workspace = true }
 # The current room-contract WASM is bundled (`crawler/contracts/room_contract.wasm`,
@@ -39,6 +34,7 @@ tokio = { version = "1", features = ["rt-multi-thread", "time", "net", "io-util"
 tokio-tungstenite = { version = "0.27", features = ["rustls-tls-webpki-roots"] }
 
 [dev-dependencies]
+tempfile = "3"
 # Test-only: the differential assertion that the CONTRACT-enforced path guards in
 # `atlas_common::path` are never weaker than the crawler's older private copies.
 # Deliberately not a normal dependency — it is used by one `#[cfg(test)]` block, and
