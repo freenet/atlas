@@ -3356,7 +3356,7 @@ fn extract_message_urls(
     out
 }
 
-/// Scan freeform message text for `https://` and `freenet:` URLs. Tokenizes on
+/// Scan freeform message text for locators. Tokenizes on
 /// whitespace and common wrapping punctuation (brackets, quotes, markdown
 /// emphasis), strips trailing sentence punctuation, and runs each candidate
 /// through [`normalize_href`] so the result is byte-identical to how hub-link
@@ -3389,9 +3389,10 @@ fn scan_urls(text: &str) -> Vec<(String, &'static str)> {
     out
 }
 
-/// Extract outbound site locators from hub HTML: `freenet:<id>` links, gateway
-/// `/v1/contract/web/<id>` links (normalized to `freenet:`), and external
-/// `https://` links. Skips relative/in-app/anchor/mailto links; dedups.
+/// Extract outbound site locators from hub HTML: `freenet:<id>` links and
+/// gateway `/v1/contract/web/<id>` links (normalized to `freenet:`). Skips
+/// relative/in-app/anchor/mailto links, and off-Freenet `https://` links --
+/// Atlas indexes Freenet, not the web. Dedups.
 fn extract_locators(html: &str) -> Vec<(String, &'static str)> {
     let mut out: Vec<(String, &'static str)> = Vec::new();
     let mut seen = HashSet::new();
@@ -5475,10 +5476,32 @@ mod tests {
     /// different ids, or the per-host/per-author fairness tests they belong to
     /// would silently collapse into one bucket and stop testing anything.
     fn fid(n: usize) -> String {
+        // TWO varying characters, not one. A single character gives only 58
+        // distinct ids, and `drain_rotation_serves_the_tail_across_runs` indexes
+        // up to n=92 -- so fid(2)==fid(60) and three more pairs collided.
+        // `Pending::add` returns false on a duplicate WITHOUT erroring, so four
+        // of that test's thirty fixtures were silently never inserted.
         let mut s = ID.to_string();
         s.pop();
+        s.pop();
+        s.push(B58[(n / B58.len()) % B58.len()] as char);
         s.push(B58[n % B58.len()] as char);
         s
+    }
+
+    /// `fid` promises a distinct id per `n`; a collision silently drops fixtures
+    /// rather than failing, so the promise needs a test.
+    #[test]
+    fn fid_is_collision_free_over_the_range_fixtures_use() {
+        let ids: std::collections::HashSet<String> = (0..200).map(fid).collect();
+        assert_eq!(ids.len(), 200, "fid must not collide over 0..200");
+        for n in [0usize, 57, 58, 92, 199] {
+            let id = fid(n);
+            assert!(
+                matches!(id.len(), 43 | 44) && id.chars().all(|c| B58.contains(&(c as u8))),
+                "fid({n}) = {id:?} must be a valid contract id"
+            );
+        }
     }
 
     #[test]
@@ -8037,10 +8060,17 @@ mod tests {
             let mut p = Pending::load(f.path());
             for a in 0..authors {
                 for i in 0..3 {
-                    p.add(
-                        &format!("freenet:{}/", fid(a * 10 + i)),
-                        "site",
-                        &format!("AUTHOR{a}"),
+                    // Assert the insert LANDED. `add` returns false on a
+                    // duplicate without erroring, which is how four colliding
+                    // fixture ids silently reduced this test from 30 entries to
+                    // 26 while it still passed.
+                    assert!(
+                        p.add(
+                            &format!("freenet:{}/", fid(a * 10 + i)),
+                            "site",
+                            &format!("AUTHOR{a}"),
+                        ),
+                        "fixture {a}/{i} must actually insert"
                     );
                 }
             }

@@ -1229,8 +1229,9 @@ fn parse_kind(s: &str) -> Result<Kind> {
     Ok(match s.to_lowercase().as_str() {
         "app" => Kind::App,
         "site" => Kind::Site,
-        "external" => Kind::External,
-        other => bail!("unknown kind '{other}' (expected app|site|external)"),
+        // `Kind::External` remains in the schema for existing entries, but the
+        // curator can no longer mint one -- see `parse_locator`.
+        other => bail!("unknown kind '{other}' (expected app|site)"),
     })
 }
 
@@ -1263,12 +1264,23 @@ fn parse_locator(s: &str) -> Result<Locator> {
         };
         loc.check().map_err(|e| anyhow!("{e}"))?;
         Ok(loc)
-    } else if s.starts_with("https://") {
-        let loc = Locator::External { url: s.to_string() };
-        loc.check().map_err(|e| anyhow!("{e}"))?;
-        Ok(loc)
+    } else if s.starts_with("https://") || s.starts_with("http://") {
+        // Atlas indexes Freenet, not the web. The crawler stopped capturing
+        // off-Freenet links at `normalize_href`; refusing here closes the other
+        // half, the curator's own hand-add. Without this the CLI remains a way
+        // to put a `Locator::External` into the index by hand, which is how the
+        // entries this policy exists to remove got there in the first place.
+        //
+        // `Locator::External` is deliberately still PARSEABLE (it stays in the
+        // schema) so existing entries can be read and tombstoned -- `remove`
+        // takes a subject id, not a locator, so this refusal does not block the
+        // purge.
+        bail!(
+            "off-Freenet locators are not indexed: Atlas indexes Freenet, not the web. \
+             Use a `freenet:` or `app:` locator."
+        )
     } else {
-        bail!("locator must start with `freenet:`, `app:` or `https://`")
+        bail!("locator must start with `freenet:` or `app:`")
     }
 }
 
@@ -1477,6 +1489,34 @@ mod tests {
                 "{name} defines its own `--slug`, which shadows the global index slug"
             );
         }
+    }
+
+    /// The curator's hand-add is the OTHER way an off-Freenet entry can reach
+    /// the index -- the crawler's discovery paths were closed at
+    /// `normalize_href`, but this one is a person typing a URL. Both halves have
+    /// to refuse or the policy is only half-enforced.
+    #[test]
+    fn parse_locator_refuses_off_freenet_urls() {
+        for uri in [
+            "https://example.com/",
+            "https://freenet.org",
+            "http://example.com/",
+        ] {
+            let err = parse_locator(uri).expect_err("must refuse");
+            assert!(
+                err.to_string().contains("Atlas indexes Freenet"),
+                "{uri}: message should say why, got {err}"
+            );
+        }
+    }
+
+    /// `Kind::External` stays in the schema so existing entries parse and can be
+    /// tombstoned, but nothing may mint a new one.
+    #[test]
+    fn parse_kind_refuses_external() {
+        assert!(parse_kind("external").is_err());
+        assert!(parse_kind("app").is_ok());
+        assert!(parse_kind("site").is_ok());
     }
 
     #[test]
