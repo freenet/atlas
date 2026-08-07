@@ -47,6 +47,13 @@ use freenet_stdlib::prelude::{ContractKey, Parameters};
 ///   pre-bump snapshot, so it is worth merging, but it is NOT what the published UI
 ///   reads.
 pub const LEGACY_INDEX_CODE_HASHES: &[&str] = &[
+    // Retired 2026-08-06 by the classification schema change: `IndexEntry`
+    // gained `class` / `verified` / `ext`, `Kind` and the new vocabulary fields
+    // became open (string) vocabularies, and `atlas-common` was renamed to
+    // `fn-atlas-common` so the crate can be published (the old name is taken on
+    // crates.io). Any of those alone re-keys; the rename was verified to move
+    // the artifact on its own (a9511c… without it, 773c31… with it).
+    "EMp9LZM2awHm7QeG6CsKGDNVfmgHehBTSht6RE2uDvhD",
     // Retired 2026-08-03 by the freenet-stdlib 0.8.3 -> 0.8.5 bump, which the
     // crawler's river-core 0.1.19 requirement forced. The contract's own source
     // did not change; stdlib is a workspace dependency of it, so the artifact
@@ -77,6 +84,9 @@ mod tests {
     // generation and the one below were built against stdlib 0.8.3 (this one was
     // retired by the 0.8.5 bump, the other by the app-registry source change),
     // so the stdlib version alone no longer distinguishes them.
+    const LEGACY_V085_PRE_CLASSIFICATION_WASM: &[u8] = include_bytes!(
+        "../../contracts/index-contract/legacy/atlas_index_contract-v0.8.5-stdlib-pre-classification.wasm"
+    );
     const LEGACY_V083_APP_REGISTRY_WASM: &[u8] = include_bytes!(
         "../../contracts/index-contract/legacy/atlas_index_contract-v0.8.3-stdlib-app-registry.wasm"
     );
@@ -87,6 +97,7 @@ mod tests {
         "../../contracts/index-contract/legacy/atlas_index_contract-v0.6.0-stdlib.wasm"
     );
     const PRESERVED_LEGACY_WASMS: &[&[u8]] = &[
+        LEGACY_V085_PRE_CLASSIFICATION_WASM,
         LEGACY_V083_APP_REGISTRY_WASM,
         LEGACY_V083_WASM,
         LEGACY_V06_WASM,

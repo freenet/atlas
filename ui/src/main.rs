@@ -98,11 +98,16 @@ body { margin:0; background:var(--bg); color:var(--fg); line-height:1.5;
 .brand p { margin:.2rem 0 0; color:var(--dim); font-size:.9rem; }
 .count { color:var(--faint); font-size:.78rem; white-space:nowrap;
   font-variant-numeric:tabular-nums; }
+.searchrow { display:flex; flex-wrap:wrap; align-items:center; gap:.55rem .9rem; }
 .search { width:100%; padding:.72rem .95rem; font-size:.98rem; color:var(--fg);
   background:var(--card); border:1px solid var(--line); border-radius:9px; outline:none;
   transition:border-color .15s; }
+.searchrow .search { flex:1 1 15rem; min-width:0; }
 .search::placeholder { color:var(--faint); }
 .search:focus { border-color:var(--dim); }
+.safe { display:flex; align-items:center; gap:.4rem; white-space:nowrap; cursor:pointer;
+  color:var(--dim); font-size:.8rem; user-select:none; -webkit-user-select:none; }
+.safe input { margin:0; accent-color:var(--dim); cursor:pointer; }
 .status { color:var(--dim); font-size:.8rem; margin:.7rem 0 0; }
 .results { color:var(--faint); font-size:.76rem; margin:.7rem 0 0;
   font-variant-numeric:tabular-nums; }
@@ -113,11 +118,17 @@ body { margin:0; background:var(--bg); color:var(--fg); line-height:1.5;
   min-height:152px; transition:border-color .15s, transform .15s, background .15s; }
 .card:hover { border-color:var(--dim); transform:translateY(-2px); background:var(--card-hover); }
 .card.feat { background:var(--feat); }
-.card-top { display:flex; justify-content:space-between; align-items:center; margin-bottom:.55rem; }
+.card-top { display:flex; flex-wrap:wrap; justify-content:space-between; align-items:center;
+  row-gap:.3rem; margin-bottom:.55rem; }
 .kind { font-size:.66rem; text-transform:uppercase; letter-spacing:.09em; color:var(--faint);
   font-weight:600; }
 .card-top .kind.app { color:var(--dim); text-transform:none; letter-spacing:0; margin-left:.45rem;
   margin-right:auto; }
+/* `margin-left:auto` keeps this hugging the right edge next to the star whether
+   or not the "on <app>" hint is present, instead of being spread to the middle
+   by the row's space-between. */
+.adult { font-size:.66rem; color:var(--dim); border:1px solid var(--line); border-radius:5px;
+  padding:.04rem .4rem; margin-left:auto; white-space:nowrap; cursor:default; }
 .star { color:var(--dim); font-size:.82rem; }
 .card h3 { margin:0 0 .4rem; font-size:1.04rem; font-weight:620; letter-spacing:-0.01em;
   line-height:1.3; }
@@ -166,26 +177,36 @@ fn App() -> Element {
         connect();
     });
     let mut query = use_signal(String::new);
+    // Safe search is ON unless the visitor has previously turned it off. Read
+    // once at mount; `use_signal`'s initializer does not re-run.
+    let mut safe = use_signal(load_safe_search);
     let q = query().to_lowercase();
+    let safe_on = safe();
 
-    // Total live entries (unfiltered) for the header count, and the filtered set
-    // shown in the grid.
-    let total = STATE
-        .read()
-        .as_ref()
-        .map(|s| s.live_entries().count())
-        .unwrap_or(0);
-    let entries: Vec<IndexEntry> = match STATE.read().as_ref() {
+    // `total` is the header count and must describe what is actually browsable,
+    // so it counts entries that survive safe search but is deliberately blind to
+    // the search query -- the per-query count is the separate "N results" line.
+    // Counting all live entries here would claim 63 while the grid can only ever
+    // reach 61.
+    let (total, entries): (usize, Vec<IndexEntry>) = match STATE.read().as_ref() {
         Some(state) => {
-            let mut v: Vec<IndexEntry> = state.live_entries().cloned().collect();
+            let mut v: Vec<IndexEntry> = state
+                .live_entries()
+                .filter(|e| passes_safe_search(e, safe_on))
+                .cloned()
+                .collect();
             v.sort_by(|a, b| {
                 b.featured
                     .cmp(&a.featured)
                     .then(b.added_at.cmp(&a.added_at))
             });
-            v.into_iter().filter(|e| matches_query(e, &q)).collect()
+            let total = v.len();
+            (
+                total,
+                v.into_iter().filter(|e| matches_query(e, &q)).collect(),
+            )
         }
-        None => Vec::new(),
+        None => (0, Vec::new()),
     };
     let searching = !q.is_empty();
     let shown = entries.len();
@@ -202,11 +223,25 @@ fn App() -> Element {
                     div { class: "count", "{total} entries" }
                 }
             }
-            input {
-                class: "search",
-                placeholder: "Search apps, sites, and more…",
-                value: "{query}",
-                oninput: move |e| query.set(e.value()),
+            div { class: "searchrow",
+                input {
+                    class: "search",
+                    placeholder: "Search apps, sites, and more…",
+                    value: "{query}",
+                    oninput: move |e| query.set(e.value()),
+                }
+                label { class: "safe",
+                    input {
+                        r#type: "checkbox",
+                        checked: safe_on,
+                        onchange: move |e| {
+                            let on = e.checked();
+                            safe.set(on);
+                            store_safe_search(on);
+                        },
+                    }
+                    "Safe search"
+                }
             }
             // Only surface connection status while not yet ready (connecting,
             // looking for the index, errors); hide it in the normal case.
@@ -272,9 +307,20 @@ fn EntryCard(entry: IndexEntry) -> Element {
     rsx! {
         div { class: "{card_class}",
             div { class: "card-top",
-                span { class: "kind", "{kind_label(entry.kind)}" }
+                span { class: "kind", "{kind_label(&entry.kind)}" }
                 if let Some(app) = host_app {
                     span { class: "kind app", "on {app}" }
+                }
+                // Shown for a general-audience landing too -- that is the whole
+                // point. Safe search leaves those entries visible, so this is the
+                // only warning a visitor gets that there is adult material
+                // further in.
+                if has_adult_sections(&entry) {
+                    span {
+                        class: "adult",
+                        title: "There are adult sections inside this listing",
+                        "adult sections"
+                    }
                 }
                 if entry.featured {
                     span { class: "star", "★" }
@@ -438,12 +484,99 @@ fn ws_url() -> Option<String> {
     Some(url)
 }
 
+/// `kind` is an OPEN vocabulary, so this cannot be exhaustive and must not
+/// pretend to be. A value this build has never seen renders as itself rather
+/// than as a wrong label or a panic, which is what lets a new kind ship without
+/// a contract re-key.
 #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
-fn kind_label(kind: Kind) -> &'static str {
-    match kind {
-        Kind::App => "app",
-        Kind::Site => "site",
-        Kind::External => "web",
+fn kind_label(kind: &Kind) -> &str {
+    match kind.as_str() {
+        Kind::APP => "app",
+        Kind::SITE => "site",
+        Kind::EXTERNAL => "web",
+        other => other,
+    }
+}
+
+/// `localStorage` key holding the visitor's safe-search choice.
+#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+const SAFE_SEARCH_KEY: &str = "atlas.safe_search";
+
+/// Whether the safe-search filter applies to this entry's grid slot.
+///
+/// The filter is deliberately narrow: it hides only entries whose classified
+/// landing is not the exact permissive value.
+///
+/// - `landing` anything other than the exact `general` — hidden. Involuntary exposure on following a link is
+///   the single thing being prevented, so this is the whole filter.
+/// - `landing == General` with `has_adult_sections == true` — SHOWN. That
+///   combination IS the gated case: the visitor lands on general-audience
+///   content and will not encounter adult material without navigating to it.
+///   Hiding gated sites would remove most of a general-purpose imageboard or
+///   forum from the index while preventing nothing. The card carries an "adult
+///   sections" badge instead (see [`has_adult_sections`]).
+/// - `class == None` — SHOWN. These entries predate the taxonomy and were
+///   admitted under the older content gate, which is why showing them is not a
+///   regression. `None` means "NOT ASSESSED", it does NOT mean "assessed and
+///   found safe". If this default is ever inverted, that distinction is the
+///   thing to reason about: flipping `None` to hidden would blank most of the
+///   index on the strength of an absent judgement, and flipping it to "treated
+///   as General" would be asserting a judgement nobody made.
+///
+/// Applied at READ time rather than at crawl time on purpose: policy can then
+/// change with a UI deploy instead of a re-crawl and a re-signing of every
+/// record.
+#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+fn passes_safe_search(e: &IndexEntry, safe: bool) -> bool {
+    if !safe {
+        return true;
+    }
+    match &e.class {
+        // MATCHES THE PERMISSIVE VALUE, never the negation of the restricted one.
+        // `landing` is an open vocabulary: `!= "adult"` would show a future
+        // `"explicit"` to a build that predates it, i.e. fail OPEN on exactly the
+        // field where that is unacceptable. `is_general()` fails closed instead.
+        Some(c) => c.landing.is_general(),
+        None => true,
+    }
+}
+
+/// Whether to badge a card as having adult material deeper inside.
+///
+/// Unclassified (`None`) means not assessed, so it gets no badge — the same
+/// asymmetry as [`passes_safe_search`]: an absent judgement is never rendered as
+/// a positive one in either direction.
+#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+fn has_adult_sections(e: &IndexEntry) -> bool {
+    e.class
+        .as_ref()
+        .map(|c| c.has_adult_sections)
+        .unwrap_or(false)
+}
+
+/// Read the persisted safe-search choice, defaulting to ON.
+///
+/// Every failure path (no window, `localStorage` unavailable or blocked, key
+/// absent, value unrecognised) returns `true`. Safe is the default, so a storage
+/// problem must never silently unfilter the grid.
+// Not gated to wasm32 — see the rationale comment on `set_shell_title` above.
+#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+fn load_safe_search() -> bool {
+    let stored = web_sys::window()
+        .and_then(|w| w.local_storage().ok().flatten())
+        .and_then(|s| s.get_item(SAFE_SEARCH_KEY).ok().flatten());
+    // Only the exact opt-out string turns the filter off.
+    stored.as_deref() != Some("off")
+}
+
+/// Persist the safe-search choice. Best-effort: a blocked `localStorage` (private
+/// browsing, storage disabled) leaves the toggle working for this page load and
+/// simply does not survive a reload.
+// Not gated to wasm32 — see the rationale comment on `set_shell_title` above.
+#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+fn store_safe_search(on: bool) {
+    if let Some(storage) = web_sys::window().and_then(|w| w.local_storage().ok().flatten()) {
+        let _ = storage.set_item(SAFE_SEARCH_KEY, if on { "on" } else { "off" });
     }
 }
 
@@ -459,18 +592,23 @@ fn matches_query(e: &IndexEntry, q: &str) -> bool {
 
 // Native-only: everything above this point that touches `web_sys` needs the
 // `wasm32` target to compile at all, so these run against the pure functions
-// only (`matches_query`, `kind_label`), via
-// `cargo test -p atlas-ui` on the host target. There is no test harness in this
-// crate for the rendered component tree itself.
+// only (`matches_query`, `kind_label`, `passes_safe_search`,
+// `has_adult_sections`), via `cargo test -p atlas-ui` on the host target. There
+// is no test harness in this crate for the rendered component tree itself.
+//
+// `load_safe_search` / `store_safe_search` are NOT covered here: they reach
+// `web_sys::window()`, whose non-wasm stub panics, so they can only be exercised
+// in a browser.
 #[cfg(test)]
 mod tests {
     use super::*;
+    use atlas_common::{Audience, Classification, Volatility};
 
     fn entry(title: &str, snippet: &str, tags: &[&str]) -> IndexEntry {
         IndexEntry {
             subject_id: SubjectId::parse("28VTg95wG2zvE").expect("valid test subject id"),
             version: 1,
-            kind: Kind::Site,
+            kind: Kind::new(Kind::SITE),
             title: title.to_string(),
             snippet: snippet.to_string(),
             tags: tags.iter().map(|t| t.to_string()).collect(),
@@ -480,6 +618,27 @@ mod tests {
             },
             featured: false,
             added_at: 0,
+            class: None,
+            verified: None,
+            ext: None,
+        }
+    }
+
+    /// An entry carrying a real classification. The two fields that are NOT
+    /// varied (`volatility`, `classifier`) are curator metadata the UI must not
+    /// read, so they are held constant on purpose: if a filter ever started
+    /// depending on one, these tests would keep passing and that is worth
+    /// knowing.
+    fn classified(landing: Audience, has_adult_sections: bool) -> IndexEntry {
+        IndexEntry {
+            class: Some(Classification {
+                landing,
+                has_adult_sections,
+                volatility: Volatility::new(Volatility::STATIC),
+                classifier: 1,
+                classified_at: 1_700_000_000,
+            }),
+            ..entry("A classified entry", "snippet", &[])
         }
     }
 
@@ -509,5 +668,124 @@ mod tests {
             &entry("River", "chat", &["messaging"]),
             "zzz"
         ));
+    }
+
+    /// The one thing safe search exists to do.
+    #[test]
+    fn safe_search_hides_an_adult_landing() {
+        assert!(!passes_safe_search(
+            &classified(Audience::new(Audience::ADULT), false),
+            true
+        ));
+        assert!(!passes_safe_search(
+            &classified(Audience::new(Audience::ADULT), true),
+            true
+        ));
+    }
+
+    /// The gated case: a general-audience landing with adult material deeper in
+    /// stays VISIBLE. Involuntary exposure is what is being prevented, and a
+    /// visitor landing on the general front page is not exposed. Hiding these
+    /// would cut most of a general-purpose imageboard or forum from the index
+    /// while preventing nothing.
+    #[test]
+    fn safe_search_keeps_a_general_landing_with_adult_sections() {
+        assert!(passes_safe_search(
+            &classified(Audience::new(Audience::GENERAL), true),
+            true
+        ));
+        assert!(passes_safe_search(
+            &classified(Audience::new(Audience::GENERAL), false),
+            true
+        ));
+    }
+
+    /// Unclassified entries predate the taxonomy and were admitted under the
+    /// older content gate, so they are shown. This asserts the DEFAULT, not a
+    /// judgement: `None` is "not assessed", never "assessed and found safe".
+    #[test]
+    fn safe_search_shows_an_unclassified_entry() {
+        assert!(passes_safe_search(&entry("Old", "pre-taxonomy", &[]), true));
+    }
+
+    /// Turning the toggle off must not filter anything, including the entries
+    /// that have no classification at all.
+    #[test]
+    fn safe_search_off_hides_nothing() {
+        for e in [
+            classified(Audience::new(Audience::ADULT), true),
+            classified(Audience::new(Audience::GENERAL), false),
+            entry("Old", "pre-taxonomy", &[]),
+        ] {
+            assert!(passes_safe_search(&e, false));
+        }
+    }
+
+    /// The badge tracks `has_adult_sections` alone, independently of where the
+    /// visitor lands, and an absent classification is never rendered as a
+    /// positive claim in either direction.
+    #[test]
+    fn the_adult_sections_badge_follows_the_flag_not_the_landing() {
+        assert!(has_adult_sections(&classified(
+            Audience::new(Audience::GENERAL),
+            true
+        )));
+        assert!(has_adult_sections(&classified(
+            Audience::new(Audience::ADULT),
+            true
+        )));
+        assert!(!has_adult_sections(&classified(
+            Audience::new(Audience::GENERAL),
+            false
+        )));
+        assert!(!has_adult_sections(&entry("Old", "pre-taxonomy", &[])));
+    }
+
+    /// The known kinds must have DISTINCT labels. `kind` is an open vocabulary
+    /// now, so a missing arm is no longer a compile error and this is the only
+    /// thing catching the copy-paste that gives a new kind an existing kind's
+    /// label, silently mislabelling every card of that kind.
+    #[test]
+    fn known_kinds_have_distinct_labels() {
+        let kinds = [
+            Kind::new(Kind::APP),
+            Kind::new(Kind::SITE),
+            Kind::new(Kind::EXTERNAL),
+        ];
+        let mut labels: Vec<&str> = kinds.iter().map(kind_label).collect();
+        assert!(labels.iter().all(|l| !l.is_empty()));
+        labels.sort_unstable();
+        let before = labels.len();
+        labels.dedup();
+        assert_eq!(before, labels.len(), "two kinds share a label: {labels:?}");
+    }
+
+    /// An unknown kind renders as itself rather than as a wrong label or a
+    /// panic. This is what lets a new kind ship with no contract re-key, so it
+    /// is the property worth pinning.
+    #[test]
+    fn an_unknown_kind_renders_as_itself() {
+        assert_eq!(kind_label(&Kind::new("room")), "room");
+        assert_eq!(kind_label(&Kind::new("whatever-2031")), "whatever-2031");
+    }
+
+    /// The safe-search filter must key off the exact permissive value, so a
+    /// landing this build has never heard of is HIDDEN rather than shown.
+    ///
+    /// Deleting `is_general()` in favour of `!= "adult"` passes every other test
+    /// in this module and fails only this one, which is the entire reason it
+    /// exists: with an open vocabulary the two are not equivalent, and the
+    /// difference is a fail-open on the one field where that matters.
+    #[test]
+    fn an_unrecognised_landing_fails_closed() {
+        let future = classified(Audience::new("explicit"), false);
+        assert!(
+            !passes_safe_search(&future, true),
+            "an unrecognised landing must be hidden while safe search is on"
+        );
+        assert!(
+            passes_safe_search(&future, false),
+            "with safe search off the visitor has opted in, so it shows"
+        );
     }
 }

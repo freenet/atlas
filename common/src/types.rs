@@ -3,7 +3,10 @@ use std::collections::BTreeMap;
 use ed25519_dalek::{Signature, VerifyingKey};
 use serde::{Deserialize, Serialize};
 
-use crate::{MAX_SNIPPET, MAX_TAGS, MAX_TAG_LEN, MAX_TITLE};
+use crate::{
+    MAX_EXT_KEY, MAX_EXT_KEYS, MAX_EXT_TOTAL_BYTES, MAX_SNIPPET, MAX_TAGS, MAX_TAG_LEN, MAX_TITLE,
+    MAX_VOCAB,
+};
 
 /// Number of random bytes behind a subject id (~72 bits, ~12 base58 chars).
 const SUBJECT_ID_BYTES: usize = 9;
@@ -45,13 +48,79 @@ impl SubjectId {
     }
 }
 
-/// The 0.1 taxonomy. Constrained to things whose locator is directly openable;
-/// richer kinds (Document, Media, Feed, Room) wait for per-kind Open semantics.
-#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
-pub enum Kind {
-    App,
-    Site,
-    External,
+// ---------------------------------------------------------------------------
+// Open vocabularies
+//
+// `Kind`, `Audience`, `Volatility` and `VerifyStatus` are newtypes over `String`
+// rather than enums, and the reason is a measured property of the wire format
+// rather than a style preference.
+//
+// An externally-tagged UNIT enum encodes in CBOR as exactly its variant-name
+// string: `Kind::Site` and `"Site"` are the same bytes (`a2 646b696e64
+// 6453697465 616e 07`), and bytes written by the enum decode straight into a
+// `String` field. So this change is byte-compatible with every already-signed
+// record and costs nothing to make.
+//
+// What it BUYS is the removal of a recurring tax. serde has no `#[serde(other)]`
+// for externally-tagged enums, so an unknown variant is a hard decode error --
+// and because the whole index is one CBOR document validated all-or-nothing, a
+// single unknown variant rejects the ENTIRE state. Since any `common/` change
+// re-keys the contract (`hash(compiled_wasm, params)`), an enum meant one
+// re-key, one migration and one UI rebuild for every new value. A string means
+// a new value is just a new value.
+//
+// It also removes the reason to guess. An earlier draft of this file declared
+// `Room`, `Document`, `Media` and `Feed` up front purely so a later taxonomy
+// would not force a re-key. With an open vocabulary that speculation is
+// unnecessary, so it is gone.
+//
+// THE TRAP, and why the UI is written the way it is: an enum fails loudly on an
+// unknown value, a string accepts it silently. For anything driving a SAFETY
+// decision the consumer must therefore match the PERMISSIVE value explicitly and
+// treat everything else as restricted -- `landing == AUDIENCE_GENERAL`, never
+// `landing != AUDIENCE_ADULT`. Written the first way a future `"explicit"` is
+// hidden by an old reader; written the second way it is shown.
+//
+// `Locator` deliberately stays an enum: its variants carry different SHAPES, so
+// they encode as a map rather than a scalar and no string can express them.
+// ---------------------------------------------------------------------------
+
+/// Validate a vocabulary tag. Bounded and character-restricted so an open
+/// vocabulary cannot become a smuggling channel: these values are rendered in
+/// the UI, printed by `atlasctl show`, and embedded in `--json` output.
+fn check_vocab(field: &str, s: &str) -> Result<(), String> {
+    if s.is_empty() || s.len() > MAX_VOCAB {
+        return Err(format!("{field} length {} out of range", s.len()));
+    }
+    if !s
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    {
+        return Err(format!("{field} has characters outside [A-Za-z0-9_-]"));
+    }
+    Ok(())
+}
+
+/// What a subject IS, for display and per-kind Open semantics. Open vocabulary.
+#[derive(Serialize, Deserialize, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
+pub struct Kind(String);
+
+impl Kind {
+    /// The values minted so far. CAPITALISED because these are the historic
+    /// enum variant names and are already signed into live records; changing
+    /// their spelling would void those signatures.
+    pub const APP: &'static str = "App";
+    pub const SITE: &'static str = "Site";
+    /// Retired: off-Freenet links are no longer indexed. Readable forever so
+    /// existing entries stay valid; `atlasctl` refuses to mint a new one.
+    pub const EXTERNAL: &'static str = "External";
+
+    pub fn new(s: impl Into<String>) -> Self {
+        Kind(s.into())
+    }
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
 }
 
 /// Where "Open" navigates. An arbitrary URI; only the Freenet form has an
@@ -259,6 +328,146 @@ pub struct IndexEntry {
     pub featured: bool,
     /// Unix seconds, set by the curator (contracts cannot read a clock).
     pub added_at: u64,
+    /// What a visitor encounters here. `None` means NOT YET CLASSIFIED, which
+    /// is deliberately distinguishable from any real judgement: entries minted
+    /// before the taxonomy existed must not silently read as "assessed and
+    /// found general-audience".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub class: Option<Classification>,
+    /// When the crawler last confirmed this entry still describes the resource.
+    /// `None` means never re-checked since it was minted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verified: Option<Verification>,
+    /// Additive metadata the contract does not interpret. See [`MAX_EXT_KEYS`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ext: Option<BTreeMap<String, String>>,
+}
+
+// EVERY field added to `IndexEntry` above is `Option` + `skip_serializing_if`,
+// and that is load-bearing rather than stylistic.
+//
+// `IndexEntry` is inside `RecordBody`, which IS the signed payload, and
+// `crate::verify` re-serializes the CURRENT in-memory struct to check a
+// signature minted against an OLDER one. A plain `#[serde(default)]` field
+// emits its default (CBOR `null`) and changes the signed bytes, so every
+// existing record fails `verify_sig` at once -- and because validation is
+// all-or-nothing, that rejects the entire state and makes the index
+// unmigratable. Skipping the field when absent re-serializes a legacy entry
+// byte-for-byte, so its signature still verifies.
+//
+// The rule written on `IndexState` ("use `#[serde(default)]` on new fields")
+// does NOT cover this: every prior use of it is on `IndexState` /
+// `IndexSummary` / `IndexDelta`, none of which are signed. No signed type had
+// ever gained a field before these.
+//
+// `legacy_shaped_entry_signature_still_verifies` pins the property. Another
+// field added here must have the same shape, and that test must still pass.
+
+/// Whether following a locator lands a visitor on adult material. Open
+/// vocabulary; consumers must match [`Audience::GENERAL`] explicitly so an
+/// unrecognised future value fails CLOSED (see the note above `check_vocab`).
+#[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
+pub struct Audience(String);
+
+impl Audience {
+    pub const GENERAL: &'static str = "general";
+    pub const ADULT: &'static str = "adult";
+
+    pub fn new(s: impl Into<String>) -> Self {
+        Audience(s.into())
+    }
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+    /// True only for the exact permissive value. Deliberately not the negation
+    /// of "is adult": an unknown value must not be treated as general.
+    pub fn is_general(&self) -> bool {
+        self.0 == Self::GENERAL
+    }
+}
+
+/// Whether an entry's description is a durable property of the resource or a
+/// snapshot of something that has already changed. Open vocabulary.
+#[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
+pub struct Volatility(String);
+
+impl Volatility {
+    /// The description keeps describing the resource.
+    pub const STATIC: &'static str = "static";
+    /// A live feed of user-submitted content, so a frozen description of "what
+    /// was on it" goes stale within hours. An entry minted from one page-load
+    /// of a feed describes that page-load, not the resource.
+    pub const FEED: &'static str = "feed";
+
+    pub fn new(s: impl Into<String>) -> Self {
+        Volatility(s.into())
+    }
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// Outcome of the crawler's last re-check. Open vocabulary.
+#[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
+pub struct VerifyStatus(String);
+
+impl VerifyStatus {
+    /// Fetched, and still describable as listed.
+    pub const LIVE: &'static str = "live";
+    /// Could not be fetched on the last attempt. Not a takedown: transient
+    /// unreachability is normal on Freenet and one miss means little.
+    pub const UNREACHABLE: &'static str = "unreachable";
+    /// Fetched, but no longer the thing that was described.
+    pub const CHANGED: &'static str = "changed";
+
+    pub fn new(s: impl Into<String>) -> Self {
+        VerifyStatus(s.into())
+    }
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// What a visitor encounters at a locator.
+///
+/// Deliberately records OBSERVABLES rather than verdicts. This contract is
+/// world-readable, so every field here is a public statement about someone
+/// else's site. "Lands on adult material" is descriptive and useful to a
+/// visitor; "probably infringing" is an accusation, and that assessment stays
+/// in the crawler's local decision log where it gates admission without being
+/// broadcast.
+#[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
+pub struct Classification {
+    /// What the visitor sees IMMEDIATELY on following this locator. The default
+    /// view filters on this field, because involuntary exposure is the thing
+    /// being prevented.
+    pub landing: Audience,
+    /// Whether adult material exists deeper in, behind navigation or a gate.
+    ///
+    /// `has_adult_sections` with a general `landing` IS the gated case,
+    /// expressed as two observations rather than as a separate `gated` flag
+    /// that could contradict them. The imageboard already in the index is
+    /// exactly this: a general-audience front page with one adult board inside.
+    pub has_adult_sections: bool,
+    pub volatility: Volatility,
+    /// Which classifier taxonomy produced this. Lets a later taxonomy change
+    /// find and re-run only the stale labels instead of re-crawling everything.
+    pub classifier: u16,
+    /// Unix seconds, set by the curator (contracts cannot read a clock).
+    pub classified_at: u64,
+}
+
+/// The crawler's last re-check of an entry.
+///
+/// Exists because nothing is re-checked today: a locator is decided about once
+/// and never revisited, so a site that was general-audience when it was indexed
+/// stays described that way forever. Retention of a stale or turned entry is a
+/// slower version of never having classified it.
+#[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
+pub struct Verification {
+    /// Unix seconds of the last successful re-check.
+    pub last_verified_at: u64,
+    pub status: VerifyStatus,
 }
 
 /// Removal marker. Wins over a live entry at the same subject once its version
@@ -270,6 +479,20 @@ pub struct Tombstone {
 }
 
 /// The signable body of a per-subject record.
+///
+/// `large_enum_variant` is suppressed deliberately rather than by boxing `Live`.
+/// The lint assumes the big variant is the rare one, so that padding every
+/// instance to its size is waste. Here it is the opposite: the newest generation
+/// holds 87 live entries against 32 tombstones, so `Live` is the common case by
+/// roughly 3 to 1. Boxing would add a heap allocation and a pointer chase to
+/// nearly three quarters of records to save padding on the other quarter, which
+/// is a pessimisation dressed as a fix.
+///
+/// Boxing would also be wire-neutral (serde's `Box<T>` is transparent), so this
+/// stays a free choice later if the live/tomb ratio ever inverts. It is recorded
+/// here so the next person to see the lint does not "fix" it without checking
+/// which variant actually dominates.
+#[allow(clippy::large_enum_variant)]
 #[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
 pub enum RecordBody {
     Live(IndexEntry),
@@ -328,6 +551,51 @@ impl RecordBody {
             }
             if e.tags.len() > MAX_TAGS || e.tags.iter().any(|t| t.len() > MAX_TAG_LEN) {
                 return Err("too many tags or a tag is too long".to_string());
+            }
+            // Open vocabularies are bounded and character-restricted. Note what
+            // is NOT checked: that a value is one of the KNOWN ones. Rejecting
+            // an unrecognised tag would re-impose exactly the coupling these
+            // fields were made strings to escape -- a new value would need a new
+            // contract, i.e. a re-key. Consumers handle unknown values; the
+            // contract only stops them being unbounded or unprintable.
+            check_vocab("kind", e.kind.as_str())?;
+            if let Some(c) = &e.class {
+                check_vocab("landing", c.landing.as_str())?;
+                check_vocab("volatility", c.volatility.as_str())?;
+            }
+            if let Some(v) = &e.verified {
+                check_vocab("status", v.status.as_str())?;
+            }
+            // `ext` is uninterpreted, so the ONLY things checked are the two
+            // that stay the contract's business whatever a key comes to mean:
+            // it must not blow the state-size bound, and it must not carry a
+            // terminal escape into `atlasctl show`. Deliberately no check that a
+            // key is known -- a key the contract has never heard of is the
+            // feature, and rejecting one would put us back to needing a re-key
+            // per new field.
+            if let Some(ext) = &e.ext {
+                if ext.len() > MAX_EXT_KEYS {
+                    return Err(format!("too many ext keys ({MAX_EXT_KEYS} max)"));
+                }
+                let mut total = 0usize;
+                for (k, v) in ext {
+                    if k.is_empty() || k.len() > MAX_EXT_KEY {
+                        return Err("ext key length out of range".to_string());
+                    }
+                    if has_raw_control_char(k) || has_raw_control_char(v) {
+                        return Err("ext entry contains a control character".to_string());
+                    }
+                    total += k.len() + v.len();
+                }
+                // The bound that actually protects the state cap. Checked on the
+                // SUM, not per pair: bounding a count and a per-item size
+                // separately bounds their product, which is 48x larger than the
+                // budget and is how the first version of this blew the cap.
+                if total > MAX_EXT_TOTAL_BYTES {
+                    return Err(format!(
+                        "ext total {total} B over the {MAX_EXT_TOTAL_BYTES} B budget"
+                    ));
+                }
             }
             e.locator.check()?;
         }
@@ -608,6 +876,179 @@ mod tests {
     use rand::rngs::OsRng;
 
     const ID: &str = "EqJ5YpEEV3XLqEvKWLQHFhGAac2qXzSUoE6k2zbdnXBr";
+
+    /// `IndexEntry` EXACTLY as it was before `class` / `verified` / `ext` were
+    /// added, mirrored here so a test can mint a record the way the deployed
+    /// curator minted the ~87 live ones.
+    ///
+    /// This must NOT be expressed in terms of the current type. An "equivalence"
+    /// test that builds its expected value out of the code under test proves
+    /// only that the code agrees with itself; the whole point here is to hold a
+    /// frozen copy of the OLD shape and check the NEW code against it.
+    #[derive(Serialize)]
+    struct LegacyEntry {
+        subject_id: SubjectId,
+        version: u64,
+        /// The historic ENUM, not today's newtype. This is load-bearing: if this
+        /// mirror used the current `Kind` then both sides of the test would
+        /// serialize as a string and it would prove nothing about the
+        /// enum-to-string change. Signing through the real prior shape is what
+        /// pins that a unit enum and a string are the same CBOR bytes, and so
+        /// that the ~87 already-signed records still verify.
+        kind: LegacyKind,
+        title: String,
+        snippet: String,
+        tags: Vec<String>,
+        locator: Locator,
+        featured: bool,
+        added_at: u64,
+    }
+
+    /// `Kind` exactly as it was before it became an open vocabulary.
+    #[derive(Serialize)]
+    #[allow(dead_code)]
+    enum LegacyKind {
+        App,
+        Site,
+        External,
+    }
+
+    #[derive(Serialize)]
+    enum LegacyBody {
+        Live(LegacyEntry),
+        #[allow(dead_code)]
+        Tomb(Tombstone),
+    }
+
+    /// The historic wire values are literals and must stay exactly as spelled.
+    ///
+    /// Asserted against hardcoded strings on purpose. Every other test that
+    /// touches these goes through the constants on BOTH sides, so it agrees with
+    /// itself whatever they say -- `parse_kind("site") == Kind::new(Kind::SITE)`
+    /// passes just as happily if both become "banana".
+    ///
+    /// What this protects is not the existing records (they carry their own
+    /// bytes and keep verifying regardless) but the CONSISTENCY of new ones
+    /// against them: re-spelling `SITE` as "site" would mint entries that no
+    /// longer match the 63 already published, splitting one kind into two for
+    /// every consumer that groups or filters by it.
+    #[test]
+    fn the_historic_kind_values_are_exactly_as_published() {
+        assert_eq!(Kind::APP, "App");
+        assert_eq!(Kind::SITE, "Site");
+        assert_eq!(Kind::EXTERNAL, "External");
+    }
+
+    /// THE migration-safety test.
+    ///
+    /// `IndexEntry` sits inside the SIGNED `RecordBody`, and `crate::verify`
+    /// re-serializes the current in-memory struct to check a signature that was
+    /// minted against the old one. So a new field that serializes even when
+    /// absent silently invalidates every existing record — and since validation
+    /// is all-or-nothing, that rejects the whole state and makes the index
+    /// unmigratable. Measured: a plain `#[serde(default)]` field turns an 18 B
+    /// encoding into 34 B.
+    ///
+    /// `#[serde(default, skip_serializing_if = "Option::is_none")]` is what
+    /// makes an absent field re-serialize byte-for-byte. This test is the only
+    /// thing standing between a future edit and that breakage; nothing else in
+    /// the suite signs with an old shape and verifies with the new one.
+    #[test]
+    fn legacy_shaped_entry_signature_still_verifies() {
+        let key = SigningKey::generate(&mut OsRng);
+        let legacy = LegacyBody::Live(LegacyEntry {
+            subject_id: SubjectId::parse(&bs58::encode([3u8; 9]).into_string()).unwrap(),
+            version: 1,
+            kind: LegacyKind::Site,
+            title: "A site indexed before the taxonomy existed".into(),
+            snippet: "Minted by the old curator.".into(),
+            tags: vec!["freenet".into()],
+            locator: Locator::Freenet {
+                contract_id: ID.to_string(),
+                path: "/".into(),
+            },
+            featured: false,
+            added_at: 1_700_000_000,
+        });
+
+        // Sign the LEGACY bytes, exactly as the deployed curator did.
+        let sig = crate::sign(&legacy, &key);
+        let legacy_bytes = crate::canonical(&legacy);
+
+        // Decode them with the CURRENT type, as `atlasctl migrate` does when it
+        // carries a legacy generation forward.
+        let current: RecordBody = ciborium::de::from_reader(&legacy_bytes[..])
+            .expect("a legacy record must still decode under the current type");
+
+        match &current {
+            RecordBody::Live(e) => {
+                assert!(e.class.is_none(), "an unclassified entry must stay None");
+                assert!(e.verified.is_none());
+                assert!(e.ext.is_none());
+            }
+            RecordBody::Tomb(_) => panic!("expected a live entry"),
+        }
+
+        // Re-serializing must reproduce the signed bytes EXACTLY. This is the
+        // assertion that fails first if the field shape regresses, and it says
+        // why more precisely than the signature check below.
+        assert_eq!(
+            crate::canonical(&current),
+            legacy_bytes,
+            "the current type must re-serialize a legacy record byte-for-byte, \
+             or every existing signature is void"
+        );
+
+        let rec = SignedRecord {
+            body: current,
+            by: key.verifying_key(),
+            sig,
+        };
+        rec.verify_sig()
+            .expect("a signature minted under the legacy shape must still verify");
+    }
+
+    /// The above test is only meaningful if it can FAIL. A populated optional
+    /// field must change the bytes, which is what proves the byte-equality
+    /// assertion is testing the skip and not something vacuous.
+    #[test]
+    fn a_populated_optional_field_does_change_the_signed_bytes() {
+        let base = IndexEntry {
+            subject_id: SubjectId::parse(&bs58::encode([4u8; 9]).into_string()).unwrap(),
+            version: 1,
+            kind: Kind::new(Kind::SITE),
+            title: "t".into(),
+            snippet: "s".into(),
+            tags: vec![],
+            locator: Locator::Freenet {
+                contract_id: ID.to_string(),
+                path: "/".into(),
+            },
+            featured: false,
+            added_at: 1,
+            class: None,
+            verified: None,
+            ext: None,
+        };
+        let bare = crate::canonical(&RecordBody::Live(base.clone()));
+
+        let classified = IndexEntry {
+            class: Some(Classification {
+                landing: Audience::new(Audience::GENERAL),
+                has_adult_sections: false,
+                volatility: Volatility::new(Volatility::STATIC),
+                classifier: 1,
+                classified_at: 2,
+            }),
+            ..base
+        };
+        assert_ne!(
+            crate::canonical(&RecordBody::Live(classified)),
+            bare,
+            "if populating `class` did not change the bytes, the byte-equality \
+             assertion in the legacy test would pass for the wrong reason"
+        );
+    }
 
     fn app_res(app: &str, resource: &str, path: &str) -> Locator {
         Locator::AppResource {

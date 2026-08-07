@@ -15,8 +15,9 @@ mod types;
 
 pub use state::{contract_web_href, IndexDelta, IndexState, IndexSummary};
 pub use types::{
-    has_raw_control_char, AppRecord, AppRegistry, AppRegistryBody, IndexEntry, IndexParams,
-    KeyAuth, KeyAuthBody, Kind, Locator, RecordBody, SignedRecord, SubjectId, Tombstone,
+    has_raw_control_char, AppRecord, AppRegistry, AppRegistryBody, Audience, Classification,
+    IndexEntry, IndexParams, KeyAuth, KeyAuthBody, Kind, Locator, RecordBody, SignedRecord,
+    SubjectId, Tombstone, Verification, VerifyStatus, Volatility,
 };
 
 /// Max records in a single index contract. Keeps the full state inside the
@@ -58,6 +59,59 @@ pub const MAX_EXTERNAL_URL: usize = 512;
 /// pathological deep link.
 pub const MAX_LOCATOR_PATH: usize = 512;
 
+/// Max length of an open-vocabulary tag (`kind`, `landing`, `volatility`,
+/// `status`).
+///
+/// These are newtypes over `String` rather than enums so a new value costs no
+/// contract re-key (see the note in `types.rs`). The bound is what stops an open
+/// vocabulary from becoming an unbounded field: it is sized to fit the longest
+/// value in use ("unreachable", 11) with room to spare, and it feeds
+/// `max_entries_worst_case_fits_the_node_state_cap` -- four vocabulary fields at
+/// this length are part of the worst-case record.
+pub const MAX_VOCAB: usize = 16;
+
+/// Bounds on `IndexEntry::ext`, the opaque additive-metadata map.
+///
+/// The contract validates SIZE and character-safety only, and never interprets
+/// a key. That is the entire point: a new piece of per-entry metadata can be
+/// added by writing a new key here, with no Rust type change, therefore no new
+/// contract artifact, therefore no re-key and no migration. Every `common/`
+/// edit moves the index address (`hash(compiled_wasm, params)`), and both prior
+/// re-keys left the live UI serving a stale snapshot, once for eight days --
+/// so an additive change that does not require one is worth real money.
+///
+/// The trade is that the contract cannot enforce anything ABOUT this metadata.
+/// Anything the contract must validate, or that the UI must be able to rely on,
+/// belongs in a typed field instead. `ext` is for metadata the network only
+/// needs to carry.
+///
+/// SIZED BY MEASUREMENT, NOT BY TASTE, and the budget is now FULLY ALLOCATED.
+/// `max_entries_worst_case_fits_the_node_state_cap` prints the arithmetic: the
+/// worst legal record is 2609 B, so `MAX_ENTRIES` of them is 49.76 MiB of the
+/// 50 MiB cap, leaving about 12 B per entry spare. A first attempt at 16 keys x
+/// (32 B key + 256 B value) measured 7151 B per entry, i.e. 136 MiB against
+/// that cap.
+///
+/// Hence a TOTAL-bytes bound rather than per-key maxima. Bounding a count and a
+/// per-item size independently bounds their PRODUCT, which is what exploded;
+/// bounding the sum bounds the thing that actually has to fit, and lets the
+/// budget be spent as one long value or several short ones.
+///
+/// READ THIS BEFORE ADDING A FIELD. Twelve bytes of slack is not an oversight
+/// and does not want "fixing": this 96 B IS the pre-allocated growth space, and
+/// future per-entry metadata is meant to land inside it rather than as a new
+/// typed field. Growing here costs nothing, since no Rust type changes and so
+/// the contract does not re-key. Adding a new typed field, or raising any bound
+/// including this one, now requires trading it against another bound or against
+/// `MAX_ENTRIES` — and re-running that test, which is the only thing that will
+/// tell you whether you can afford it.
+pub const MAX_EXT_KEYS: usize = 8;
+/// Max length of a single `ext` key. A sanity bound; [`MAX_EXT_TOTAL_BYTES`] is
+/// the one that binds.
+pub const MAX_EXT_KEY: usize = 32;
+/// Max SUM of `key.len() + value.len()` across every `ext` pair.
+pub const MAX_EXT_TOTAL_BYTES: usize = 96;
+
 /// Canonical CBOR bytes used as the signing payload for any signed struct.
 /// Signing and verification must both go through this so the bytes match.
 pub fn canonical<T: Serialize>(value: &T) -> Vec<u8> {
@@ -94,7 +148,10 @@ pub fn generate_key() -> SigningKey {
 #[cfg(test)]
 mod bound_tests {
     use super::*;
-    use crate::types::{IndexEntry, Kind, Locator, RecordBody, SignedRecord, SubjectId};
+    use crate::types::{
+        Audience, Classification, IndexEntry, Kind, Locator, RecordBody, SignedRecord, SubjectId,
+        Verification, VerifyStatus, Volatility,
+    };
     use ed25519_dalek::SigningKey;
 
     /// The node hard-caps contract state at 50 MiB, and `MAX_ENTRIES` is only a
@@ -115,13 +172,44 @@ mod bound_tests {
             let e = IndexEntry {
                 subject_id: SubjectId::parse(&bs58::encode([9u8; 9]).into_string()).unwrap(),
                 version: u64::MAX,
-                kind: Kind::Site,
+                // Vocabulary fields at their BOUND, not at the length of the
+                // values in use today. `Kind`/`landing`/`volatility`/`status`
+                // are open vocabularies, so a future value may be any legal tag
+                // up to MAX_VOCAB; measuring "Site" here would make this test
+                // pass while a legal record still blew the cap.
+                kind: Kind::new("k".repeat(MAX_VOCAB)),
                 title: "t".repeat(MAX_TITLE),
                 snippet: "s".repeat(MAX_SNIPPET),
                 tags: (0..MAX_TAGS).map(|_| "g".repeat(MAX_TAG_LEN)).collect(),
                 locator: loc,
                 featured: true,
                 added_at: u64::MAX,
+                // The optional fields are part of the worst case and must be
+                // POPULATED here. They are `skip_serializing_if`, so leaving
+                // them `None` would measure a smaller record than the contract
+                // will accept and quietly restore the exact "finite bound that
+                // is not sufficient" hole this test exists to close.
+                class: Some(Classification {
+                    landing: Audience::new("a".repeat(MAX_VOCAB)),
+                    has_adult_sections: true,
+                    volatility: Volatility::new("v".repeat(MAX_VOCAB)),
+                    classifier: u16::MAX,
+                    classified_at: u64::MAX,
+                }),
+                verified: Some(Verification {
+                    last_verified_at: u64::MAX,
+                    status: VerifyStatus::new("s".repeat(MAX_VOCAB)),
+                }),
+                // The largest LEGAL ext: the full key count, with the whole
+                // byte budget spent. Split evenly so both bounds bind at once.
+                ext: Some(
+                    (0..MAX_EXT_KEYS)
+                        .map(|i| {
+                            let per = MAX_EXT_TOTAL_BYTES / MAX_EXT_KEYS;
+                            (format!("{i:0>2}"), "v".repeat(per - 2))
+                        })
+                        .collect(),
+                ),
             };
             let body = RecordBody::Live(e);
             // Must be VALID, or the bound is not actually reachable and the test
@@ -154,6 +242,20 @@ mod bound_tests {
         ];
         let worst_record = cases.into_iter().map(worst).max().unwrap();
         let total = worst_record * MAX_ENTRIES;
+        // Report the headroom, not just pass/fail. Sizing a new per-entry field
+        // needs a NUMBER, and a test that only speaks up on overflow forces the
+        // next person to guess and then discover the overflow — which is how the
+        // first version of `ext` came to be 48x its budget. Run with
+        // `--nocapture` to read it.
+        let headroom = NODE_STATE_CAP.saturating_sub(total);
+        println!(
+            "worst-case record {worst_record} B x MAX_ENTRIES {MAX_ENTRIES} = {:.2} MiB \
+             of the {} MiB cap; headroom {:.2} MiB = {} B per entry",
+            total as f64 / 1048576.0,
+            NODE_STATE_CAP / 1024 / 1024,
+            headroom as f64 / 1048576.0,
+            headroom / MAX_ENTRIES,
+        );
         assert!(
             total < NODE_STATE_CAP,
             "MAX_ENTRIES ({MAX_ENTRIES}) x worst-case record ({worst_record} B) = \

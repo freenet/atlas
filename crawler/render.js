@@ -51,6 +51,29 @@ const enumMax = Number.isFinite(enumMaxRaw) ? Math.min(Math.max(enumMaxRaw, 0), 
 const NAV_TIMEOUT_MS = 30000;
 const POLL_TIMEOUT_MS = 25000; // max time to wait for the WASM frame to populate
 const MIN_SETTLE_MS = 6000; // always let content load this long before accepting "stable"
+// The caller's acceptance threshold, mirrored so the stabilization predicate below
+// can agree with it. THE RUST CONSTANT IS AUTHORITATIVE: `MIN_DESCRIBABLE_CHARS` in
+// crawler/src/main.rs is what actually decides whether a rendered page is indexed or
+// deferred as too thin; this is a copy, and the two MUST be changed together.
+//
+// They disagreed, and that was the bug. The loop below declared a page "stable" from
+// the FRAME BODY's text length, while the caller judged the same page on its CONTENT
+// REGION — so a Freenet app that had painted its shell but not yet received node data
+// satisfied the stability test (chrome alone clears the 40-character floor) and was
+// handed back at ~7s with its content region still a skeleton. Measured: 4 of 32
+// locators in one crawl, e.g. BaroShare captured at 87 characters ("Connecting to
+// your Freenet node...") on one run and 597 on the next, while every run exited at
+// 7-9s and left ~17s of the poll budget unspent.
+//
+// Set `ATLAS_MIN_DESCRIBABLE_CHARS` to have the Rust side pass its own value and
+// retire the copy; until then, a change on either side without the other silently
+// reopens the disagreement. There is no JS test harness here, so the drift is not
+// caught mechanically — main.rs's source-pin tests over this file are the place to
+// add that check.
+const MIN_DESCRIBABLE_CHARS = (() => {
+  const n = Number.parseInt(process.env.ATLAS_MIN_DESCRIBABLE_CHARS || '', 10);
+  return Number.isFinite(n) && n >= 0 ? n : 200;
+})();
 const POLL_STEP_MS = 1000;
 const HASH_SETTLE_MS = 2500; // re-render after a hashchange (no reload, no reconnect)
 const ENUM_RESERVE_MS = 8000;  // leave room to close the browser and emit
@@ -115,21 +138,60 @@ const CONTENT_SELECTORS = ['main', '[role=main]', 'article', '#content', '.conte
 // caller's minimum-content guard defers it for free instead of describing chrome.
 const requireContent = args.includes('--require-content');
 
+// Runs IN THE PAGE. Single implementation on purpose: both the text we hand back and
+// the stabilization predicate in the poll loop go through it, so the "is this page
+// done?" question and the "is this page describable?" question can never be answered
+// off different measurements again. Inlining a second copy at either call site is how
+// the two drifted the first time.
+//
+// `countOnly` returns the size instead of the text: the poll asks this once a second
+// and only needs to compare against a threshold, and shipping a whole content region
+// across the CDP boundary every poll is wasted bandwidth on a page that may carry
+// megabytes of it.
+function contentRegionProbe({ sels, strict, countOnly }) {
+  let text = '';
+  for (const s of sels) {
+    const el = document.querySelector(s);
+    const t = el && el.innerText ? el.innerText.trim() : '';
+    if (t.length > 80) {
+      text = t;
+      break;
+    }
+  }
+  if (!text) text = strict ? '' : document.body ? document.body.innerText : '';
+  // Unicode SCALARS, not UTF-16 code units, because the Rust gate counts `chars()`:
+  // an emoji is 2 here and 1 there. Measuring the permissive way would let this loop
+  // call a page describable that the caller then rejects, which is precisely the
+  // disagreement that sharing one function exists to prevent.
+  return countOnly ? [...text.trim()].length : text;
+}
+
 async function contentText(frame) {
   try {
-    return await frame.evaluate(
-      ({ sels, strict }) => {
-        for (const s of sels) {
-          const el = document.querySelector(s);
-          const t = el && el.innerText ? el.innerText.trim() : '';
-          if (t.length > 80) return t;
-        }
-        return strict ? '' : document.body ? document.body.innerText : '';
-      },
-      { sels: CONTENT_SELECTORS, strict: requireContent }
-    );
+    return await frame.evaluate(contentRegionProbe, {
+      sels: CONTENT_SELECTORS,
+      strict: requireContent,
+      countOnly: false,
+    });
   } catch (_) {
     return '';
+  }
+}
+
+// Size of the same region, for the poll loop. Deliberately NOT a wrapper around the
+// function above: a source pin in crawler/src/main.rs counts that function's call
+// sites to catch an enumerated page losing its text capture, and a fourth call would
+// trip it. Both go through `contentRegionProbe`, which is the part that must not fork.
+async function contentRegionChars(frame) {
+  try {
+    const n = await frame.evaluate(contentRegionProbe, {
+      sels: CONTENT_SELECTORS,
+      strict: requireContent,
+      countOnly: true,
+    });
+    return Number.isFinite(n) ? n : 0;
+  } catch (_) {
+    return 0;
   }
 }
 
@@ -163,6 +225,37 @@ async function pickFrame(page) {
   try {
     browser = await playwright.chromium.launch({ headless: true });
     const page = await browser.newPage({ viewport: { width: 1200, height: 900 } });
+
+    // Count of WebSockets the page currently holds open, which is how we tell "thin
+    // because it is still waiting on the node" from "thin because that is the whole
+    // page". A client-side Freenet app reaches the node over a WebSocket, so a page
+    // holding one open with a still-empty content region has an outstanding answer
+    // coming; a page holding none does not, and no amount of extra waiting will
+    // change it.
+    //
+    // This is what keeps the longer wait CONDITIONAL. Most thin locators are thin
+    // permanently — a single-image page whose entire text is "Served from Freenet /
+    // <W>x<H> / <size> / Copy link", or a bare form — and probes held those flat from
+    // t=1s to t=90s. Neither opens a WebSocket, so both still settle on the old
+    // ~7s path instead of each burning the full 25s poll budget for nothing.
+    // Registered on the page, not a frame: the app runs in the gateway's __sandbox
+    // iframe and its socket surfaces here (verified against Delta and BaroShare).
+    let liveSockets = 0;
+    page.on('websocket', (ws) => {
+      liveSockets++;
+      // Decrement once even if both events fire, or a socket that errors then closes
+      // drives the count negative and permanently disables the wait for this page.
+      let counted = true;
+      const gone = () => {
+        if (counted) {
+          counted = false;
+          liveSockets--;
+        }
+      };
+      ws.on('close', gone);
+      ws.on('socketerror', gone);
+    });
+
     const resp = await page
       .goto(url, { waitUntil: 'domcontentloaded', timeout: NAV_TIMEOUT_MS })
       .catch(() => null);
@@ -171,14 +264,22 @@ async function pickFrame(page) {
     // Wait for the sandbox app to finish rendering. Many Freenet apps (e.g.
     // Delta) paint their chrome within ~1s but only fetch and render their real
     // content (including outbound links) seconds later, so we cannot stop at the
-    // first sign of text. Instead we poll until content STABILIZES: text length
-    // and anchor count stop growing for two consecutive polls, after a minimum
-    // settle time, bounded by an absolute timeout.
+    // first sign of text. Instead we poll until content STABILIZES: text length,
+    // anchor count and CONTENT-REGION size stop growing for two consecutive polls,
+    // after a minimum settle time, bounded by an absolute timeout.
+    //
+    // The content-region size is in that list because the frame body alone answered
+    // the wrong question. An app shell's chrome clears the 40-character floor on its
+    // own and then sits flat while the real content is still in flight, so the loop
+    // called the page settled and the caller — which measures only the content region
+    // — rejected it as too thin. Same page, two measurements, and the renderer was
+    // reporting on the one that could not see the thing being waited for.
     const deadline = Date.now() + POLL_TIMEOUT_MS;
     const minSettle = Date.now() + MIN_SETTLE_MS;
     let frame = null;
     let prevLen = -1;
     let prevA = -1;
+    let prevChars = -1;
     let stable = 0;
     for (;;) {
       frame = await pickFrame(page);
@@ -190,15 +291,30 @@ async function pickFrame(page) {
           document.querySelectorAll('a').length,
         ]);
       } catch (_) {}
-      const grew = len !== prevLen || a !== prevA;
+      const chars = await contentRegionChars(frame);
+      const grew = len !== prevLen || a !== prevA || chars !== prevChars;
       const hasContent = len > 40 || a > 0;
-      if (!grew && hasContent && Date.now() > minSettle) {
+      // Exactly the caller's acceptance test. Below it, the render is going to be
+      // thrown away, so "stable" is not a useful thing to be.
+      const describable = chars >= MIN_DESCRIBABLE_CHARS;
+      // Not settled, however flat it looks: the content region is still too thin to
+      // index AND the page is holding a node connection open, so the data that fills
+      // it has not arrived yet. Flatness is what this state LOOKS like from the DOM —
+      // a shell finished painting and then waits — which is why flatness alone was
+      // never enough to stop on. Keep polling to the deadline; a page with no node
+      // connection, or one already describable, is unaffected and still stops early.
+      const awaitingNode = !describable && liveSockets > 0;
+      if (!grew && hasContent && !awaitingNode && Date.now() > minSettle) {
         if (++stable >= 2) break;
       } else {
         stable = 0;
       }
       prevLen = len;
       prevA = a;
+      prevChars = chars;
+      // Budget genuinely exhausted: take the thin result rather than return nothing.
+      // The caller defers a too-thin page for free and re-renders it on the next
+      // pass, so a slow node costs a round trip, not an entry.
       if (Date.now() > deadline) break;
       await page.waitForTimeout(POLL_STEP_MS);
     }

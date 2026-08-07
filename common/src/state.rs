@@ -412,7 +412,7 @@ mod tests {
         IndexEntry {
             subject_id: sid.clone(),
             version,
-            kind: Kind::App,
+            kind: Kind::new(Kind::APP),
             title: title.to_string(),
             snippet: "snippet".into(),
             tags: vec!["tag".into()],
@@ -421,6 +421,9 @@ mod tests {
             },
             featured: false,
             added_at: 1,
+            class: None,
+            verified: None,
+            ext: None,
         }
     }
 

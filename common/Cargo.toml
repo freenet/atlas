@@ -1,5 +1,12 @@
 [package]
-name = "atlas-common"
+# Published name. `atlas-common` was taken on crates.io in Aug 2025 by an
+# unrelated IntelLabs ML-provenance crate, and crates.io requires every path
+# dependency of a published crate to itself be published under a real name.
+#
+# Consumers still write `use atlas_common::…`: the workspace renames this
+# dependency back (`atlas-common = { package = "fn-atlas-common", … }`), which
+# is why this is a two-line change rather than a rename across every file.
+name = "fn-atlas-common"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
