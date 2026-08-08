@@ -2678,8 +2678,39 @@ fn main() -> Result<()> {
     // loop below: it walks the live index on its own (roughly daily) cadence,
     // meant to be invoked by its own scheduled run rather than every
     // `--interval` tick. See `run_recheck_pass`.
+    //
+    // It shares the SAME `SpendLedger`/`Budget` and `--monthly-max` as the
+    // ordinary crawl, constructed fresh here rather than reusing the one built
+    // further below: this branch returns immediately, so the two never
+    // coexist, and building it here keeps the recheck path fully self-
+    // contained. An earlier version of this pass explicitly bypassed the
+    // budget, reasoning that population-derived ceilings kept it to "tens, not
+    // hundreds" of calls a day -- true for the RENDER count, but every one of
+    // those calls that finds changed content is a real, billed OpenAI request
+    // (vision-eligible, so up to the full per-call reservation), and nothing
+    // stood between that and the API. `--monthly-max` is supposed to be the
+    // hard money ceiling; a path that ignores it is not a detail, it is the
+    // one invariant this whole re-key exists to protect.
     if cli.recheck {
-        return run_recheck_pass(&cli, &recheck_state_path, &decisions_path, now_secs());
+        let prices = Prices::from_cli(cli.input_price, cli.output_price)?;
+        let monthly_max = usd_to_micros(cli.monthly_max, "--monthly-max")?;
+        let mut ledger = SpendLedger::load(&spend_path, now_secs());
+        let mut budget = Budget::new(
+            &mut ledger,
+            cli.max,
+            cli.daily_max,
+            cli.per_host_max,
+            monthly_max,
+            &prices,
+        );
+        return run_recheck_pass(
+            &cli,
+            &recheck_state_path,
+            &decisions_path,
+            &mut budget,
+            &prices,
+            now_secs(),
+        );
     }
 
     let mut state = CrawlState::default();
@@ -3387,6 +3418,20 @@ struct LiveEntry {
     has_adult_sections: bool,
 }
 
+/// Whether a fresh assessment would change what is currently PUBLISHED for
+/// `landing`/`has_adult_sections` — the one field the involuntary-exposure
+/// design depends on (safe search hides on `landing`, the badge reads
+/// `has_adult_sections`). A change here must never auto-publish through the
+/// recheck sweep: it is the first path where a re-render of adversary-
+/// controlled content can move that field with no human in the loop, on a
+/// recurring cadence, and a title/snippet refresh does not carry that risk.
+/// Extracted as a pure function rather than left inline so it is testable
+/// directly, not only via a source scrape of `run_recheck_pass`.
+fn landing_would_change(current_adult: bool, current_has_sections: bool, new: &Assessment) -> bool {
+    (new.landing == Landing::Adult) != current_adult
+        || new.has_adult_sections != current_has_sections
+}
+
 /// Ask `atlasctl` for the live index. Unlike `AppRegistryView::load`, a failure
 /// here IS fatal to the pass: there is nothing useful a recheck sweep can do
 /// without knowing what is published.
@@ -3721,15 +3766,19 @@ impl RecheckSchedule {
 /// on what it finds — see the outcome branches inline below for the specific
 /// rule each one follows.
 ///
-/// Deliberately does NOT route through `Budget`/`SpendLedger`: the population-
-/// derived ceilings keep this pass to on the order of `TARGET_DAILY_RENDERS_*`
-/// calls a day by construction (tens, not hundreds), which is negligible next
-/// to `--monthly-max` — the same order of magnitude as the ordinary crawl's own
-/// `--max` default. `--recheck-max` is the safety valve.
+/// Routes every reclassification through the SAME `Budget` the ordinary crawl
+/// uses via `try_take`/`settle`, so `--monthly-max` bounds this pass too. The
+/// population-derived ceilings keep the RENDER count small (tens, not
+/// hundreds, a day) but every render whose content changed is a real, billed
+/// OpenAI call — vision-eligible, so up to a full reservation — and nothing
+/// about "renders are cheap" makes that call free. `--recheck-max` remains a
+/// separate safety valve on top, not a substitute for the money cap.
 fn run_recheck_pass(
     cli: &Cli,
     recheck_state_path: &Path,
     decisions_path: &Path,
+    budget: &mut Budget,
+    prices: &Prices,
     now: u64,
 ) -> Result<()> {
     let live = fetch_live_index(cli)?;
@@ -3798,6 +3847,7 @@ fn run_recheck_pass(
     let mut flagged = 0usize;
     let mut unreachable_marked = 0usize;
     let mut skipped_no_key = 0usize;
+    let mut skipped_no_budget = 0usize;
 
     for e in due {
         let tier = tier_of[&e.subject_id];
@@ -3813,13 +3863,20 @@ fn run_recheck_pass(
             Err(err) => {
                 eprintln!("  recheck: {} unreachable ({err:#})", e.subject_id);
                 checked += 1;
-                if schedule.record_unreachable(&e.subject_id, now) {
-                    if recheck_update(cli, &e.subject_id, e.version, "unreachable", None).is_ok() {
-                        unreachable_marked += 1;
-                    }
-                    // Back off like an unchanged result once it is recorded: a
-                    // confirmed-dead resource must not be re-hammered daily
-                    // forever.
+                if schedule.record_unreachable(&e.subject_id, now)
+                    && recheck_update(cli, &e.subject_id, e.version, "unreachable", None).is_ok()
+                {
+                    unreachable_marked += 1;
+                    // Back off like an unchanged result once the stamp is
+                    // actually on record: a confirmed-dead resource must not be
+                    // re-hammered daily forever. If the stamp FAILED to
+                    // publish, the schedule is left untouched on purpose — the
+                    // strike count `record_unreachable` already bumped stands,
+                    // so the next pass either hits the threshold again
+                    // immediately (retrying the stamp) or the resource comes
+                    // back and the streak clears normally. Backing off here on
+                    // a failed publish would assert "confirmed dead" for a
+                    // status nobody ever recorded.
                     schedule.record_unchanged(&e.subject_id, ceiling, now);
                 }
             }
@@ -3838,29 +3895,44 @@ fn run_recheck_pass(
                 // same floor a new locator is judged on — is itself worth a
                 // curator's look rather than a silent LLM guess on ~nothing.
                 if visible < MIN_DESCRIBABLE_CHARS {
-                    eprintln!(
-                        "  recheck: {} now too thin to classify ({visible} chars) — \
-                         flagging for review",
-                        e.subject_id
-                    );
-                    schedule.record_changed(&e.subject_id, tier, print, now);
-                    let _ = decisions.record(
+                    // Gated on the log write succeeding, matching `index_page`'s
+                    // established discipline elsewhere in this file: advancing
+                    // the schedule here means "this has been recorded", and if
+                    // the record failed that would be false. On failure the
+                    // entry simply stays due and is retried next pass.
+                    if decisions.record(
                         &e.locator,
                         Outcome::FlaggedOnRecheck,
                         &format!(
                             "content changed and is now too thin to classify ({visible} chars)"
                         ),
                         now,
-                    );
-                    flagged += 1;
+                    ) {
+                        eprintln!(
+                            "  recheck: {} now too thin to classify ({visible} chars) — \
+                             flagging for review",
+                            e.subject_id
+                        );
+                        schedule.record_changed(&e.subject_id, tier, print, now);
+                        flagged += 1;
+                    }
                     continue;
                 }
                 let Some(k) = key.as_deref() else {
                     skipped_no_key += 1;
                     continue;
                 };
+                // Same budget the ordinary crawl uses. A denial here behaves
+                // exactly like a denial there: the entry is left alone (NOT
+                // marked seen, NOT advanced) so it is simply retried on a later
+                // pass once headroom returns, rather than silently reclassified
+                // for free.
+                if budget.try_take(&e.locator).is_err() {
+                    skipped_no_budget += 1;
+                    continue;
+                }
                 let mut usage: Option<Usage> = None;
-                let desc = match describe_llm(
+                let desc_result = describe_llm(
                     &client,
                     k,
                     &model,
@@ -3868,7 +3940,9 @@ fn run_recheck_pass(
                     &body,
                     page.screenshot.as_deref(),
                     &mut usage,
-                ) {
+                );
+                budget.settle(usage.map(|u| prices.cost(&u)));
+                let desc = match desc_result {
                     Ok(d) => d,
                     Err(err) => {
                         eprintln!(
@@ -3879,14 +3953,73 @@ fn run_recheck_pass(
                     }
                 };
                 let admission = desc.assessment.as_ref().map(Assessment::admit);
+                // A landing/adult-sections FLIP, in EITHER direction, is not a
+                // cosmetic correction: it is the one field the whole
+                // involuntary-exposure design depends on (safe search hides on
+                // `landing`, the badge reads `has_adult_sections`), and this is
+                // the first path where a re-render of ADVERSARY-CONTROLLED
+                // content can change it with no human in the loop, on a
+                // recurring cadence. An admitted title/snippet/tag refresh
+                // still auto-publishes — that risk is bounded and reversible by
+                // definition, the entry was already admitted. A landing change
+                // gets the SAME treatment as a would-now-be-refused verdict:
+                // leave the published entry untouched and flag it, rather than
+                // trust a single automated read of a page that just changed to
+                // move the one field that decides who gets warned.
+                let landing_changed = desc.assessment.as_ref().is_some_and(|a| {
+                    landing_would_change(e.landing_adult, e.has_adult_sections, a)
+                });
                 match admission {
-                    Some(Admission::Admit) | None => {
+                    Some(Admission::Admit) | None if !landing_changed => {
+                        // Only advance the schedule when the correction
+                        // actually PUBLISHED. On failure (a version race
+                        // against a concurrent editor, a network error), the
+                        // entry must stay exactly as due as it was — recording
+                        // success here would make a correction that never
+                        // landed indistinguishable, on the next pass, from one
+                        // that did, and it would never be retried.
                         if recheck_update(cli, &e.subject_id, e.version, "live", Some(&desc))
                             .is_ok()
                         {
                             corrected += 1;
+                            schedule.record_changed(&e.subject_id, tier, print, now);
                         }
-                        schedule.record_changed(&e.subject_id, tier, print, now);
+                    }
+                    Some(Admission::Admit) | None => {
+                        // landing_changed: flag instead of auto-publishing. See
+                        // the comment above the match.
+                        let evidence = desc
+                            .assessment
+                            .as_ref()
+                            .map(|a| {
+                                let was = if e.landing_adult {
+                                    Landing::Adult
+                                } else {
+                                    Landing::General
+                                };
+                                format!(
+                                    "landing {} -> {}, adult sections {} -> {}",
+                                    was.flag(),
+                                    a.landing.flag(),
+                                    e.has_adult_sections,
+                                    a.has_adult_sections
+                                )
+                            })
+                            .unwrap_or_default();
+                        if decisions.record(
+                            &e.locator,
+                            Outcome::FlaggedOnRecheck,
+                            &format!("landing/adult-sections would change on recheck: {evidence}"),
+                            now,
+                        ) {
+                            eprintln!(
+                                "  recheck: {} landing/adult-sections would change \
+                                 ({evidence}) — leaving published, flagging for review",
+                                e.subject_id
+                            );
+                            schedule.record_changed(&e.subject_id, tier, print, now);
+                            flagged += 1;
+                        }
                     }
                     Some(Admission::Refuse(outcome)) => {
                         // Leave the published entry untouched: this is a
@@ -3900,13 +4033,9 @@ fn run_recheck_pass(
                             .as_ref()
                             .map(Assessment::evidence)
                             .unwrap_or_default();
-                        eprintln!(
-                            "  recheck: {} would now be refused ({}) — leaving published, \
-                             flagging for review",
-                            e.subject_id,
-                            outcome.token()
-                        );
-                        let _ = decisions.record(
+                        // Same gate as the too-thin arm above: only advance once
+                        // the flag is actually on record.
+                        if decisions.record(
                             &e.locator,
                             Outcome::FlaggedOnRecheck,
                             &format!(
@@ -3914,9 +4043,16 @@ fn run_recheck_pass(
                                 outcome.token()
                             ),
                             now,
-                        );
-                        schedule.record_changed(&e.subject_id, tier, print, now);
-                        flagged += 1;
+                        ) {
+                            eprintln!(
+                                "  recheck: {} would now be refused ({}) — leaving \
+                                 published, flagging for review",
+                                e.subject_id,
+                                outcome.token()
+                            );
+                            schedule.record_changed(&e.subject_id, tier, print, now);
+                            flagged += 1;
+                        }
                     }
                 }
             }
@@ -3929,7 +4065,8 @@ fn run_recheck_pass(
     eprintln!(
         "recheck complete: {checked} checked / {unchanged} unchanged / {corrected} corrected \
          / {flagged} flagged / {unreachable_marked} marked unreachable / {skipped_no_key} \
-         skipped (no key) — {} standard, {} high-drift entries tracked",
+         skipped (no key) / {skipped_no_budget} skipped (budget) — {} standard, {} \
+         high-drift entries tracked",
         standard_pop, highdrift_pop
     );
     Ok(())
@@ -3957,19 +4094,38 @@ struct Page {
     /// The walk STOPPED EARLY rather than running out of pages: the wall clock ran
     /// out, or a step failed. What was captured is an arbitrary prefix of the site.
     truncated: bool,
-    /// True iff this content came back from a SUCCESSFUL `render_page` call.
-    /// False for the static-fetch fallback (renderer errored, or none was
-    /// configured) and for a non-Freenet external fetch, which never attempts a
-    /// render at all.
+    /// True iff a repeated identical [`TooThin`] verdict from THIS content is a
+    /// genuine, permanent property of the resource, rather than an artifact of
+    /// how this particular fetch happened. Despite the name, this is NOT simply
+    /// "did `render_page` run" — it is "will the SAME acquisition method be
+    /// tried again on a future run, and could a DIFFERENT one produce a richer
+    /// result."
     ///
-    /// A fallback page's content says nothing about whether the SITE is thin —
-    /// only that the renderer failed to produce a real page this run (node
-    /// missing, a playwright upgrade, chromium OOM). Feeding a fallback result
-    /// into the [`TooThin`] retirement streak is what let a transient tooling
-    /// failure permanently blacklist the entire backlog: three broken runs in a
-    /// row produce the SAME static-fetch text and look identical to three
-    /// genuine identical renders. See the `record_thin` call site in
-    /// `run_once`, which only advances the streak when this is true.
+    /// - A successful `render_page` call: `true`. The strongest signal there is.
+    /// - The static-fetch FALLBACK on a `freenet:` locator (renderer errored, or
+    ///   none was configured this run): `false`. A future run with a working
+    ///   renderer could get a genuinely different, richer page from the exact
+    ///   same locator — a fallback page's content says nothing about whether
+    ///   the SITE is thin, only that the renderer failed to produce a real page
+    ///   THIS run (node missing, a playwright upgrade, chromium OOM). Feeding
+    ///   this into the [`TooThin`] retirement streak is what let a transient
+    ///   tooling failure permanently blacklist the entire backlog: three broken
+    ///   runs in a row produce the SAME static-fetch text and look identical to
+    ///   three genuine identical renders.
+    /// - A non-Freenet EXTERNAL fetch: `true`, not `false`. This one is easy to
+    ///   get backwards — an external URL never goes through `render_page` in ANY
+    ///   run, by construction (only `freenet:` locators branch into it), so
+    ///   static fetch is not a degraded fallback for it, it is the PERMANENT,
+    ///   sole acquisition method. A repeated identical thin result from an
+    ///   external URL is exactly as deterministic as a repeated identical
+    ///   render, and marking it `false` reopens the pre-fix bug for every
+    ///   permanently-thin external locator (a paywall stub, a JS-only SPA
+    ///   shell): it would defer forever, never retire, and re-burn a budgeted
+    ///   attempt on every run — the identical failure mode this field exists to
+    ///   close, just for a different locator class.
+    ///
+    /// See the `record_thin` call site in `run_once`, which only advances the
+    /// retirement streak when this is true.
     rendered: bool,
     /// A JPEG screenshot of the viewport, captured when the page was thin or
     /// image-heavy enough that text alone is unlikely to describe it — see
@@ -4410,8 +4566,11 @@ fn get_page_enumerating(
             extra_pages: Vec::new(),
             extra_texts: Vec::new(),
             truncated: false,
-            // An external (non-Freenet) locator is never rendered at all.
-            rendered: false,
+            // `true`, deliberately, despite never touching `render_page` — see
+            // the field doc. This IS the permanent acquisition method for an
+            // external locator, so a repeated identical thin result from it is
+            // a genuine deterministic verdict, not a fallback artifact.
+            rendered: true,
             screenshot: None,
         })
     }
@@ -4431,6 +4590,25 @@ const SCREENSHOT_THIN_CHARS: usize = MIN_DESCRIBABLE_CHARS * 2;
 /// even though it clears the text floor comfortably.
 const SCREENSHOT_CHARS_PER_IMG: usize = 150;
 
+/// Upper bound on `visible` for the image-heavy check to even apply.
+///
+/// `img_count` is counted over `page.html`, which is the WHOLE document
+/// (`document.documentElement.outerHTML` — see `render.js`), not the content
+/// region `visible` is measured from; there is no HTML parser in this crate to
+/// scope one to the other. Left unbounded, that mismatch fires on an ordinary,
+/// image-free ARTICLE whose chrome happens to carry a handful of unrelated
+/// icons: a 3000-character page with a logo, nav, social-share row and footer
+/// sitemap (25 `<img>` tags) clears `25 * 150 = 3750`, well past its own text,
+/// and triggers a screenshot for content that is not remotely image-heavy.
+///
+/// This bound is the cheap fix for that without a parser: a page whose REAL
+/// content this large is not "mostly images" regardless of how many icons its
+/// chrome carries, so the density check is simply skipped past this point.
+/// Four times the thin-page margin comfortably covers the pages the density
+/// check exists for (an image-only page's caption-and-metadata text is nowhere
+/// near this) while excluding ordinary long-form content.
+const SCREENSHOT_IMAGE_HEAVY_MAX_CHARS: usize = SCREENSHOT_THIN_CHARS * 4;
+
 /// Whether `page` is thin or image-heavy enough that a screenshot is worth its
 /// cost, decided ENTIRELY from content already fetched — no second render just
 /// to decide, and no second LLM call either way (see `describe_llm`, which is
@@ -4439,6 +4617,9 @@ fn wants_screenshot(page: &Page) -> bool {
     let visible = page.describable_text().trim().chars().count();
     if visible <= SCREENSHOT_THIN_CHARS {
         return true;
+    }
+    if visible > SCREENSHOT_IMAGE_HEAVY_MAX_CHARS {
+        return false;
     }
     let img_count = page.html.matches("<img").count();
     img_count > 0 && visible < img_count.saturating_mul(SCREENSHOT_CHARS_PER_IMG)
@@ -8339,6 +8520,49 @@ mod tests {
         }
     }
 
+    /// The same guarantee as `redistribution_findings_are_never_published`,
+    /// pinned separately for `recheck_update` — the newer of the two `atlasctl`
+    /// callers, and the one a future edit is more likely to touch without
+    /// remembering the older pin exists at all.
+    #[test]
+    fn recheck_update_never_publishes_local_only_fields() {
+        let src = include_str!("main.rs");
+        let production = src
+            .split("\nmod tests")
+            .next()
+            .expect("source must have a pre-test region");
+        let at = production
+            .find("fn recheck_update(")
+            .expect("recheck_update must exist");
+        let end = production[at..]
+            .find("\nfn ")
+            .map(|e| at + e)
+            .unwrap_or(production.len());
+        let body = strip_comments(&production[at..end]);
+        for needle in [
+            "--landing=",
+            "--adult-sections=",
+            "--volatility=",
+            "--verified=",
+        ] {
+            assert!(body.contains(needle), "{needle:?} must be published");
+        }
+        for banned in [
+            "redistribution",
+            "distinct_rightsholders",
+            "claims_own_authorship",
+            "distributes_complete_works",
+            "release_markers",
+            "recognized_commercial_work",
+            "illegal",
+        ] {
+            assert!(
+                !body.contains(banned),
+                "{banned:?} must never be sent to atlasctl from the recheck path either"
+            );
+        }
+    }
+
     /// An automated taxonomy must number itself from 1; 0 is reserved for a
     /// person classifying by hand, and a classifier that claimed it would sweep up
     /// judgements it never made.
@@ -8634,6 +8858,91 @@ mod tests {
             screenshot: None,
         };
         assert!(wants_screenshot(&heavy));
+    }
+
+    fn assessment(landing: Landing, has_adult_sections: bool) -> Assessment {
+        Assessment {
+            landing,
+            has_adult_sections,
+            volatility: Volatility::Static,
+            illegal: false,
+            redistribution: RedistributionSigns::default(),
+        }
+    }
+
+    /// The gate the recheck sweep's auto-publish path depends on: any change to
+    /// `landing` or `has_adult_sections`, in EITHER direction, must be reported
+    /// as a change — this is what routes an auto-correction to
+    /// `FlaggedOnRecheck` instead of publishing it unreviewed. Both fields are
+    /// exercised independently (a real page could turn adult without ever
+    /// touching `has_adult_sections`, or vice versa), and a same-value case
+    /// proves the function is not simply always `true`.
+    #[test]
+    fn landing_would_change_catches_a_flip_in_either_field_either_direction() {
+        assert!(landing_would_change(
+            false,
+            false,
+            &assessment(Landing::Adult, false)
+        ));
+        assert!(landing_would_change(
+            true,
+            false,
+            &assessment(Landing::General, false)
+        ));
+        assert!(landing_would_change(
+            false,
+            false,
+            &assessment(Landing::General, true)
+        ));
+        assert!(landing_would_change(
+            false,
+            true,
+            &assessment(Landing::General, false)
+        ));
+        assert!(!landing_would_change(
+            false,
+            false,
+            &assessment(Landing::General, false)
+        ));
+        assert!(!landing_would_change(
+            true,
+            true,
+            &assessment(Landing::Adult, true)
+        ));
+    }
+
+    /// The chrome-vs-content mismatch: `visible` is measured from `page.text`
+    /// (the CONTENT REGION render.js extracts), but `img_count` is counted over
+    /// `page.html` (the WHOLE document). A long, ordinary article whose chrome
+    /// happens to carry a realistic number of unrelated icons (logo, nav,
+    /// social-share row, footer sitemap) must not trigger a screenshot merely
+    /// because those icons outnumber `visible / SCREENSHOT_CHARS_PER_IMG` — the
+    /// page is not remotely image-heavy, the density check is just comparing
+    /// the wrong two numbers. `SCREENSHOT_IMAGE_HEAVY_MAX_CHARS` is what stops
+    /// it: 3000 chars of real content is well past that ceiling, so the density
+    /// check never runs at all, regardless of chrome image count.
+    #[test]
+    fn wants_screenshot_does_not_fire_on_a_long_article_with_chrome_icons() {
+        let article = "word ".repeat(600); // ~3000 chars of real content
+        let html = format!(
+            "<html><body><nav>{}</nav><article>{article}</article><footer>{}\
+             </footer></body></html>",
+            "<img src=icon.svg>".repeat(15),
+            "<img src=social.svg>".repeat(10),
+        );
+        let page = Page {
+            html,
+            text: article,
+            extra_pages: Vec::new(),
+            extra_texts: Vec::new(),
+            truncated: false,
+            rendered: true,
+            screenshot: None,
+        };
+        assert!(
+            !wants_screenshot(&page),
+            "25 chrome icons on a 3000-char article must not read as image-heavy"
+        );
     }
 
     /// An ordinary content page — plenty of text, few or no images relative to
@@ -9519,6 +9828,45 @@ mod tests {
         assert!(
             !body[guard..else_if].contains("record_thin"),
             "the fallback branch (guard..else-if) must not call record_thin at all"
+        );
+    }
+
+    /// The companion mistake to the fallback fix above, and an easy one to make:
+    /// an external (non-Freenet) locator never touches `render_page` in ANY run,
+    /// so static fetch is not a degraded fallback for it — it is the permanent,
+    /// sole acquisition method. `rendered` must be `true` here despite no render
+    /// ever being attempted, or a repeated identical thin result from a
+    /// permanently-thin external URL (a paywall stub, a JS-only SPA shell) never
+    /// retires and re-burns a budgeted attempt on every run forever — the exact
+    /// failure mode this field exists to close, just for a different locator
+    /// class. Source-scraped for the same reason as its neighbour: exercising
+    /// the branch needs a live external fetch.
+    #[test]
+    fn an_external_fetch_counts_as_rendered_for_retirement_purposes() {
+        let src = include_str!("main.rs");
+        let production = src
+            .split("\nmod tests")
+            .next()
+            .expect("source must have a pre-test region");
+        assert!(
+            !production.contains("fn an_external_fetch_counts_as_rendered"),
+            "the scan region must exclude the test module, or the pin matches itself"
+        );
+        let body = strip_comments(production);
+        // Anchor on the external branch's distinguishing call, not on
+        // "rendered: true" alone -- that literal also appears at the genuine
+        // -render construction site, so matching it without the anchor would
+        // pass whichever site happens to come first in the file.
+        let ssrf = body
+            .find("ssrf_check(loc)?;")
+            .expect("the external-fetch branch must SSRF-check the raw locator");
+        let next_fn = body[ssrf..]
+            .find("\nfn ")
+            .map(|e| ssrf + e)
+            .unwrap_or(body.len());
+        assert!(
+            body[ssrf..next_fn].contains("rendered: true"),
+            "the external-fetch Page construction must set rendered: true, not false"
         );
     }
 
