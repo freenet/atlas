@@ -85,32 +85,37 @@ pub const MAX_VOCAB: usize = 16;
 /// belongs in a typed field instead. `ext` is for metadata the network only
 /// needs to carry.
 ///
-/// SIZED BY MEASUREMENT, NOT BY TASTE, and the budget is now FULLY ALLOCATED.
-/// `max_entries_worst_case_fits_the_node_state_cap` prints the arithmetic: the
-/// worst legal record is 2609 B, so `MAX_ENTRIES` of them is 49.76 MiB of the
-/// 50 MiB cap, leaving about 12 B per entry spare. A first attempt at 16 keys x
-/// (32 B key + 256 B value) measured 7151 B per entry, i.e. 136 MiB against
-/// that cap.
+/// SIZED BY MEASUREMENT, NOT BY TASTE.
+/// `max_entries_worst_case_fits_the_node_state_cap` prints the arithmetic. The
+/// worst legal STATE entry is 2594 B including its map key, so `MAX_ENTRIES` of
+/// them is 49.48 MiB of the 50 MiB cap, leaving about 27 B per entry.
 ///
-/// Hence a TOTAL-bytes bound rather than per-key maxima. Bounding a count and a
-/// per-item size independently bounds their PRODUCT, which is what exploded;
-/// bounding the sum bounds the thing that actually has to fit, and lets the
-/// budget be spent as one long value or several short ones.
+/// Two measurements had to be corrected to get here, and both are worth knowing:
 ///
-/// READ THIS BEFORE ADDING A FIELD. Twelve bytes of slack is not an oversight
-/// and does not want "fixing": this 96 B IS the pre-allocated growth space, and
-/// future per-entry metadata is meant to land inside it rather than as a new
+/// 1. A first attempt at 16 keys x (32 B key + 256 B value) measured 7151 B per
+///    entry, i.e. 136 MiB against a 50 MiB cap. Bounding a count and a per-item
+///    size independently bounds their PRODUCT. Hence a TOTAL-bytes bound, which
+///    also lets the budget be spent as one long value or several short ones.
+/// 2. The test then measured a bare `SignedRecord`, but what the node caps is
+///    the serialized `IndexState`, whose `records` map holds a SECOND copy of
+///    every subject id as its key. That is ~14 B per entry, which at the time
+///    was larger than the entire apparent headroom: the honest number was
+///    50.11 MiB, i.e. already OVER. This budget was cut from 96 B to 64 B to pay
+///    for it.
+///
+/// READ THIS BEFORE ADDING A FIELD. This 64 B IS the pre-allocated growth space,
+/// and future per-entry metadata is meant to land inside it rather than as a new
 /// typed field. Growing here costs nothing, since no Rust type changes and so
 /// the contract does not re-key. Adding a new typed field, or raising any bound
-/// including this one, now requires trading it against another bound or against
-/// `MAX_ENTRIES` — and re-running that test, which is the only thing that will
+/// including this one, means trading it against another bound or against
+/// `MAX_ENTRIES` -- and re-running that test, which is the only thing that will
 /// tell you whether you can afford it.
 pub const MAX_EXT_KEYS: usize = 8;
 /// Max length of a single `ext` key. A sanity bound; [`MAX_EXT_TOTAL_BYTES`] is
 /// the one that binds.
 pub const MAX_EXT_KEY: usize = 32;
 /// Max SUM of `key.len() + value.len()` across every `ext` pair.
-pub const MAX_EXT_TOTAL_BYTES: usize = 96;
+pub const MAX_EXT_TOTAL_BYTES: usize = 64;
 
 /// Canonical CBOR bytes used as the signing payload for any signed struct.
 /// Signing and verification must both go through this so the bytes match.
@@ -168,9 +173,12 @@ mod bound_tests {
         let key = SigningKey::from_bytes(&[7u8; 32]);
         let id = "EqJ5YpEEV3XLqEvKWLQHFhGAac2qXzSUoE6k2zbdnXBr";
 
-        let worst = |loc: Locator| -> usize {
+        let worst_rec = |loc: Locator, sid: SubjectId| -> SignedRecord {
             let e = IndexEntry {
-                subject_id: SubjectId::parse(&bs58::encode([9u8; 9]).into_string()).unwrap(),
+                // 0xFF.. encodes to the LONGEST base58 form (13 chars); [9u8;9]
+                // gives 12, and `SubjectId::random()` produces 13 most of the
+                // time, so the short form understated the common case.
+                subject_id: sid,
                 version: u64::MAX,
                 // Vocabulary fields at their BOUND, not at the length of the
                 // values in use today. `Kind`/`landing`/`volatility`/`status`
@@ -200,30 +208,54 @@ mod bound_tests {
                     last_verified_at: u64::MAX,
                     status: VerifyStatus::new("s".repeat(MAX_VOCAB)),
                 }),
-                // The largest LEGAL ext: the full key count, with the whole
-                // byte budget spent. Split evenly so both bounds bind at once.
-                ext: Some(
-                    (0..MAX_EXT_KEYS)
-                        .map(|i| {
-                            let per = MAX_EXT_TOTAL_BYTES / MAX_EXT_KEYS;
-                            (format!("{i:0>2}"), "v".repeat(per - 2))
-                        })
-                        .collect(),
-                ),
+                // The largest-ENCODING legal ext, which is not the same as the
+                // most evenly split one. A CBOR text string of 24 bytes or more
+                // needs a 2-byte head instead of 1, so spending the same budget
+                // on a few LONG values encodes larger than spreading it thin.
+                // Still exactly `MAX_EXT_KEYS` pairs and exactly
+                // `MAX_EXT_TOTAL_BYTES` of content.
+                ext: Some({
+                    let long = MAX_EXT_TOTAL_BYTES / 4;
+                    let mut m = std::collections::BTreeMap::new();
+                    for (i, n) in [long, long, long, MAX_EXT_TOTAL_BYTES - 3 * long - 4]
+                        .into_iter()
+                        .enumerate()
+                    {
+                        m.insert(format!("{i}"), "v".repeat(n - 1));
+                    }
+                    for i in 4..MAX_EXT_KEYS {
+                        m.insert(format!("{i}"), String::new());
+                    }
+                    m
+                }),
             };
             let body = RecordBody::Live(e);
             // Must be VALID, or the bound is not actually reachable and the test
             // would be measuring something the contract would reject anyway.
             body.check_structure()
                 .expect("the worst case must be a valid entry");
-            let rec = SignedRecord {
+            SignedRecord {
                 sig: sign(&body, &key),
                 by: key.verifying_key(),
                 body,
-            };
+            }
+        };
+        let worst = |loc: Locator| -> usize {
+            let sid = SubjectId::parse(&bs58::encode([255u8; 9]).into_string()).unwrap();
             let mut buf = Vec::new();
-            ciborium::ser::into_writer(&rec, &mut buf).unwrap();
+            ciborium::ser::into_writer(&worst_rec(loc, sid), &mut buf).unwrap();
             buf.len()
+        };
+        // The binding locator, reused for the state measurement below.
+        let worst_signed = |sid: SubjectId| -> SignedRecord {
+            worst_rec(
+                Locator::AppResource {
+                    app: "a".repeat(MAX_APP_SLUG),
+                    resource: "b".repeat(MAX_RESOURCE),
+                    path: "/p".repeat(MAX_LOCATOR_PATH / 2),
+                },
+                sid,
+            )
         };
 
         let cases = [
@@ -233,24 +265,55 @@ mod bound_tests {
             Locator::AppResource {
                 app: "a".repeat(MAX_APP_SLUG),
                 resource: "b".repeat(MAX_RESOURCE),
-                path: "/p".repeat(MAX_LOCATOR_PATH / 2 - 1),
+                path: "/p".repeat(MAX_LOCATOR_PATH / 2),
             },
             Locator::Freenet {
                 contract_id: id.to_string(),
-                path: "/p".repeat(MAX_LOCATOR_PATH / 2 - 1),
+                path: "/p".repeat(MAX_LOCATOR_PATH / 2),
             },
         ];
         let worst_record = cases.into_iter().map(worst).max().unwrap();
-        let total = worst_record * MAX_ENTRIES;
+
+        // Measure the STATE, not a bare record. What the node caps is the
+        // serialized `IndexState`, whose `records: BTreeMap<SubjectId, _>` holds
+        // a SECOND copy of every subject id as the map key -- ~14 B per entry
+        // that a record-only measurement misses entirely. At 6 B of apparent
+        // headroom that omission is larger than the margin, so the old
+        // arithmetic said "fits" for an index that does not.
+        //
+        // Measured marginally rather than by building 20 000 records: the
+        // difference between a two-record and a one-record state is exactly what
+        // one more entry costs, map key and all, and it takes two signatures
+        // instead of twenty thousand.
+        let state_of = |n: usize| -> usize {
+            let mut st = IndexState::default();
+            for i in 0..n {
+                let mut raw = [255u8; 9];
+                raw[0] = i as u8; // distinct ids, still 13-char worst case
+                let sid = SubjectId::parse(&bs58::encode(raw).into_string()).unwrap();
+                st.records.insert(sid.clone(), worst_signed(sid));
+            }
+            let mut buf = Vec::new();
+            ciborium::ser::into_writer(&st, &mut buf).unwrap();
+            buf.len()
+        };
+        let one = state_of(1);
+        let marginal = state_of(2) - one;
+        // The map header widens as the count grows (1 -> 3 bytes by 20 000);
+        // add the few bytes rather than pretend the marginal cost is the whole
+        // story.
+        let total = one + marginal * (MAX_ENTRIES - 1) + 4;
+
         // Report the headroom, not just pass/fail. Sizing a new per-entry field
         // needs a NUMBER, and a test that only speaks up on overflow forces the
-        // next person to guess and then discover the overflow — which is how the
-        // first version of `ext` came to be 48x its budget. Run with
+        // next person to guess and then discover the overflow -- which is how
+        // the first version of `ext` came to be 48x its budget. Run with
         // `--nocapture` to read it.
         let headroom = NODE_STATE_CAP.saturating_sub(total);
         println!(
-            "worst-case record {worst_record} B x MAX_ENTRIES {MAX_ENTRIES} = {:.2} MiB \
-             of the {} MiB cap; headroom {:.2} MiB = {} B per entry",
+            "worst record {worst_record} B; worst STATE entry {marginal} B \
+             (incl. map key) x MAX_ENTRIES {MAX_ENTRIES} = {:.2} MiB of the {} MiB \
+             cap; headroom {:.2} MiB = {} B per entry",
             total as f64 / 1048576.0,
             NODE_STATE_CAP / 1024 / 1024,
             headroom as f64 / 1048576.0,
@@ -258,8 +321,8 @@ mod bound_tests {
         );
         assert!(
             total < NODE_STATE_CAP,
-            "MAX_ENTRIES ({MAX_ENTRIES}) x worst-case record ({worst_record} B) = \
-             {:.1} MiB, over the {} MiB node cap — lower a per-entry bound or \
+            "MAX_ENTRIES ({MAX_ENTRIES}) x worst-case STATE entry ({marginal} B) = \
+             {:.1} MiB, over the {} MiB node cap -- lower a per-entry bound or \
              MAX_ENTRIES",
             total as f64 / 1048576.0,
             NODE_STATE_CAP / 1024 / 1024

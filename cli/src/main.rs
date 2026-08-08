@@ -14,7 +14,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use atlas_common::{
     generate_key, sign, AppRecord, AppRegistry, AppRegistryBody, Audience, Classification,
     IndexDelta, IndexEntry, IndexParams, IndexState, KeyAuth, KeyAuthBody, Kind, Locator,
-    RecordBody, SignedRecord, SubjectId, Tombstone, Volatility,
+    RecordBody, SignedRecord, SubjectId, Tombstone, Verification, VerifyStatus, Volatility,
 };
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use ed25519_dalek::{Signature, Signer, SigningKey};
@@ -139,6 +139,25 @@ impl ClassArgs {
     }
 }
 
+/// `--verified`, as a CLI spelling. See [`LandingArg`] for why it is mirrored
+/// rather than deriving `ValueEnum` on the schema type directly.
+#[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+enum VerifyStatusArg {
+    Live,
+    Unreachable,
+    Changed,
+}
+
+impl From<VerifyStatusArg> for VerifyStatus {
+    fn from(v: VerifyStatusArg) -> Self {
+        match v {
+            VerifyStatusArg::Live => VerifyStatus::new(VerifyStatus::LIVE),
+            VerifyStatusArg::Unreachable => VerifyStatus::new(VerifyStatus::UNREACHABLE),
+            VerifyStatusArg::Changed => VerifyStatus::new(VerifyStatus::CHANGED),
+        }
+    }
+}
+
 /// The per-field edits `update` applies. Every field is optional, and an unset
 /// one is CARRIED FORWARD from the current entry rather than reset to a default.
 #[derive(Args, Clone, Debug, Default)]
@@ -159,6 +178,17 @@ struct EntryEdits {
     /// and a bare flag cannot express that.
     #[arg(long)]
     featured: Option<bool>,
+    /// Stamps `verified` directly, timestamped `now`. FOR THE CRAWLER'S
+    /// re-verification sweep, not for a human: a person asserting `live`
+    /// without having actually re-fetched the resource is exactly the false
+    /// confidence this field exists to prevent. Takes priority over the
+    /// description-changed-clears-`verified` rule below, since a caller passing
+    /// this explicitly just DID the check the field is meant to record — most
+    /// often alongside a `title`/`snippet` correction from the same re-check,
+    /// where the ordinary rule would otherwise immediately clear what this flag
+    /// just set.
+    #[arg(long, value_enum)]
+    verified: Option<VerifyStatusArg>,
     #[command(flatten)]
     class: ClassArgs,
 }
@@ -169,6 +199,7 @@ impl EntryEdits {
             && self.snippet.is_none()
             && self.tags.is_none()
             && self.featured.is_none()
+            && self.verified.is_none()
             && self.class.is_empty()
     }
 }
@@ -1195,7 +1226,12 @@ fn next_entry(
         // typo fix.
         added_at: current.added_at,
         class: next_class(current.class.as_ref(), &edits.class, now)?,
-        verified: if description_changed {
+        verified: if let Some(status) = edits.verified {
+            Some(Verification {
+                last_verified_at: now,
+                status: status.into(),
+            })
+        } else if description_changed {
             None
         } else {
             current.verified.clone()
@@ -1267,6 +1303,23 @@ async fn update(
     record
         .verify_sig()
         .map_err(|e| anyhow!("refusing to build on the record for {subject}: {e}"))?;
+    // The signature covers the BODY, not the map key it was filed under, so a
+    // valid signature does not establish that this record is the subject we
+    // asked for. Without this, a node serving a genuine record for subject A
+    // under key B makes `update --subject B` sign and publish a new version of
+    // A: `next_entry` carries `current.subject_id` forward, so the edit lands on
+    // a subject the curator never named, while the CLI reports success for B.
+    //
+    // `IndexState::verify` makes exactly this check (`common/src/state.rs`), and
+    // `preflight_generation` repeats it on the migration path — but neither runs
+    // here, because `fetch_state` deliberately does not verify.
+    if record.body.subject_id() != &subject_id {
+        bail!(
+            "the node served a record for subject {} under the key for {subject}; \
+             refusing to edit a subject that was not named",
+            record.body.subject_id().as_str()
+        );
+    }
     let RecordBody::Live(current) = &record.body else {
         bail!(
             "subject {subject} is tombstoned — a takedown is final for that subject \
@@ -1339,21 +1392,21 @@ async fn show(cli: &Cli, dir: &Path, subscribe: bool, json: bool) -> Result<()> 
                 serde_json::json!({
                     "subject_id": e.subject_id.as_str(),
                     "version": e.version,
-                    "kind": format!("{:?}", e.kind),
+                    "kind": e.kind.as_str(),
                     "title": e.title,
                     "locator": e.locator.to_uri(),
                     "featured": e.featured,
                     "added_at": e.added_at,
                     "class": e.class.as_ref().map(|c| serde_json::json!({
-                        "landing": format!("{:?}", c.landing),
+                        "landing": c.landing.as_str(),
                         "has_adult_sections": c.has_adult_sections,
-                        "volatility": format!("{:?}", c.volatility),
+                        "volatility": c.volatility.as_str(),
                         "classifier": c.classifier,
                         "classified_at": c.classified_at,
                     })),
                     "verified": e.verified.as_ref().map(|v| serde_json::json!({
                         "last_verified_at": v.last_verified_at,
-                        "status": format!("{:?}", v.status),
+                        "status": v.status.as_str(),
                     })),
                     "ext": e.ext,
                 })
@@ -1381,9 +1434,9 @@ async fn show(cli: &Cli, dir: &Path, subscribe: bool, json: bool) -> Result<()> 
             }
         };
         println!(
-            "{star}{}  [{:?}]  {}\n     {}\n     {}{note}\n{}",
+            "{star}{}  [{}]  {}\n     {}\n     {}{note}\n{}",
             e.subject_id.as_str(),
-            e.kind,
+            e.kind.as_str(),
             e.title,
             e.snippet,
             e.locator.to_uri(),
@@ -2556,6 +2609,59 @@ mod tests {
             .verified,
             cur.verified
         );
+    }
+
+    /// `--verified` is for the crawler's re-verification sweep: it stamps the
+    /// exact status given, at `now`, regardless of what was there before.
+    #[test]
+    fn verified_flag_stamps_the_given_status_at_now() {
+        let cur = IndexEntry {
+            verified: None,
+            ..entry(1)
+        };
+        let out = next_entry(
+            &cur,
+            1,
+            &EntryEdits {
+                verified: Some(VerifyStatusArg::Unreachable),
+                ..Default::default()
+            },
+            555,
+        )
+        .unwrap();
+        let v = out.verified.expect("verified must be set");
+        assert_eq!(v.status, VerifyStatus::new(VerifyStatus::UNREACHABLE));
+        assert_eq!(v.last_verified_at, 555);
+    }
+
+    /// `--verified` alongside a description correction (the crawler's own
+    /// "content changed, re-describe, and stamp the re-check" case) must WIN
+    /// over the ordinary "a description change clears verified" rule -- the
+    /// flag being passed at all means the caller just did the verification the
+    /// field records, and clearing it back to `None` in the same call would
+    /// make the crawler's re-verification pass unable to ever mark anything
+    /// `live` again.
+    #[test]
+    fn verified_flag_survives_a_simultaneous_description_change() {
+        let cur = IndexEntry {
+            verified: Some(a_verification()),
+            title: "Old Title".to_string(),
+            ..entry(1)
+        };
+        let out = next_entry(
+            &cur,
+            1,
+            &EntryEdits {
+                title: Some("New Title".to_string()),
+                verified: Some(VerifyStatusArg::Live),
+                ..Default::default()
+            },
+            999,
+        )
+        .unwrap();
+        let v = out.verified.expect("verified must be set, not cleared");
+        assert_eq!(v.status, VerifyStatus::new(VerifyStatus::LIVE));
+        assert_eq!(v.last_verified_at, 999);
     }
 
     #[test]

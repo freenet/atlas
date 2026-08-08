@@ -76,6 +76,23 @@ pub struct IndexSummary {
     /// missed sync that the full-state anti-entropy path still heals.
     #[serde(default)]
     pub apps_fingerprint: [u8; 8],
+    /// First 8 bytes of each record's signature. Same reasoning as
+    /// `apps_fingerprint`, one level down: `atlasctl update` is the first write
+    /// path able to mint two DIFFERENT bodies at the SAME version for one
+    /// subject (a lost reply retried against a node that has not caught up
+    /// yet), and without a per-record fingerprint here two such bodies
+    /// summarise identically, so `plan_fanout_send` skips them and they never
+    /// exchange -- the same permanent divergence `apps_fingerprint` exists to
+    /// prevent, just per-record instead of per-registry.
+    ///
+    /// A `BTreeMap` alongside `versions` rather than folding the fingerprint
+    /// into the version map's value, so an old summary decoded under this type
+    /// (before this field existed) still deserialises: a missing map defaults
+    /// to empty, and an empty map at any subject behaves like `apps_fingerprint`
+    /// did before the app registry had one -- no fingerprint to compare against,
+    /// so `delta()` falls back to the version-only check for that subject.
+    #[serde(default)]
+    pub record_fingerprints: BTreeMap<SubjectId, [u8; 8]>,
 }
 
 /// The diff a peer needs to catch up: records newer than its summary, and a
@@ -296,6 +313,15 @@ impl IndexState {
                 fp.copy_from_slice(&a.sig.to_bytes()[..8]);
                 fp
             }),
+            record_fingerprints: self
+                .records
+                .iter()
+                .map(|(sid, rec)| {
+                    let mut fp = [0u8; 8];
+                    fp.copy_from_slice(&rec.sig.to_bytes()[..8]);
+                    (sid.clone(), fp)
+                })
+                .collect(),
         }
     }
 
@@ -325,14 +351,24 @@ impl IndexState {
             }
             _ => None,
         };
+        // Same shape as the `apps` case above: strictly newer, OR equal version
+        // with a fingerprint mismatch. `is_none_or` on `versions` already covers
+        // "peer doesn't have this subject at all" (no version to compare against
+        // -> send it); the fingerprint check only fires when a version IS present
+        // and matches, which is exactly the equal-version-different-body case.
         let records = self
             .records
             .iter()
             .filter(|(sid, rec)| {
-                summary
-                    .versions
-                    .get(*sid)
-                    .is_none_or(|v| rec.body.version() > *v)
+                summary.versions.get(*sid).is_none_or(|v| {
+                    let newer = rec.body.version() > *v;
+                    let equal_but_diverged = rec.body.version() == *v
+                        && summary
+                            .record_fingerprints
+                            .get(*sid)
+                            .is_some_and(|fp| rec.sig.to_bytes()[..8] != *fp);
+                    newer || equal_but_diverged
+                })
             })
             .map(|(_, rec)| rec.clone())
             .collect();
@@ -950,6 +986,99 @@ mod tests {
         assert!(
             a.delta(&sa).is_logically_empty(),
             "an identical peer must be sent a logically-empty delta"
+        );
+    }
+
+    /// The record-level twin of `two_registries_at_equal_version_converge_and_can_still_sync`.
+    /// `atlasctl update` is what makes this reachable now (a lost-reply retry can
+    /// mint a second, differently-worded version-N body for one subject), and
+    /// without `record_fingerprints` the two would summarise identically and
+    /// never exchange -- the exact permanent divergence this field exists to
+    /// close, one level down from the app registry.
+    #[test]
+    fn two_records_at_equal_version_converge_and_can_still_sync() {
+        let (root, online) = (key(), key());
+        let s = sid(9);
+        let mut a = IndexState::initialized(key_auth(&root, &online, 1));
+        a.records.insert(
+            s.clone(),
+            signed(RecordBody::Live(entry(&s, 7, "Title A")), &online),
+        );
+        let mut b = IndexState::initialized(key_auth(&root, &online, 1));
+        b.records.insert(
+            s.clone(),
+            signed(RecordBody::Live(entry(&s, 7, "Title B")), &online),
+        );
+
+        let mut ab = a.clone();
+        ab.merge(&b);
+        let mut ba = b.clone();
+        ba.merge(&a);
+        assert_eq!(
+            ab.records, ba.records,
+            "equal-version records must converge to the same winner"
+        );
+
+        let (sa, sb) = (a.summarize(), b.summarize());
+        assert_ne!(
+            sa.record_fingerprints.get(&s),
+            sb.record_fingerprints.get(&s),
+            "equal-version different-body summaries must not be byte-identical"
+        );
+        assert!(
+            a.delta(&sb)
+                .records
+                .iter()
+                .any(|r| r.body.subject_id() == &s),
+            "an equal-version peer with a different body must receive the record"
+        );
+        assert!(
+            a.delta(&sa).is_logically_empty(),
+            "an identical peer must be sent a logically-empty delta"
+        );
+    }
+
+    /// A summary encoded before `record_fingerprints` existed must still decode
+    /// (empty map, per `#[serde(default)]`), and a missing fingerprint for a
+    /// subject must fall back to the version-only check rather than panic or
+    /// force every record into every delta.
+    #[test]
+    fn a_summary_without_record_fingerprints_still_decodes_and_deltas_by_version() {
+        let (root, online) = (key(), key());
+        let s = sid(4);
+        let mut a = IndexState::initialized(key_auth(&root, &online, 1));
+        a.records.insert(
+            s.clone(),
+            signed(RecordBody::Live(entry(&s, 3, "Title")), &online),
+        );
+
+        // The legacy encoding: no `record_fingerprints` key at all.
+        #[derive(Serialize)]
+        struct LegacySummary {
+            key_auth_version: u64,
+            versions: BTreeMap<SubjectId, u64>,
+            apps_version: u64,
+            apps_fingerprint: [u8; 8],
+        }
+        let legacy = LegacySummary {
+            key_auth_version: 1,
+            versions: [(s.clone(), 3)].into_iter().collect(),
+            apps_version: 0,
+            apps_fingerprint: [0u8; 8],
+        };
+        let mut buf = Vec::new();
+        ciborium::ser::into_writer(&legacy, &mut buf).unwrap();
+        let decoded: IndexSummary = ciborium::de::from_reader(&buf[..])
+            .expect("a summary without record_fingerprints must still decode");
+        assert!(decoded.record_fingerprints.is_empty());
+
+        // Same version, no fingerprint on file for it -> version-only check says
+        // "already have it", so nothing is sent. This is the correct fallback: a
+        // legacy peer simply doesn't get the equal-version-divergence protection
+        // until IT also upgrades, same as `apps_fingerprint`'s original rollout.
+        assert!(
+            a.delta(&decoded).is_logically_empty(),
+            "a legacy summary at the same version must not force a resend"
         );
     }
 

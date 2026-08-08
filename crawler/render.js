@@ -324,9 +324,23 @@ async function pickFrame(page) {
     const text = await contentText(frame);
 
     if (shotPath) {
-      // Screenshot the whole page viewport: the gateway shell is a thin wrapper
-      // whose iframe fills the viewport, so this captures the rendered site.
-      await page.screenshot({ path: shotPath, fullPage: false }).catch(() => {});
+      // Screenshot the VIEWPORT only (fullPage: false), not the whole scrollable
+      // page: this is deliberately what the visitor sees on arrival without
+      // scrolling, because that is the exact thing Atlas's `landing` field is
+      // defined as ("what a visitor sees IMMEDIATELY on following this
+      // locator" -- see Classification::landing). A full-page capture would
+      // measure something the classifier is not supposed to be judging.
+      //
+      // JPEG, not PNG: OpenAI's vision pricing is resolution-based (tile count),
+      // not file-size based -- a fixed 1200x900 viewport costs the same input
+      // tokens regardless of format or quality -- so there is nothing to lose by
+      // compressing. Measured on real pages: PNG ~157 KB, JPEG q70 ~33-90 KB.
+      // Roughly a third to half the base64 payload per call for identical
+      // classification cost, which matters at the volume of a periodic
+      // re-verification sweep.
+      await page
+        .screenshot({ path: shotPath, fullPage: false, type: 'jpeg', quality: 70 })
+        .catch(() => {});
     }
 
     // --enumerate: having settled page 1, walk the rest by hash. Each step is a
