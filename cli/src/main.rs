@@ -679,10 +679,15 @@ async fn migrate(cli: &Cli, dir: &Path, dry_run: bool, allow_missing: &[String])
 
     if dry_run {
         if probe_errors > 0 {
+            // Deliberately does NOT say "unreachable": probe_errors also counts
+            // per-generation and folded-state preflight failures, so telling an
+            // operator whose state fails contract validation to "fix
+            // connectivity" sends them after the wrong problem entirely.
             bail!(
-                "[dry-run] {probe_errors} legacy generation(s) were unreachable — a \
-                 real migrate would abort on these; fix connectivity and retry so \
-                 their entries are not left stranded"
+                "[dry-run] {probe_errors} legacy generation(s) could not be resolved — \
+                 either unreachable, or their state failed validation. A real \
+                 migrate would abort on these; the per-generation output above \
+                 says which, and re-running is safe once it is fixed"
             );
         }
         if !unacknowledged.is_empty() {
