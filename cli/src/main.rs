@@ -21,7 +21,10 @@ use ed25519_dalek::{Signature, Signer, SigningKey};
 use serde::Serialize;
 
 use api::NodeClient;
-use freenet_stdlib::prelude::ContractInstanceId;
+use freenet_migrate::{
+    migrate_contract, FoldAllAck, Outcome, ProbeIo, ProbeStateOps, SelectionPolicy,
+};
+use freenet_stdlib::prelude::{ContractInstanceId, Parameters};
 
 const CONTRACT_WASM: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/atlas_index_contract.wasm"));
 const DEFAULT_URL: &str = "ws://127.0.0.1:7509/v1/contract/command?encodingProtocol=native";
@@ -489,7 +492,7 @@ async fn main() -> Result<()> {
             let key = NodeClient::contract_key(CONTRACT_WASM, &params);
             println!("current: {}", key.id());
             for (i, k) in migration::legacy_index_keys(&params).iter().enumerate() {
-                println!("legacy[{i}]: {}", k.id());
+                println!("legacy[{i}]: {k}");
             }
             Ok(())
         }
@@ -542,133 +545,101 @@ async fn push_state(dir: &Path, slug: &str, from: &str, to: &str) -> Result<()> 
 /// Carry the curated index forward after a rebuild re-keyed the contract.
 ///
 /// The index address is `hash(wasm, params)`; a stdlib/toolchain bump that
-/// changes the WASM moves it. This GETs EVERY legacy (pre-rebuild) address and
-/// PUT-merges each non-empty state into the current address, so no generation's
-/// entries are stranded. The contract merges per-subject by version
-/// (tombstone-aware), so merging all generations is idempotent and order-
-/// independent — re-running is safe, and a tombstone-only generation still
-/// contributes its takedowns without resurrecting anything.
+/// changes the WASM moves it. This drives `freenet-migrate`'s backward-probe
+/// decision driver over EVERY legacy (pre-rebuild) address — newest-first, all
+/// generations, `SelectionPolicy::FoldAll` — folds every non-empty state with
+/// the contract's own `IndexState::merge`, and PUT-merges the folded result
+/// into the current address, so no generation's entries are stranded. The merge
+/// is per-subject by version (tombstone-aware), so the fold is idempotent and
+/// order-independent — re-running is safe, and a tombstone-only generation
+/// still contributes its takedowns without resurrecting anything.
 ///
 /// A legacy GET that *errors* (a dead-ended / timed-out cross-node probe) is NOT
 /// treated as an empty state: it aborts, so the operator never rebuilds the UI
-/// onto an empty index while entries still live at the old address.
+/// onto an empty index while entries still live at the old address. (This is a
+/// deliberate deviation from the driver's RECOMMENDED timeout-is-a-miss
+/// semantics, expressed through `ProbeIo`'s abort channel — see
+/// `MigrateProbeIo`.)
 async fn migrate(cli: &Cli, dir: &Path, dry_run: bool, allow_missing: &[String]) -> Result<()> {
     let params = params_bytes(dir, &cli.slug)?;
     let current_key = NodeClient::contract_key(CONTRACT_WASM, &params);
-    let legacy_keys = migration::legacy_index_keys(&params);
-    if legacy_keys.is_empty() {
+    if migration::CONTRACT_LINEAGE.is_empty() {
         bail!("no legacy code hashes registered — nothing to migrate from");
     }
     println!("current index: {}", current_key.id());
 
-    let mut client = NodeClient::connect(&cli.node).await?;
+    let index_params =
+        IndexParams::from_bytes(&params).ok_or_else(|| anyhow!("could not parse index params"))?;
+    let client = NodeClient::connect(&cli.node).await?;
+    let mut io = MigrateProbeIo::new(client, dry_run, index_params);
+    let outcome = drive_index_migration(&mut io, &params).await?;
+    let MigrateProbeIo {
+        mut client,
+        index_params,
+        missing,
+        mut probe_errors,
+        hits: merged,
+        ..
+    } = io;
 
-    // Carry EVERY legacy generation forward, not just the "biggest" one. The
-    // contract merges per-subject by version (tombstone-aware), so PUT-merging
-    // all of them is idempotent and order-independent: a generation holding only
-    // tombstones still contributes its takedowns, and a stale generation cannot
-    // resurrect a subject a newer one deleted. No count-based selection or
-    // early-return — every non-empty generation participates.
-    let mut merged = 0usize;
-    let mut probe_errors = 0usize;
-    let mut missing: Vec<String> = Vec::new();
-    for (i, key) in legacy_keys.iter().enumerate() {
-        // M1: a GET *error* (dead-ended / timed-out cross-node probe) must NEVER
-        // be silently treated as an empty state — otherwise a rebuild would land
-        // on an empty index while the entries still live at the old address. On a
-        // real run we abort immediately (the operator fixes connectivity and
-        // re-runs; the merge is idempotent). In a dry-run we instead warn and keep
-        // surveying the remaining generations, then exit non-zero at the end, so
-        // the operator sees the full picture rather than only the first failure.
-        // A definitive NotFound means the address genuinely holds nothing, which
-        // can be a legitimate outcome (a registered generation that holds nothing),
-        // but is NOT proof of it.
-        // Treating it as an abort (which folding it into the error bucket did)
-        // made the command unusable: probing an empty generation stopped the run
-        // before it reached the generation holding the entries.
-        //
-        // It is reported LOUDLY rather than silently, because NotFound is not
-        // absolute proof of absence — a contract that exists but is momentarily
-        // unfindable answers the same way. The merge is idempotent, so re-running
-        // later recovers such a generation; the operator just has to know to.
-        let probe = client.get_optional(key, false).await;
-        let id_str = key.id().to_string();
-        if let Ok(None) = &probe {
-            println!(
-                "legacy[{i}] {} NOT FOUND — treated as absent and skipped.\n\
-                 WARNING: if that generation was actually published, it is \
-                 momentarily unfindable rather than empty; re-run migrate later \
-                 (merging is idempotent) and confirm with `atlasctl show`.",
-                key.id()
-            );
-            missing.push(id_str.clone());
-            continue;
+    // What the fold produced. `Recovered` iff at least one generation held
+    // (preflight-passing) state; `SeedLocal` hands back the empty local
+    // snapshot when every generation missed.
+    let folded: Option<IndexState> = match outcome {
+        Outcome::Recovered {
+            merged,
+            truncated_fold,
+            ..
+        } => {
+            if truncated_fold {
+                // Unreachable while the registry is smaller than the driver's
+                // hop cap (64); refuse loudly rather than PUT a partial fold.
+                bail!(
+                    "the probe hop cap cut the sweep short — some generations \
+                     were never probed; refusing to PUT a partial fold"
+                );
+            }
+            Some(merged)
         }
-        let plan = match plan_generation(probe.map(|o| o.unwrap_or_default())) {
-            Ok(plan) => plan,
-            Err(e) if dry_run => {
-                eprintln!(
-                    "legacy[{i}] {} GET FAILED (reported, NOT counted as empty): {e:#}",
-                    key.id()
-                );
+        Outcome::SeedLocal { .. } => None,
+        Outcome::NoLegacy { .. } => {
+            unreachable!("an empty lineage bails before the probe starts")
+        }
+    };
+
+    if let Some(folded) = &folded {
+        let (live, tomb) = count_state(folded);
+        let state = encode(folded)?;
+        // Each generation was already pre-flighted as it arrived (see
+        // `MigrateProbeIo`); this guards the FOLDED result — the state the
+        // contract will actually be asked to accept.
+        if let Err(e) = preflight_generation(&state, &index_params) {
+            if dry_run {
+                eprintln!("FOLDED STATE PRE-FLIGHT FAILED: {e:#}");
                 probe_errors += 1;
-                continue;
+            } else {
+                return Err(e).context("the folded legacy state would be rejected by the contract");
             }
-            Err(e) => {
-                return Err(e).with_context(|| {
-                    format!(
-                        "legacy[{i}] {} GET failed — aborting so its entries are \
-                         not silently dropped as empty",
-                        key.id()
-                    )
-                });
-            }
-        };
-        match plan {
-            None => println!(
-                "legacy[{i}] {} is empty — nothing to carry forward",
-                key.id()
-            ),
-            Some((state, live, tomb)) => {
-                println!(
-                    "legacy[{i}] {} holds {live} live / {tomb} tombstone record(s)",
-                    key.id()
-                );
-                // Pre-flight BEFORE the PUT (and in a dry-run, where it is the
-                // whole point): the node will reject the entire generation if any
-                // one record fails, so find that out here with a per-record
-                // report rather than from an opaque contract error mid-publish.
-                let index_params = IndexParams::from_bytes(&params)
-                    .ok_or_else(|| anyhow!("could not parse index params"))?;
-                if let Err(e) = preflight_generation(&state, &index_params) {
-                    if dry_run {
-                        eprintln!("legacy[{i}] {} PRE-FLIGHT FAILED: {e:#}", key.id());
-                        probe_errors += 1;
-                        continue;
-                    }
-                    return Err(e).with_context(|| {
-                        format!("legacy[{i}] {} would be rejected by the contract", key.id())
-                    });
-                }
-                if dry_run {
-                    println!(
-                        "  [dry-run] would PUT-merge legacy[{i}] into {}",
-                        current_key.id()
-                    );
-                } else {
-                    // PUT-over the current contract; the node applies it as a
-                    // merging update and, with subscribe, hosts it so cross-node
-                    // GETs can find it.
-                    client
-                        .put(CONTRACT_WASM, params.clone(), state, true)
-                        .await
-                        .with_context(|| {
-                            format!("PUT-merging legacy[{i}] into the current index")
-                        })?;
-                    merged += 1;
-                    println!("  merged legacy[{i}] into {}", current_key.id());
-                }
-            }
+        } else if dry_run {
+            println!(
+                "[dry-run] would PUT-merge {merged} generation(s) \
+                 ({live} live / {tomb} tombstone record(s)) into {}",
+                current_key.id()
+            );
+        } else {
+            // One PUT of the folded state over the current contract; the node
+            // applies it as a merging update (folding in whatever the current
+            // address already holds) and, with subscribe, hosts it so
+            // cross-node GETs can find it.
+            client
+                .put(CONTRACT_WASM, params.clone(), state, true)
+                .await
+                .context("PUT-merging the folded legacy state into the current index")?;
+            println!(
+                "merged {merged} generation(s) ({live} live / {tomb} tombstone \
+                 record(s)) into {}",
+                current_key.id()
+            );
         }
     }
 
@@ -686,12 +657,9 @@ async fn migrate(cli: &Cli, dir: &Path, dry_run: bool, allow_missing: &[String])
     // run. Per-generation, not blanket: see the note on `--allow-missing`.
     //
     // Checked AFTER the readback below on a real run, so the operator still gets the
-    // "current index now holds N live entries" line — the PUTs already happened, so
+    // "current index now holds N live entries" line — the PUT already happened, so
     // bailing before it protects nothing and hides the most useful datum.
-    let unacknowledged: Vec<&String> = missing
-        .iter()
-        .filter(|id| !allow_missing.iter().any(|a| a == *id))
-        .collect();
+    let unacknowledged = unacknowledged(&missing, allow_missing);
     if !missing.is_empty() {
         println!(
             "\nNOTE: {} generation(s) reported NOT FOUND and were skipped:\n{}",
@@ -762,21 +730,251 @@ async fn migrate(cli: &Cli, dir: &Path, dry_run: bool, allow_missing: &[String])
     Ok(())
 }
 
-/// Decide what to do with one legacy generation, given the *outcome* of its GET.
+/// One legacy generation's probe, classified. This is the M1 seam (previously
+/// `plan_generation`): a GET **error** — including a state that does not decode
+/// with the current types — stays `Failed` and is NEVER folded into
+/// "empty"/"absent", so the adapter can abort (real run) or warn-and-continue
+/// (dry-run) instead of silently skipping. Only a *successful* GET is
+/// classified further:
 ///
-/// This is the M1 seam: a GET **error** stays an `Err` here — it is NEVER folded
-/// into "empty" — so the caller can abort (real run) or warn-and-continue
-/// (dry-run) instead of silently skipping. Only a *successful* GET is classified:
-/// `Ok(None)` means the address is genuinely empty (skip); `Ok(Some((state, live,
-/// tomb)))` means carry the state forward (any non-empty state, including a
-/// tombstone-only one, so takedowns still propagate).
-fn plan_generation(get_result: Result<Vec<u8>>) -> Result<Option<(Vec<u8>, usize, usize)>> {
-    let state = get_result?;
-    if state.is_empty() {
-        return Ok(None);
+/// * `Absent` — the node definitively answered NotFound. A DIFFERENT outcome
+///   from an error: the address genuinely holds nothing — a legitimate result
+///   for a registered generation that never received state — but NOT proof of
+///   it (an existing-but-momentarily-unfindable contract answers the same
+///   way), which is why `migrate` reports it loudly and gates it behind
+///   `--allow-missing`.
+/// * `Empty` — the GET succeeded with zero bytes; nothing to carry forward.
+/// * `State` — carry it forward (any non-empty decodable state, including a
+///   tombstone-only one, so takedowns still propagate).
+enum LegacyProbe {
+    Absent,
+    Empty,
+    State {
+        bytes: Vec<u8>,
+        live: usize,
+        tomb: usize,
+    },
+    Failed(anyhow::Error),
+}
+
+fn classify_probe(probe: Result<Option<Vec<u8>>>) -> LegacyProbe {
+    match probe {
+        Err(e) => LegacyProbe::Failed(e),
+        Ok(None) => LegacyProbe::Absent,
+        Ok(Some(bytes)) if bytes.is_empty() => LegacyProbe::Empty,
+        Ok(Some(bytes)) => match count_records(&bytes) {
+            Ok((live, tomb)) => LegacyProbe::State { bytes, live, tomb },
+            // An undecodable state is an ERROR, not "empty" (see count_records).
+            Err(e) => LegacyProbe::Failed(e),
+        },
     }
-    let (live, tomb) = count_records(&state)?;
-    Ok(Some((state, live, tomb)))
+}
+
+/// The one node operation the migration sweep needs, factored as a trait so
+/// the whole sweep — adapter, driver, and gate accounting — is testable
+/// without a node (see `migration_sweep_folds_every_generation_and_records_missing`).
+trait LegacyGet {
+    fn get_state(
+        &mut self,
+        id: ContractInstanceId,
+    ) -> impl std::future::Future<Output = Result<Option<Vec<u8>>>>;
+}
+
+impl LegacyGet for NodeClient {
+    async fn get_state(&mut self, id: ContractInstanceId) -> Result<Option<Vec<u8>>> {
+        // Never subscribe to a legacy key: the retired address must not be
+        // re-hosted by the probing node.
+        self.get_instance_optional(id, false).await
+    }
+}
+
+/// `ProbeIo` adapter over the node client for `migrate`: classifies every
+/// legacy GET (see [`LegacyProbe`]), runs the per-generation pre-flight, and
+/// records what the operator must acknowledge.
+///
+/// Deliberate deviation from the driver's RECOMMENDED semantics (timeout = a
+/// miss, probe advances): for Atlas, a GET error read as "absent" is exactly
+/// how a rebuild lands on an empty index while entries still live at the old
+/// address. So a transport error or undecodable state ABORTS a real run —
+/// through the `Err` channel `ProbeIo` provides for precisely this — and is
+/// warned-and-counted in a dry-run survey, which then exits non-zero. Only a
+/// definitive NotFound advances the probe, and even that is recorded in
+/// `missing` for the `--allow-missing` gate.
+struct MigrateProbeIo<G> {
+    client: G,
+    dry_run: bool,
+    index_params: IndexParams,
+    /// 0-based index of the generation being probed (the driver asks
+    /// newest-first), for the `legacy[i]` output lines.
+    next_idx: usize,
+    /// Generations that answered a definitive NotFound; each must be
+    /// explicitly acknowledged via `--allow-missing` or the run fails.
+    missing: Vec<String>,
+    /// Dry-run only: unreachable / undecodable / pre-flight-failing
+    /// generations (a real run aborts on the first instead).
+    probe_errors: usize,
+    /// Generations that contributed state to the fold.
+    hits: usize,
+}
+
+impl<G> MigrateProbeIo<G> {
+    fn new(client: G, dry_run: bool, index_params: IndexParams) -> Self {
+        Self {
+            client,
+            dry_run,
+            index_params,
+            next_idx: 0,
+            missing: Vec::new(),
+            probe_errors: 0,
+            hits: 0,
+        }
+    }
+}
+
+impl<G: LegacyGet> ProbeIo for MigrateProbeIo<G> {
+    type Error = anyhow::Error;
+
+    async fn get(&mut self, id: ContractInstanceId) -> Result<Option<Vec<u8>>> {
+        let i = self.next_idx;
+        self.next_idx += 1;
+        match classify_probe(self.client.get_state(id).await) {
+            LegacyProbe::Absent => {
+                // Reported LOUDLY rather than silently, because NotFound is not
+                // absolute proof of absence — a contract that exists but is
+                // momentarily unfindable answers the same way. The merge is
+                // idempotent, so re-running later recovers such a generation;
+                // the operator just has to know to.
+                println!(
+                    "legacy[{i}] {id} NOT FOUND — treated as absent and skipped.\n\
+                     WARNING: if that generation was actually published, it is \
+                     momentarily unfindable rather than empty; re-run migrate later \
+                     (merging is idempotent) and confirm with `atlasctl show`."
+                );
+                self.missing.push(id.to_string());
+                Ok(None)
+            }
+            LegacyProbe::Empty => {
+                println!("legacy[{i}] {id} is empty — nothing to carry forward");
+                Ok(None)
+            }
+            LegacyProbe::State { bytes, live, tomb } => {
+                println!("legacy[{i}] {id} holds {live} live / {tomb} tombstone record(s)");
+                // Pre-flight BEFORE anything is PUT (and in a dry-run, where it
+                // is the whole point): the node will reject an entire PUT if
+                // any one record fails, so find that out here with a
+                // per-record report rather than from an opaque contract error
+                // mid-publish.
+                match preflight_generation(&bytes, &self.index_params) {
+                    Ok(()) => {
+                        self.hits += 1;
+                        Ok(Some(bytes))
+                    }
+                    Err(e) if self.dry_run => {
+                        eprintln!("legacy[{i}] {id} PRE-FLIGHT FAILED: {e:#}");
+                        self.probe_errors += 1;
+                        Ok(None)
+                    }
+                    Err(e) => Err(e).with_context(|| {
+                        format!("legacy[{i}] {id} would be rejected by the contract")
+                    }),
+                }
+            }
+            LegacyProbe::Failed(e) if self.dry_run => {
+                eprintln!("legacy[{i}] {id} GET FAILED (reported, NOT counted as empty): {e:#}");
+                self.probe_errors += 1;
+                Ok(None)
+            }
+            LegacyProbe::Failed(e) => Err(e).with_context(|| {
+                format!(
+                    "legacy[{i}] {id} GET failed — aborting so its entries are \
+                     not silently dropped as empty"
+                )
+            }),
+        }
+    }
+}
+
+/// `ProbeStateOps` binding `IndexState` into the decision driver. The fold IS
+/// the contract's own merge: `IndexState::merge` is the exact function the
+/// contract's `update_state` runs (commutative, associative, idempotent,
+/// tombstone-aware — see its docs), so there is no second merge implementation
+/// that could drift from the one the network enforces, and folding all
+/// generations client-side reaches the same state the old per-generation
+/// node-side merge did.
+struct IndexProbeOps;
+
+impl ProbeStateOps for IndexProbeOps {
+    type State = IndexState;
+
+    /// The adapter already classified undecodable bytes as `Failed`
+    /// (abort/warn), so this cannot fail on anything it is handed; `None` — a
+    /// silent per-generation miss — stays the defensive fallback the driver
+    /// expects.
+    fn decode(&self, bytes: &[u8]) -> Option<IndexState> {
+        if bytes.is_empty() {
+            return None;
+        }
+        ciborium::de::from_reader(bytes).ok()
+    }
+
+    /// Any decodable non-empty state participates — including a tombstone-only
+    /// generation (takedowns must propagate) and a record-less one (it can
+    /// still carry `key_auth` / the app registry) — matching what the old loop
+    /// PUT forward.
+    fn is_real(&self, _state: &IndexState) -> bool {
+        true
+    }
+
+    fn merge_generations(&self, mut newer: IndexState, older: IndexState) -> IndexState {
+        newer.merge(&older);
+        newer
+    }
+
+    /// The "local snapshot" is an empty `IndexState` (the CLI holds no local
+    /// copy); merging it is a no-op, run anyway for shape.
+    fn merge_with_local(&self, mut recovered: IndexState, local: &IndexState) -> IndexState {
+        recovered.merge(local);
+        recovered
+    }
+
+    // prepare_forward: identity (the default) — IndexState carries no
+    // key-relative pointer (the freenet/river#427 class) to strip.
+}
+
+/// The migration drive `migrate` runs, factored so tests exercise the SAME
+/// ops + policy + lineage assembly production uses.
+///
+/// Policy is `FoldAll` — EVERY generation participates, never just the newest
+/// hit, because each generation can hold curated entries the others lack (the
+/// old loop PUT-merged all of them for the same reason). That is only sound
+/// because deletions are explicit tombstones and the merge is commutative +
+/// idempotent; `index_merge_satisfies_fold_all_preconditions` proves it with
+/// the crate's own `policy_check` helpers, which is what the `FoldAllAck`
+/// acknowledges.
+async fn drive_index_migration<IO>(io: &mut IO, params: &[u8]) -> Result<Outcome<IndexState>>
+where
+    IO: ProbeIo<Error = anyhow::Error>,
+{
+    migrate_contract(
+        IndexProbeOps,
+        io,
+        IndexState::default(),
+        &Parameters::from(params.to_vec()),
+        migration::CONTRACT_LINEAGE,
+        SelectionPolicy::FoldAll(FoldAllAck::i_understand_fold_all_resurrects_without_tombstones()),
+    )
+    .await
+}
+
+/// The skipped generations the operator has NOT explicitly accepted. ANY
+/// skipped generation fails the run unless acknowledged — per-generation, not
+/// blanket (see the note on `--allow-missing`), and an acknowledgement for a
+/// generation that is not actually missing acknowledges nothing.
+fn unacknowledged<'a>(missing: &'a [String], allow_missing: &[String]) -> Vec<&'a String> {
+    missing
+        .iter()
+        .filter(|id| !allow_missing.iter().any(|a| a == *id))
+        .collect()
 }
 
 /// Decode an index state and count its (live, tombstone) records.
@@ -790,6 +988,13 @@ fn count_records(state: &[u8]) -> Result<(usize, usize)> {
     }
     let st: IndexState = ciborium::de::from_reader(state)
         .context("legacy state did not decode with the current types")?;
+    Ok(count_state(&st))
+}
+
+/// Count (live, tombstone) records of an in-memory state — the folded result
+/// `migrate` reports and PUTs. `count_records` is the byte-level equivalent
+/// for raw GET responses.
+fn count_state(st: &IndexState) -> (usize, usize) {
     let mut live = 0;
     let mut tomb = 0;
     for rec in st.records.values() {
@@ -798,7 +1003,7 @@ fn count_records(state: &[u8]) -> Result<(usize, usize)> {
             RecordBody::Tomb(_) => tomb += 1,
         }
     }
-    Ok((live, tomb))
+    (live, tomb)
 }
 
 /// Run the validation the CONTRACT will run, and report every record that fails.
@@ -2286,7 +2491,10 @@ mod tests {
     #[test]
     fn an_undecodable_generation_is_an_error_not_empty() {
         assert!(count_records(b"not cbor at all").is_err());
-        assert!(plan_generation(Ok(b"not cbor at all".to_vec())).is_err());
+        assert!(matches!(
+            classify_probe(Ok(Some(b"not cbor at all".to_vec()))),
+            LegacyProbe::Failed(_)
+        ));
     }
 
     #[test]
@@ -2294,35 +2502,356 @@ mod tests {
         assert_eq!(count_records(&[]).unwrap(), (0, 0));
     }
 
-    /// M1: a legacy GET *error* must surface as an `Err` (which the caller turns
-    /// into a real-run abort or a dry-run warning), never be folded into an empty
-    /// state — which would let a rebuild land on an empty index while entries
-    /// still live at the old address.
+    /// M1: a legacy GET *error* must classify as `Failed` (which the adapter
+    /// turns into a real-run abort or a dry-run warning), never be folded into
+    /// an empty/absent state — which would let a rebuild land on an empty index
+    /// while entries still live at the old address.
     #[test]
-    fn plan_generation_surfaces_get_error() {
-        let outcome: Result<Vec<u8>> = Err(anyhow!("simulated dead-end / timeout"));
+    fn classify_probe_keeps_a_get_error_an_error() {
+        let outcome: Result<Option<Vec<u8>>> = Err(anyhow!("simulated dead-end / timeout"));
         assert!(
-            plan_generation(outcome).is_err(),
-            "a GET error must stay an Err, not be skipped as empty"
+            matches!(classify_probe(outcome), LegacyProbe::Failed(_)),
+            "a GET error must stay Failed, not be skipped as empty/absent"
         );
     }
 
-    /// A *successful* but empty GET is a legitimate skip: nothing lives at that
-    /// address, so there is nothing to carry forward.
+    /// …and a definitive NotFound is a DIFFERENT outcome from an error: the
+    /// address genuinely holds nothing (still gated behind `--allow-missing`,
+    /// because NotFound is not absolute proof of absence). Collapsing the two
+    /// in either direction is the data-loss failure mode this seam exists to
+    /// prevent: error→absent silently drops a reachable generation's entries;
+    /// absent→error made the command unusable (an empty generation aborted the
+    /// run before it reached the one holding the entries).
     #[test]
-    fn plan_generation_skips_ok_empty() {
-        assert!(plan_generation(Ok(Vec::new())).unwrap().is_none());
+    fn classify_probe_distinguishes_absent_from_error() {
+        assert!(matches!(classify_probe(Ok(None)), LegacyProbe::Absent));
+    }
+
+    /// A *successful* but empty GET is a legitimate skip: nothing lives at that
+    /// address, so there is nothing to carry forward — and it is NOT recorded
+    /// as `Absent` (no `--allow-missing` acknowledgement needed).
+    #[test]
+    fn classify_probe_skips_ok_empty() {
+        assert!(matches!(
+            classify_probe(Ok(Some(Vec::new()))),
+            LegacyProbe::Empty
+        ));
     }
 
     /// A tombstone-only generation is non-empty and must still be carried forward
     /// so its takedowns propagate into the current index.
     #[test]
-    fn plan_generation_merges_tombstone_only() {
+    fn classify_probe_carries_tombstone_only_state() {
         let bytes = encoded_state(vec![tomb_record(SubjectId::random())]);
-        let (_, live, tomb) = plan_generation(Ok(bytes))
-            .unwrap()
-            .expect("a tombstone-only generation must be carried forward, not skipped");
+        let LegacyProbe::State { live, tomb, .. } = classify_probe(Ok(Some(bytes))) else {
+            panic!("a tombstone-only generation must be carried forward, not skipped");
+        };
         assert_eq!((live, tomb), (0, 1));
+    }
+
+    // --- the migration sweep, against the production assembly ---
+
+    /// A scripted stand-in for the node: serves canned per-id responses and
+    /// records every id the sweep asked for.
+    enum Scripted {
+        State(Vec<u8>),
+        Absent,
+        Fail,
+    }
+
+    struct ScriptedNode {
+        responses: BTreeMap<String, Scripted>,
+        requested: Vec<ContractInstanceId>,
+    }
+
+    impl LegacyGet for ScriptedNode {
+        async fn get_state(&mut self, id: ContractInstanceId) -> Result<Option<Vec<u8>>> {
+            self.requested.push(id);
+            match self.responses.get(&id.to_string()) {
+                Some(Scripted::State(bytes)) => Ok(Some(bytes.clone())),
+                Some(Scripted::Fail) => Err(anyhow!("simulated dead-end / timeout")),
+                Some(Scripted::Absent) | None => Ok(None),
+            }
+        }
+    }
+
+    /// Params + generation-state builder for the sweep tests: a root-signed
+    /// key_auth authorizing one online key, so minted states PASS the
+    /// adapter's per-generation pre-flight (which runs the contract's real
+    /// `IndexState::verify`, not a stub).
+    struct SweepFixture {
+        online: SigningKey,
+        key_auth: KeyAuth,
+        params: Vec<u8>,
+    }
+
+    impl SweepFixture {
+        fn new() -> Self {
+            let root = generate_key();
+            let online = generate_key();
+            let ka_body = KeyAuthBody {
+                version: 1,
+                authorized: vec![online.verifying_key()],
+            };
+            let key_auth = KeyAuth {
+                sig: sign(&ka_body, &root),
+                body: ka_body,
+            };
+            let params = IndexParams {
+                root_vk: root.verifying_key(),
+                slug: "default".to_string(),
+            }
+            .to_bytes();
+            Self {
+                online,
+                key_auth,
+                params,
+            }
+        }
+
+        fn index_params(&self) -> IndexParams {
+            IndexParams::from_bytes(&self.params).expect("fixture params round-trip")
+        }
+
+        fn live(&self, sid: &SubjectId, version: u64, title: &str) -> RecordBody {
+            RecordBody::Live(IndexEntry {
+                subject_id: sid.clone(),
+                version,
+                kind: Kind::new(Kind::SITE),
+                title: title.to_string(),
+                snippet: "A record minted for the sweep test.".to_string(),
+                tags: vec!["freenet".to_string()],
+                locator: parse_locator(&format!("freenet:{ID_A}/")).unwrap(),
+                featured: false,
+                added_at: 1_700_000_000,
+                class: None,
+                verified: None,
+                ext: None,
+            })
+        }
+
+        fn tomb(&self, sid: &SubjectId, version: u64) -> RecordBody {
+            RecordBody::Tomb(Tombstone {
+                subject_id: sid.clone(),
+                version,
+            })
+        }
+
+        fn state(&self, bodies: Vec<RecordBody>) -> Vec<u8> {
+            let mut st = IndexState::initialized(self.key_auth.clone());
+            for body in bodies {
+                let rec = SignedRecord {
+                    sig: sign(&body, &self.online),
+                    by: self.online.verifying_key(),
+                    body,
+                };
+                st.records.insert(rec.body.subject_id().clone(), rec);
+            }
+            encode(&st).unwrap()
+        }
+    }
+
+    /// The full sweep, run against the SAME assembly `migrate` uses
+    /// (`drive_index_migration` + the real `MigrateProbeIo`): every registered
+    /// generation is probed, newest-first; every generation holding state
+    /// joins the fold (FoldAll — the OLDEST generation's unique record
+    /// survives even though newer generations answered, which is exactly what
+    /// a newest-wins regression would drop); a definitive NotFound is recorded
+    /// for the `--allow-missing` gate; and a newer tombstone still beats the
+    /// older live record it supersedes.
+    #[tokio::test]
+    async fn migration_sweep_folds_every_generation_and_records_missing() {
+        let fx = SweepFixture::new();
+        let ids = migration::legacy_index_keys(&fx.params);
+        assert_eq!(ids.len(), 4, "fixture assumes the 4 registered generations");
+        let sid_a = SubjectId::random();
+        let sid_b = SubjectId::random();
+        let sid_x = SubjectId::random();
+        let mut responses = BTreeMap::new();
+        // Newest generation: one record of its own.
+        responses.insert(
+            ids[0].to_string(),
+            Scripted::State(fx.state(vec![fx.live(&sid_a, 1, "A")])),
+        );
+        // Second generation: definitively absent.
+        responses.insert(ids[1].to_string(), Scripted::Absent);
+        // Third: a takedown for X.
+        responses.insert(
+            ids[2].to_string(),
+            Scripted::State(fx.state(vec![fx.tomb(&sid_x, 2)])),
+        );
+        // Oldest: the record the takedown supersedes, plus one only IT holds.
+        responses.insert(
+            ids[3].to_string(),
+            Scripted::State(fx.state(vec![fx.live(&sid_x, 1, "X"), fx.live(&sid_b, 1, "B")])),
+        );
+        let node = ScriptedNode {
+            responses,
+            requested: Vec::new(),
+        };
+        let mut io = MigrateProbeIo::new(node, false, fx.index_params());
+        let outcome = drive_index_migration(&mut io, &fx.params)
+            .await
+            .expect("the sweep must complete");
+
+        assert_eq!(
+            io.client.requested, ids,
+            "every registered generation must be probed, newest-first"
+        );
+        assert_eq!(
+            io.missing,
+            vec![ids[1].to_string()],
+            "the NotFound generation must be recorded for the --allow-missing gate"
+        );
+        assert_eq!(io.hits, 3);
+        let Outcome::Recovered {
+            merged,
+            truncated_fold,
+            ..
+        } = outcome
+        else {
+            panic!("a sweep with hits must recover");
+        };
+        assert!(!truncated_fold);
+        assert_eq!(count_state(&merged), (2, 1), "A and B live, X tombstoned");
+        assert!(matches!(
+            merged.records.get(&sid_a).unwrap().body,
+            RecordBody::Live(_)
+        ));
+        assert!(
+            matches!(
+                merged.records.get(&sid_b).unwrap().body,
+                RecordBody::Live(_)
+            ),
+            "the OLDEST generation's unique record must survive the fold — \
+             newest-wins selection would drop it"
+        );
+        assert!(
+            matches!(
+                merged.records.get(&sid_x).unwrap().body,
+                RecordBody::Tomb(_)
+            ),
+            "a newer tombstone must not be resurrected by an older live record"
+        );
+        // The folded result passes the same pre-flight `migrate` runs before
+        // its one forward PUT.
+        preflight_generation(&encode(&merged).unwrap(), &fx.index_params())
+            .expect("the folded state must verify");
+    }
+
+    /// A transport error on a REAL run aborts the whole migration immediately
+    /// — nothing is PUT and later generations are not even probed. A timeout
+    /// or dead-end must NEVER be read as "absent": that is how a rebuild lands
+    /// on an empty index while entries still live at the old address.
+    #[tokio::test]
+    async fn migration_sweep_aborts_on_a_transport_error() {
+        let fx = SweepFixture::new();
+        let ids = migration::legacy_index_keys(&fx.params);
+        let mut responses = BTreeMap::new();
+        responses.insert(
+            ids[0].to_string(),
+            Scripted::State(fx.state(vec![fx.live(&SubjectId::random(), 1, "A")])),
+        );
+        responses.insert(ids[1].to_string(), Scripted::Fail);
+        // ids[2] / ids[3] would answer — but must never be asked.
+        let node = ScriptedNode {
+            responses,
+            requested: Vec::new(),
+        };
+        let mut io = MigrateProbeIo::new(node, false, fx.index_params());
+        let err = drive_index_migration(&mut io, &fx.params)
+            .await
+            .expect_err("a real run must abort on a GET error");
+        assert!(format!("{err:#}").contains("GET failed"), "{err:#}");
+        assert_eq!(
+            io.client.requested.len(),
+            2,
+            "the abort must be immediate — no further generations probed"
+        );
+    }
+
+    /// The same error on a DRY RUN is warned and counted instead: the survey
+    /// continues through every remaining generation so the operator sees the
+    /// full picture, and the non-zero `probe_errors` is what makes the command
+    /// exit non-zero at the end.
+    #[tokio::test]
+    async fn migration_dry_run_surveys_past_errors() {
+        let fx = SweepFixture::new();
+        let ids = migration::legacy_index_keys(&fx.params);
+        let mut responses = BTreeMap::new();
+        responses.insert(ids[0].to_string(), Scripted::Fail);
+        responses.insert(
+            ids[3].to_string(),
+            Scripted::State(fx.state(vec![fx.live(&SubjectId::random(), 1, "B")])),
+        );
+        // ids[1] / ids[2]: absent.
+        let node = ScriptedNode {
+            responses,
+            requested: Vec::new(),
+        };
+        let mut io = MigrateProbeIo::new(node, true, fx.index_params());
+        let outcome = drive_index_migration(&mut io, &fx.params)
+            .await
+            .expect("a dry run must survey to the end");
+        assert_eq!(
+            io.client.requested, ids,
+            "the survey must reach every generation despite the error"
+        );
+        assert_eq!(
+            io.probe_errors, 1,
+            "the error must be counted, not forgotten"
+        );
+        assert_eq!(io.missing.len(), 2);
+        assert!(
+            matches!(outcome, Outcome::Recovered { .. }),
+            "the reachable generation still folds"
+        );
+    }
+
+    /// FoldAll is only sound when the merge is commutative + idempotent +
+    /// fold-order-invariant. Prove it for `IndexState::merge` — over states
+    /// with overlapping subjects, a version conflict, and a tombstone-vs-live
+    /// conflict — with the crate's own `policy_check` helpers. If this fails,
+    /// the `FoldAllAck` in `drive_index_migration` is a lie and the adoption
+    /// must stop.
+    #[test]
+    fn index_merge_satisfies_fold_all_preconditions() {
+        use freenet_migrate::driver::policy_check;
+        let fx = SweepFixture::new();
+        let sid_a = SubjectId::random();
+        let sid_x = SubjectId::random();
+        let decode =
+            |bytes: Vec<u8>| -> IndexState { ciborium::de::from_reader(&bytes[..]).unwrap() };
+        let samples = [
+            IndexState::default(),
+            decode(fx.state(vec![fx.live(&sid_a, 1, "A v1")])),
+            decode(fx.state(vec![fx.live(&sid_a, 2, "A v2"), fx.live(&sid_x, 1, "X")])),
+            decode(fx.state(vec![fx.tomb(&sid_x, 2)])),
+        ];
+        let merge = |mut a: IndexState, b: IndexState| {
+            a.merge(&b);
+            a
+        };
+        policy_check::assert_merge_commutative(&samples, merge);
+        policy_check::assert_merge_idempotent(&samples, merge);
+        policy_check::assert_fold_order_invariant(&samples, merge);
+    }
+
+    /// ANY skipped generation fails the run unless the operator acknowledged
+    /// EXACTLY that generation: per-generation, not blanket, and an ack for a
+    /// generation that is not missing acknowledges nothing.
+    #[test]
+    fn unacknowledged_requires_exact_per_generation_acks() {
+        let missing = vec!["gen-a".to_string(), "gen-b".to_string()];
+        let a = |s: &str| s.to_string();
+        assert_eq!(unacknowledged(&missing, &[]).len(), 2);
+        assert_eq!(unacknowledged(&missing, &[a("gen-a")]), vec![&missing[1]]);
+        assert!(unacknowledged(&missing, &[a("gen-a"), a("gen-b")]).is_empty());
+        assert_eq!(
+            unacknowledged(&missing, &[a("gen-c")]).len(),
+            2,
+            "an unrelated ack must not acknowledge anything"
+        );
     }
 
     // --- update / classification ---

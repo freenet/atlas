@@ -116,13 +116,23 @@ impl NodeClient {
         key: &ContractKey,
         subscribe: bool,
     ) -> Result<Option<Vec<u8>>> {
+        self.get_instance_optional(*key.id(), subscribe).await
+    }
+
+    /// [`Self::get_optional`] for a bare instance id — the form the migration's
+    /// probe driver works in (it hands out `ContractInstanceId`s derived from
+    /// registered legacy code hashes).
+    pub async fn get_instance_optional(
+        &mut self,
+        want: ContractInstanceId,
+        subscribe: bool,
+    ) -> Result<Option<Vec<u8>>> {
         let req = ContractRequest::Get {
-            key: *key.id(),
+            key: want,
             return_contract_code: false,
             subscribe,
             blocking_subscribe: subscribe,
         };
-        let want = *key.id();
         match self.roundtrip(ClientRequest::ContractOp(req)).await? {
             // Match the identity, do not discard it. `migrate` drives several keys
             // through ONE client in sequence, and `roundtrip` takes whatever frame

@@ -1,0 +1,55 @@
+# Legacy Index-Contract Registry
+#
+# Every PRIOR generation of the Atlas index-contract WASM, in freenet-migrate's
+# unified `[[contract]]` schema. The index's on-network address is
+# BLAKE3(BLAKE3(wasm) || params), so ANY change to the compiled WASM — source,
+# a dependency bump, a crate rename — re-keys the index and strands the curated
+# entries at the old address unless the outgoing generation is recorded here
+# and carried forward by `atlasctl migrate`.
+#
+# The CURRENT generation is deliberately absent: its key is derived from the
+# embedded WASM at runtime.
+#
+# File order is NEWEST-FIRST (generation descending) and must stay that way:
+# `atlasctl keys` prints this order, the probe driver orders by the
+# `generation` field, and `slice_order_is_generation_descending` pins that the
+# two agree.
+#
+# To retire a generation: add it at the TOP with `generation` one higher than
+# the current head, BEFORE shipping the rebuild — otherwise the entries at the
+# retired key are orphaned — AND preserve the outgoing WASM under
+# `contracts/index-contract/legacy/`.
+# `every_registered_hash_matches_its_preserved_wasm` pins both halves.
+#
+# Hashes are stdlib `CodeHash::encode()` base58 (64-char hex also accepted);
+# each is decoded and validated AT BUILD TIME by freenet-migrate-build, so a
+# malformed hash is a build failure rather than a silently skipped probe.
+
+[[contract]]
+generation = 3
+code_hash = "EMp9LZM2awHm7QeG6CsKGDNVfmgHehBTSht6RE2uDvhD"
+note = "Retired 2026-08-06 by the classification schema change (IndexEntry gained class/verified/ext, Kind and the new vocabulary fields became open string vocabularies) plus the atlas-common -> fn-atlas-common rename (old name taken on crates.io). Any of those alone re-keys; the rename was verified to move the artifact on its own (a9511c… without it, 773c31… with it)."
+
+[[contract]]
+generation = 2
+code_hash = "4oYXG4CMegsqQ2Hn1vXfkcnCpTnMTfeyTUTWgTabbBAA"
+note = "Retired 2026-08-03 by the freenet-stdlib 0.8.3 -> 0.8.5 bump, which the crawler's river-core 0.1.19 requirement forced. The contract's own source did not change; stdlib is a workspace dependency of it, so the artifact (and therefore the index address) moved anyway."
+
+# The generation-1 comment history is itself a lesson: it was wrong twice, in
+# opposite directions. First it asserted this generation was never published —
+# wrong, and dangerous, because registering a generation on the belief that it
+# holds nothing and then reading a NotFound as confirmation is how you lose
+# exactly the entries you were migrating. Then the correction over-reached and
+# claimed the published UI had been left reading the 0.6.0 address; that was
+# inferred from a stale default in the UI source without checking the deployed
+# bytes, and the bytes said otherwise. Probe before you conclude, in both
+# directions.
+[[contract]]
+generation = 1
+code_hash = "C6vpLoy2sdzbw9crd9wiAtUJQdeofN4NrANbqAGcLGTU"
+note = "freenet-stdlib 0.8.3 generation, retired by the app-registry change (which touched common/, so the contract re-keyed). IS published: probed 2026-07-29 it held 36 records / 29 live — then MORE than the 0.6.0 address (30 / 23) — so skipping it in a migration loses more than skipping 0.6.0 would."
+
+[[contract]]
+generation = 0
+code_hash = "GDt9A4DteAP6SYPmFXzoTScQuPfwufMaoZxxJaDDB1Yt"
+note = "freenet-stdlib 0.6.0 generation, retired by the 0.8.3 bump. Still holds the pre-bump snapshot, so it is worth merging, but it is NOT what the published UI reads."

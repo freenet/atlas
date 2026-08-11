@@ -1,85 +1,64 @@
-//! Backward-probe migration for the Atlas index contract.
+//! Backward-probe migration registry for the Atlas index contract, on the
+//! shared `freenet-migrate` machinery.
 //!
 //! The index's on-network address is `hash(index_wasm, params)`. Any dependency
 //! bump that changes the compiled WASM (e.g. the freenet-stdlib 0.6 -> 0.8 bump)
 //! re-keys the index, so its curated entries would be stranded at the *old*
 //! address unless carried forward. Atlas has no protocol-level migration, so we
-//! do what River and Delta do: keep a registry of every *previous* generation's
-//! code hash, re-derive the old key from the same (unchanged) params, GET the
-//! old state, and PUT it into the new key.
+//! do what River and Delta do — keep a registry of every *previous* generation's
+//! code hash, re-derive each old key from the same (unchanged) params, GET the
+//! old state, and merge it into the new key — except the registry shape, key
+//! derivation, and probe sequencing now come from `freenet-migrate` instead of
+//! being hand-rolled here.
+//!
+//! The registry itself lives in `cli/legacy_contracts.toml` (freenet-migrate's
+//! unified `[[contract]]` schema, with the how-to-retire-a-generation
+//! instructions at the top); `build.rs` decodes and validates every hash AT
+//! BUILD TIME via `freenet-migrate-build`, so a malformed hash is a build
+//! failure — the retired hand-rolled `&[&str]` registry silently skipped one at
+//! runtime instead.
 //!
 //! The params (`root_vk || slug`) are a fixed byte layout that never changes on
 //! a dependency bump (see `atlas_common::IndexParams`), so the ONLY thing that
-//! moves on a rebuild is the code hash — which is exactly what this registry
+//! moves on a rebuild is the code hash — which is exactly what the registry
 //! pins.
 
-use freenet_stdlib::prelude::{ContractKey, Parameters};
+use freenet_migrate::{contract_id_from_code_hash, ContractLineageEntry};
+use freenet_stdlib::prelude::{ContractInstanceId, Parameters};
 
-/// Code hashes (base58, BITCOIN alphabet — i.e. `CodeHash::encode()`) of every
-/// PRIOR index-contract WASM generation, newest-first. The CURRENT generation
-/// is deliberately absent: its key is derived from the embedded WASM at runtime.
-///
-/// Prepend the OUTGOING code hash here every time the committed WASM is rebuilt
-/// in a way that changes its hash, BEFORE shipping the rebuild — otherwise the
-/// entries at the retired key are orphaned, AND preserve that generation's WASM
-/// under `contracts/index-contract/legacy/`.
-/// `every_registered_hash_matches_its_preserved_wasm` pins both halves.
-///
-/// - `C6vpLoy2sdzbw9crd9wiAtUJQdeofN4NrANbqAGcLGTU`
-///   freenet-stdlib 0.8.3 generation, retired by the app-registry change (which
-///   touched `common/`, so the contract re-keyed).
-///
-///   **This generation IS published and holds the NEWEST state.** Probed
-///   2026-07-29 it had 36 records / 29 live entries, MORE than the 0.6.0 address
-///   (30 / 23), so skipping it in a migration loses more than skipping 0.6.0
-///   would. The 0.8.3 migration ran and the UI was rebuilt against it.
-///
-///   (This comment has been wrong twice, in opposite directions, which is the
-///   useful part. First it asserted this generation was never published — wrong,
-///   and dangerous, because registering a generation on the belief that it holds
-///   nothing and then reading a NotFound as confirmation is how you lose exactly
-///   the entries you were migrating. Then the correction over-reached and claimed
-///   the published UI had been left reading 0.6.0; that was inferred from a stale
-///   default in the UI source without checking the deployed bytes, and the bytes
-///   say otherwise. Probe before you conclude, in both directions.)
-/// - `GDt9A4DteAP6SYPmFXzoTScQuPfwufMaoZxxJaDDB1Yt`
-///   freenet-stdlib 0.6.0 generation, retired by the 0.8.3 bump. Still holds the
-///   pre-bump snapshot, so it is worth merging, but it is NOT what the published UI
-///   reads.
-pub const LEGACY_INDEX_CODE_HASHES: &[&str] = &[
-    // Retired 2026-08-06 by the classification schema change: `IndexEntry`
-    // gained `class` / `verified` / `ext`, `Kind` and the new vocabulary fields
-    // became open (string) vocabularies, and `atlas-common` was renamed to
-    // `fn-atlas-common` so the crate can be published (the old name is taken on
-    // crates.io). Any of those alone re-keys; the rename was verified to move
-    // the artifact on its own (a9511c… without it, 773c31… with it).
-    "EMp9LZM2awHm7QeG6CsKGDNVfmgHehBTSht6RE2uDvhD",
-    // Retired 2026-08-03 by the freenet-stdlib 0.8.3 -> 0.8.5 bump, which the
-    // crawler's river-core 0.1.19 requirement forced. The contract's own source
-    // did not change; stdlib is a workspace dependency of it, so the artifact
-    // (and therefore the index address) moved anyway.
-    "4oYXG4CMegsqQ2Hn1vXfkcnCpTnMTfeyTUTWgTabbBAA",
-    "C6vpLoy2sdzbw9crd9wiAtUJQdeofN4NrANbqAGcLGTU",
-    "GDt9A4DteAP6SYPmFXzoTScQuPfwufMaoZxxJaDDB1Yt",
-];
+mod generated {
+    //! Codegen output from `cli/legacy_contracts.toml`. The codegen emits an
+    //! (empty) `DELEGATE_LINEAGE` alongside; Atlas has no delegate, so it is
+    //! unused by design.
+    #![allow(dead_code)]
+    include!(concat!(env!("OUT_DIR"), "/lineage.rs"));
+}
 
-/// Re-derive the legacy index keys (newest-first) for the given params bytes.
-/// A malformed constant is skipped rather than aborting the whole probe.
-pub fn legacy_index_keys(params: &[u8]) -> Vec<ContractKey> {
-    LEGACY_INDEX_CODE_HASHES
+/// Every PRIOR index-contract generation, slice order newest-first (pinned by
+/// `slice_order_is_generation_descending` to agree with the probe driver's
+/// generation-descending order). The CURRENT generation is deliberately
+/// absent: its key is derived from the embedded WASM at runtime.
+pub const CONTRACT_LINEAGE: &[ContractLineageEntry] = generated::CONTRACT_LINEAGE;
+
+/// Re-derive the legacy index ids (newest-first) for the given params bytes.
+/// Infallible: the hashes were decoded and validated at build time.
+pub fn legacy_index_keys(params: &[u8]) -> Vec<ContractInstanceId> {
+    let params = Parameters::from(params.to_vec());
+    CONTRACT_LINEAGE
         .iter()
-        .filter_map(|h| ContractKey::from_params(*h, Parameters::from(params.to_vec())).ok())
+        .map(|e| contract_id_from_code_hash(&e.code_hash, &params))
         .collect()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use freenet_stdlib::prelude::{ContractCode, ContractInstanceId};
+    use freenet_migrate::{contract_probe, FoldAllAck, ProbeStateOps, SelectionPolicy, Step};
+    use freenet_stdlib::prelude::{ContractCode, ContractInstanceId, ContractKey, Parameters};
 
     // The retired WASMs, preserved so each registered code hash can be verified
     // against the real bytes it claims to describe. Newest-first, matching the
-    // order of `LEGACY_INDEX_CODE_HASHES`.
+    // registry's slice order.
     // Named `-app-registry` rather than plain `-v0.8.3-stdlib`: BOTH this
     // generation and the one below were built against stdlib 0.8.3 (this one was
     // retired by the 0.8.5 bump, the other by the app-registry source change),
@@ -114,35 +93,102 @@ mod tests {
         p
     }
 
+    /// The 4 recorded generations, newest-first, exactly as the retired
+    /// hand-rolled registry held them. Every one is (or may be) a published
+    /// address that still holds state: losing, reordering, or editing an entry
+    /// in `legacy_contracts.toml` silently strands whoever's state lives there,
+    /// so the expected list is spelled out literally rather than derived.
+    #[test]
+    fn the_four_generations_survive_in_order() {
+        let expected = [
+            "EMp9LZM2awHm7QeG6CsKGDNVfmgHehBTSht6RE2uDvhD",
+            "4oYXG4CMegsqQ2Hn1vXfkcnCpTnMTfeyTUTWgTabbBAA",
+            "C6vpLoy2sdzbw9crd9wiAtUJQdeofN4NrANbqAGcLGTU",
+            "GDt9A4DteAP6SYPmFXzoTScQuPfwufMaoZxxJaDDB1Yt",
+        ];
+        let got: Vec<String> = CONTRACT_LINEAGE.iter().map(|e| e.code_hash_b58()).collect();
+        assert_eq!(got, expected, "the registry lost or reordered a generation");
+    }
+
+    /// Slice order must equal generation-DESCENDING order: `atlasctl keys`
+    /// prints slice order, while the probe driver orders by the `generation`
+    /// field — this is what keeps the two identical (newest-first).
+    #[test]
+    fn slice_order_is_generation_descending() {
+        let generations: Vec<u32> = CONTRACT_LINEAGE.iter().map(|e| e.generation).collect();
+        assert!(
+            generations.windows(2).all(|w| w[0] > w[1]),
+            "registry slice order is not strictly generation-descending: {generations:?}"
+        );
+    }
+
+    /// The driver probes exactly the registered generations, newest-first —
+    /// the same ids in the same order `legacy_index_keys` reports. Pinned by
+    /// pumping a real `contract_probe` driver (the entry point `migrate`'s
+    /// drive goes through), not by re-deriving the order in the test.
+    #[test]
+    fn probe_order_matches_keys_order_newest_first() {
+        struct NullOps;
+        impl ProbeStateOps for NullOps {
+            type State = ();
+            fn decode(&self, _bytes: &[u8]) -> Option<()> {
+                None
+            }
+            fn is_real(&self, _state: &()) -> bool {
+                false
+            }
+            fn merge_with_local(&self, _recovered: (), _local: &()) {}
+        }
+        let params_bytes = test_params();
+        let params = Parameters::from(params_bytes.clone());
+        let mut driver = contract_probe(
+            NullOps,
+            (),
+            &params,
+            CONTRACT_LINEAGE,
+            SelectionPolicy::FoldAll(
+                FoldAllAck::i_understand_fold_all_resurrects_without_tombstones(),
+            ),
+        );
+        let mut probed = Vec::new();
+        while let Step::Get(id) = driver.next_action() {
+            probed.push(id);
+            driver.on_timeout(id);
+        }
+        assert_eq!(
+            probed,
+            legacy_index_keys(&params_bytes),
+            "probe order must be the newest-first order `atlasctl keys` reports"
+        );
+    }
+
     /// EVERY registered legacy code hash must be exactly its retired WASM's
     /// hash, so each derived legacy key equals a real prior address. Guards
-    /// against a wrong/typo'd constant silently pointing the migration at a
-    /// non-existent contract, and against a new generation being registered
-    /// without preserving the WASM that backs the claim.
+    /// against a wrong/typo'd registry entry silently pointing the migration at
+    /// a non-existent contract, and against a new generation being registered
+    /// without preserving the WASM that backs the claim. (Because the derived
+    /// side comes from `freenet-migrate`'s key reconstruction and the expected
+    /// side from stdlib's own `from_params_and_code`, this also cross-checks
+    /// the crate's derivation against stdlib on every build.)
     #[test]
     fn every_registered_hash_matches_its_preserved_wasm() {
         let params = test_params();
         let derived = legacy_index_keys(&params);
         assert_eq!(
-            derived.len(),
-            LEGACY_INDEX_CODE_HASHES.len(),
-            "a registered hash failed to parse into a key"
-        );
-        assert_eq!(
             PRESERVED_LEGACY_WASMS.len(),
-            LEGACY_INDEX_CODE_HASHES.len(),
+            CONTRACT_LINEAGE.len(),
             "every registered generation must have its WASM preserved under \
              contracts/index-contract/legacy/ (newest-first, same order)"
         );
-        for (i, (key, wasm)) in derived.iter().zip(PRESERVED_LEGACY_WASMS).enumerate() {
+        for (i, (id, wasm)) in derived.iter().zip(PRESERVED_LEGACY_WASMS).enumerate() {
             let from_wasm = ContractKey::from_params_and_code(
                 Parameters::from(params.clone()),
                 ContractCode::from(wasm.to_vec()),
             );
             assert_eq!(
-                key.id(),
+                id,
                 from_wasm.id(),
-                "LEGACY_INDEX_CODE_HASHES[{i}] does not reproduce its preserved WASM's key"
+                "CONTRACT_LINEAGE[{i}] does not reproduce its preserved WASM's key"
             );
         }
     }
@@ -152,10 +198,9 @@ mod tests {
     /// migration walks.
     #[test]
     fn registered_generations_are_distinct() {
-        let params = test_params();
-        let mut ids: Vec<String> = legacy_index_keys(&params)
+        let mut ids: Vec<String> = legacy_index_keys(&test_params())
             .iter()
-            .map(|k| k.id().to_string())
+            .map(|k| k.to_string())
             .collect();
         let before = ids.len();
         ids.sort();
@@ -163,28 +208,29 @@ mod tests {
         assert_eq!(before, ids.len(), "duplicate legacy generation registered");
     }
 
-    /// The 0.8 rebuild must actually re-key: the current key must differ from
-    /// the legacy key (otherwise there is nothing to migrate and the registry
-    /// entry is stale / wrong).
+    /// The newest registered generation must actually be RETIRED: the current
+    /// key must differ from it (otherwise there is nothing to migrate and the
+    /// registry entry is stale / wrong).
     #[test]
     fn current_key_differs_from_legacy() {
         let params = test_params();
-        let legacy = legacy_index_keys(&params)[0].id().to_owned();
-        let current = ContractKey::from_params_and_code(
+        let legacy = legacy_index_keys(&params)[0];
+        let current = *ContractKey::from_params_and_code(
             Parameters::from(params.clone()),
             ContractCode::from(CURRENT_WASM.to_vec()),
         )
-        .id()
-        .to_owned();
+        .id();
         assert_ne!(
             legacy, current,
             "current WASM hashes to the legacy key — the rebuild did not re-key"
         );
     }
 
-    /// A stored base58 code hash reproduces the same instance id as hashing the
-    /// full WASM, so registering just the 32-byte hash (not the whole WASM) is
-    /// sufficient. This is the invariant the whole registry rests on.
+    /// A stored 32-byte code hash reproduces the same instance id as hashing
+    /// the full WASM, so registering just the hash (not the whole WASM) is
+    /// sufficient. This is the invariant the whole registry rests on — checked
+    /// both through stdlib's own `from_params` and through `freenet-migrate`'s
+    /// reconstruction, so the two derivations are pinned to agree here too.
     #[test]
     fn from_params_matches_from_code_for_current() {
         let params = test_params();
@@ -194,8 +240,15 @@ mod tests {
         );
         let code_hash_b58 = via_code.encoded_code_hash();
         let via_hash =
-            ContractKey::from_params(code_hash_b58, Parameters::from(params.clone())).unwrap();
+            ContractKey::from_params(code_hash_b58.clone(), Parameters::from(params.clone()))
+                .unwrap();
         assert_eq!(via_code.id(), via_hash.id());
+        let via_crate = freenet_migrate::contract_id_from_code_hash_b58(
+            &code_hash_b58,
+            &Parameters::from(params.clone()),
+        )
+        .unwrap();
+        assert_eq!(via_code.id(), &via_crate);
         // sanity: ids parse/format round-trip
         let s = via_code.id().to_string();
         assert_eq!(s.parse::<ContractInstanceId>().unwrap(), *via_code.id());

@@ -18,4 +18,14 @@ fn main() {
             "cargo:warning=committed contract wasm missing; run contracts/index-contract/build-wasm.sh"
         );
     }
+
+    // Lineage codegen: parse `legacy_contracts.toml`, decode + validate every
+    // registered code hash AT BUILD TIME (a malformed hash is a build failure,
+    // not a silently skipped probe), and emit `CONTRACT_LINEAGE` into
+    // `$OUT_DIR/lineage.rs` for `src/migration.rs` to include. Also prints
+    // `cargo:rerun-if-changed=legacy_contracts.toml`.
+    freenet_migrate_build::codegen()
+        .registry("legacy_contracts.toml")
+        .emit()
+        .expect("codegen legacy index-contract lineage");
 }
