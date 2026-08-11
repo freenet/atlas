@@ -3882,7 +3882,12 @@ fn run_recheck_pass(
             }
             Ok(page) => {
                 checked += 1;
-                let body = page.describable_text();
+                // Same widened view `index_page` classifies from, so a
+                // re-checked resource is judged by the identical rule a
+                // freshly-discovered one is — otherwise a page whose head
+                // carries a description would pass on first discovery and then
+                // fail this same floor on its very next re-check.
+                let body = page.text_for_classification();
                 let visible = body.trim().chars().count();
                 let print = ThinPrint::of(&body, visible);
                 if schedule.last_hash(&e.subject_id) == Some(print) {
@@ -4156,11 +4161,55 @@ impl Page {
     /// stop. Same-text pages are compared whitespace-insensitively, because a
     /// re-render of one page can differ in line breaks without differing at all.
     fn describable_text(&self) -> String {
+        Self::join_unique_texts(
+            std::iter::once(self.text.as_str()).chain(self.extra_texts.iter().map(String::as_str)),
+        )
+    }
+
+    /// Everything shown to the safety-rating LLM call: [`describable_text`] PLUS
+    /// whatever the entry page's own `<head>` says about itself.
+    ///
+    /// This is the SAME two signals `describe_fallback` already reads for a
+    /// curated LLM-failure fallback — `<title>`/`og:title`, then `meta
+    /// [name=description]`/`og:description` — folded in HERE instead so a page
+    /// whose rendered content alone is under the floor (a login gate, a bare app
+    /// shell) can still be classified from what its own head says about it,
+    /// through the SAME rated LLM call every other page gets. This is NOT the
+    /// unrated fallback: the LLM still runs, still rates, on exactly the same
+    /// untrusted content as before — it is simply given more of it.
+    ///
+    /// [`describable_text`]: Page::describable_text
+    fn text_for_classification(&self) -> String {
+        let meta = self.meta_summary();
+        Self::join_unique_texts(
+            meta.as_deref()
+                .into_iter()
+                .chain(std::iter::once(self.text.as_str()))
+                .chain(self.extra_texts.iter().map(String::as_str)),
+        )
+    }
+
+    /// Title and meta/OG description mined from the entry page's `<head>`, as one
+    /// chunk. `None` if the head carries neither.
+    fn meta_summary(&self) -> Option<String> {
+        let title = extract_tag(&self.html, "<title>", "</title>")
+            .or_else(|| extract_meta(&self.html, "og:title"));
+        let desc = extract_meta(&self.html, "description")
+            .or_else(|| extract_meta(&self.html, "og:description"));
+        match (title, desc) {
+            (None, None) => None,
+            (Some(t), None) | (None, Some(t)) => Some(t),
+            (Some(t), Some(d)) => Some(format!("{t}\n{d}")),
+        }
+    }
+
+    /// Shared dedup-and-join for both text views above. Whitespace-insensitive
+    /// dedup, because a re-render of one page can differ in line breaks without
+    /// differing at all — see `describable_text`'s own doc for why that matters.
+    fn join_unique_texts<'a>(chunks: impl Iterator<Item = &'a str>) -> String {
         let mut seen: Vec<String> = Vec::new();
         let mut out: Vec<&str> = Vec::new();
-        for t in
-            std::iter::once(self.text.as_str()).chain(self.extra_texts.iter().map(String::as_str))
-        {
+        for t in chunks {
             let norm = normalise_text(t);
             if norm.is_empty() || seen.contains(&norm) {
                 continue;
@@ -4311,7 +4360,14 @@ fn index_page(
     // no evidence is not a gate. Notably this is the image-only-site case, which is
     // both the likeliest adult vector and the one a text classification is blindest
     // to.
-    let body = page.describable_text();
+    //
+    // `text_for_classification`, not `describable_text`: a page whose rendered
+    // content alone is thin (a login gate, a bare app shell) may still have a
+    // real `<title>`/`og:description` its own author published, and that is
+    // still evidence the SAME rated LLM call below can classify — this is not
+    // the unrated title/meta fallback `describe_llm`'s failure path uses; the
+    // LLM still runs and still rates whatever this gate lets through.
+    let body = page.text_for_classification();
     let visible = body.trim().chars().count();
     if visible < MIN_DESCRIBABLE_CHARS {
         // `TooThin`, not a plain error: this verdict is DETERMINISTIC for a given
@@ -10920,6 +10976,282 @@ mod tests {
         );
     }
 
+    /// `meta_summary` reads `<title>`, falling back to `og:title`, then
+    /// `meta[name=description]`, falling back to `og:description` — the same
+    /// order `describe_fallback` already uses. `None` only when the head has
+    /// neither.
+    #[test]
+    fn meta_summary_reads_title_and_description_with_og_fallback() {
+        fn meta(html: &str) -> Option<String> {
+            Page {
+                html: html.into(),
+                text: String::new(),
+                extra_pages: Vec::new(),
+                extra_texts: Vec::new(),
+                truncated: false,
+                rendered: true,
+                screenshot: None,
+            }
+            .meta_summary()
+        }
+        assert_eq!(
+            meta("<title>T</title>").as_deref(),
+            Some("T"),
+            "title alone"
+        );
+        assert_eq!(
+            meta(r#"<meta property="og:title" content="OGT">"#).as_deref(),
+            Some("OGT"),
+            "og:title when there is no <title>"
+        );
+        assert_eq!(
+            meta("<title>T</title><meta name=\"description\" content=\"D\">").as_deref(),
+            Some("T\nD"),
+            "title and description both present, title first"
+        );
+        assert_eq!(
+            meta(r#"<meta property="og:description" content="OGD">"#).as_deref(),
+            Some("OGD"),
+            "og:description when there is no meta description"
+        );
+        assert_eq!(
+            meta("<title></title>"),
+            None,
+            "an empty tag is not a signal"
+        );
+        assert_eq!(
+            meta("<p>no head tags at all</p>"),
+            None,
+            "nothing in the head means no summary, not an empty string"
+        );
+    }
+
+    /// THE regression this whole change exists for. Freebird's actual rendered
+    /// head is exactly `<title>Freebird</title>` — no description — and its
+    /// visible text is the 186-character "create an account" gate. Neither alone
+    /// nor combined does that clear the floor, which matches reality: this fix
+    /// does not rescue Freebird, an app whose head carries no real signal.
+    ///
+    /// What it DOES rescue is the same shape of app once its author (or anyone
+    /// whose scaffold populates OG tags by default) adds a real description —
+    /// which is the case this asserts.
+    #[test]
+    fn a_login_gate_with_a_real_meta_description_clears_the_floor() {
+        let gate_text = "Pick a display name. Your account is a locally \
+             generated key — no signup, no server. Create account"
+            .to_string();
+        assert!(
+            gate_text.chars().count() < MIN_DESCRIBABLE_CHARS,
+            "test premise: the gate text alone is thin"
+        );
+
+        // Freebird's ACTUAL head today: title only, no description. Must NOT
+        // clear the floor — this fix does not manufacture content that is not
+        // there.
+        let no_desc = Page {
+            html: "<title>Freebird</title>".into(),
+            text: gate_text.clone(),
+            extra_pages: Vec::new(),
+            extra_texts: Vec::new(),
+            truncated: false,
+            rendered: true,
+            screenshot: None,
+        };
+        assert!(
+            no_desc.text_for_classification().trim().chars().count() < MIN_DESCRIBABLE_CHARS,
+            "a bare title must not manufacture a pass — this is Freebird's real \
+             head today, and it correctly stays too thin"
+        );
+
+        // The same gate, but the app populated a real OG description (a
+        // scaffold default, or an author who added one).
+        let with_desc = Page {
+            html: r#"<title>Freebird</title><meta property="og:description" content="Freebird is a decentralized microblogging app on Freenet: no server, no signup, anonymous accounts, and a Ghost Key for verified replies.">"#.into(),
+            text: gate_text,
+            extra_pages: Vec::new(),
+            extra_texts: Vec::new(),
+            truncated: false,
+            rendered: true,
+            screenshot: None,
+        };
+        let classify = with_desc.text_for_classification();
+        assert!(
+            classify.trim().chars().count() >= MIN_DESCRIBABLE_CHARS,
+            "a real og:description must clear the floor even though the rendered \
+             gate screen alone does not"
+        );
+        assert!(
+            classify.contains("Freebird is a decentralized microblogging"),
+            "the description text must actually reach the classifier"
+        );
+        assert!(
+            classify.contains("Create account"),
+            "the rendered content must ALSO still reach the classifier — this \
+             adds evidence, it does not replace what was already there"
+        );
+
+        // The critical isolation: `describable_text` (the RENDERED-content-only
+        // view `wants_screenshot` uses) must be completely unaffected. A meta
+        // description carries no visual information, so folding it in there
+        // would let a well-written description mask an image-only page and
+        // suppress the screenshot that is meant to catch it.
+        assert!(
+            with_desc.describable_text().trim().chars().count() < MIN_DESCRIBABLE_CHARS,
+            "describable_text must stay rendered-content-only: a page whose \
+             actual on-screen content is thin must still read as thin to the \
+             visual heuristic, regardless of what its head advertises"
+        );
+    }
+
+    /// The head-derived chunk goes through the SAME whitespace-insensitive dedup
+    /// as every other page. If an app happened to also render its OG description
+    /// as visible body text, that must count once, not twice — mirrors
+    /// `a_repeated_page_does_not_help_a_site_clear_the_floor` for the meta chunk.
+    #[test]
+    fn meta_summary_participates_in_the_same_dedup_as_other_pages() {
+        let text = "Freebird is a decentralized microblogging app.".repeat(3);
+        let page = Page {
+            html: format!(r#"<meta name="description" content="{text}">"#),
+            text: text.replace(' ', "\n"), // same substance, different whitespace
+            extra_pages: Vec::new(),
+            extra_texts: Vec::new(),
+            truncated: false,
+            rendered: true,
+            screenshot: None,
+        };
+        assert_eq!(
+            page.text_for_classification(),
+            text,
+            "identical substance from the head and the body must count once"
+        );
+    }
+
+    /// `wants_screenshot` and `is_placeholder` must stay on the RENDERED-only
+    /// views (`describable_text` / raw `page.text`), never the widened
+    /// classification text. A meta description carries no visual information —
+    /// folding it into the screenshot heuristic would let a well-written
+    /// description mask an image-only page. And `is_placeholder` compares
+    /// against a missing-resource BASELINE captured the same way; mixing in head
+    /// text would compare two different things.
+    #[test]
+    fn only_the_classification_gate_reads_the_widened_text() {
+        let src = include_str!("main.rs");
+        let production = src
+            .split("\nmod tests")
+            .next()
+            .expect("source must have a pre-test region");
+        assert!(
+            !production.contains("fn only_the_classification_gate_reads"),
+            "the scan region must exclude the test module, or the pin matches itself"
+        );
+
+        let fn_body = |name: &str| -> String {
+            let at = production
+                .find(&format!("fn {name}("))
+                .unwrap_or_else(|| panic!("{name} must exist"));
+            let end = production[at..]
+                .find("\nfn ")
+                .map(|e| at + e)
+                .unwrap_or(production.len());
+            strip_comments(&production[at..end])
+        };
+
+        let screenshot = fn_body("wants_screenshot");
+        assert!(
+            screenshot.contains("page.describable_text()"),
+            "wants_screenshot must read the rendered-only view"
+        );
+        assert!(
+            !screenshot.contains("text_for_classification"),
+            "wants_screenshot must NOT read head metadata — it decides whether a \
+             SCREENSHOT is worth taking, and a meta description carries no visual \
+             information"
+        );
+
+        let placeholder = fn_body("is_placeholder");
+        assert!(
+            !placeholder.contains("text_for_classification"),
+            "is_placeholder compares against a baseline captured the same way; \
+             mixing in head text would compare two different things"
+        );
+    }
+
+    /// The widened text still goes through the SAME rated LLM call as before —
+    /// this is not a new unrated path. The two `describe_fallback` (unrated)
+    /// call sites must stay gated on `trusted`; nothing about widening `body`
+    /// may move that gate.
+    #[test]
+    fn the_widened_text_still_goes_through_the_rated_llm_call() {
+        let src = include_str!("main.rs");
+        let production = src
+            .split("\nmod tests")
+            .next()
+            .expect("source must have a pre-test region");
+        assert!(
+            !production.contains("fn the_widened_text_still_goes_through"),
+            "the scan region must exclude the test module, or the pin matches itself"
+        );
+        let stripped = strip_comments(production);
+        assert_eq!(
+            stripped
+                .matches("describe_fallback(loc, &page.html)")
+                .count(),
+            2,
+            "describe_fallback (unrated) must have exactly its two known call \
+             sites — a third is a new unrated path"
+        );
+        // Both call sites contain the substring "if trusted" — `Err(e) if
+        // trusted` and `None if trusted` — so this single count covers both;
+        // adding a second count for "None if trusted" would double-count the
+        // second occurrence, since it is itself a substring of the first match.
+        assert_eq!(
+            stripped.matches("if trusted").count(),
+            2,
+            "both describe_fallback call sites must stay conditioned on `trusted`"
+        );
+
+        // Scoped to each function's OWN body, not "appears anywhere in the
+        // file". A whole-file `.contains()` here is satisfied by the OTHER
+        // site's identical line even if the one being checked were reverted to
+        // `describable_text` — both of the two mutations below passed the
+        // suite the first time this test was written with a global check,
+        // which is why this is scoped per-function, not global.
+        let fn_body = |name: &str| -> String {
+            let at = production
+                .find(&format!("fn {name}("))
+                .unwrap_or_else(|| panic!("{name} must exist"));
+            let end = production[at..]
+                .find("\nfn ")
+                .map(|e| at + e)
+                .unwrap_or(production.len());
+            strip_comments(&production[at..end])
+        };
+
+        let index_page = fn_body("index_page");
+        assert!(
+            index_page.contains("let body = page.text_for_classification();"),
+            "index_page's own floor check must read the widened text"
+        );
+        assert!(
+            index_page.contains(
+                "describe_llm(\n            client,\n            k,\n            model,\n            loc,\n            &body,"
+            ),
+            "the widened body must flow into index_page's SAME rated describe_llm call"
+        );
+
+        // The re-check path (issue #17's freshness work) judges a resource by
+        // the SAME rule a freshly-discovered one is judged by, or a page whose
+        // head carries a real description would pass on first discovery and
+        // then fail this identical floor on its very next re-check.
+        let recheck = fn_body("run_recheck_pass");
+        assert!(
+            recheck.contains("let body = page.text_for_classification();"),
+            "the re-check path must read the SAME widened text index_page does, \
+             or discovery and re-check disagree about whether a resource clears \
+             the floor"
+        );
+    }
+
     /// The enumeration must happen on the path that DESCRIBES a locator, not only
     /// when crawling a hub. That was the whole defect: the machinery existed and
     /// was wired into `crawl_hub` alone.
@@ -10970,7 +11302,7 @@ mod tests {
         // whole site, or enumerating it achieves nothing.
         let desc = strip_comments(production);
         assert!(
-            desc.contains("let body = page.describable_text();"),
+            desc.contains("let body = page.text_for_classification();"),
             "the describe path must read the whole site"
         );
         assert!(
