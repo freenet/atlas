@@ -2757,6 +2757,14 @@ fn main() -> Result<()> {
             &prices,
             now_secs(),
         );
+        // Logged explicitly here too, symmetric with `recheck_result` above:
+        // `Result::and` below keeps only the FIRST error when both fail, so
+        // without this an operator whose recheck pass and thin-retired pass
+        // failed for two DIFFERENT reasons would only ever see the first —
+        // the second's specific cause would never reach a log anywhere.
+        if let Err(e) = &thin_retired_result {
+            eprintln!("thin-retired recheck pass failed ({e:#})");
+        }
         return recheck_result.and(thin_retired_result);
     }
 
@@ -3230,6 +3238,24 @@ fn run_once(
                         // a real, billed attempt — the moment its content
                         // moves past the floor.
                         thin_retired.seed(&loc, kind, &author, thin.print, now_secs());
+                        // Flushed HERE, immediately, not batched with the rest
+                        // of this run's bookkeeping at the bottom of the
+                        // function. `append_seen` two lines up is already
+                        // durable per-locator; `seed`'s in-memory mutation was
+                        // not, and this schedule has no live source of truth
+                        // to self-heal from the way `RecheckSchedule` does
+                        // (that one re-derives missing entries from the
+                        // published index every pass — a retired-thin locator
+                        // is by definition unpublished, so a lost seed here is
+                        // unrecoverable, not "one extra re-check"). Without
+                        // this, a crash between here and the function's final
+                        // `thin_retired.save()` — or an unrelated
+                        // `quarantine.save()` failure a few dozen lines below,
+                        // whose `bail!` would `?`-propagate out before ever
+                        // reaching that final save — permanently strands the
+                        // locator: `seen` already recorded it decided, but the
+                        // schedule never got the seed. Caught in review.
+                        let _ = thin_retired.save();
                         let _ = decisions.record(
                             &loc,
                             Outcome::RetiredThin,
@@ -4515,22 +4541,37 @@ fn run_thin_retired_recheck_pass(
     // trust — hub/river-room lines are discovery sources, not vouched-for
     // locators — mirroring `run_once`'s Phase 1 loop.
     let mut trusted: HashSet<String> = HashSet::new();
-    if let Ok(sources) = fs::read_to_string(&cli.sources) {
-        for raw in sources.lines() {
-            let line = raw.trim();
-            if line.is_empty()
-                || line.starts_with('#')
-                || line.starts_with("hub ")
-                || line.starts_with("hub:")
-                || line.starts_with("river-room ")
-                || line.starts_with("river-room:")
-            {
-                continue;
-            }
-            if let Some((loc, _)) = normalize_mapped(line, &registry) {
-                trusted.insert(loc);
+    match fs::read_to_string(&cli.sources) {
+        Ok(sources) => {
+            for raw in sources.lines() {
+                let line = raw.trim();
+                if line.is_empty()
+                    || line.starts_with('#')
+                    || line.starts_with("hub ")
+                    || line.starts_with("hub:")
+                    || line.starts_with("river-room ")
+                    || line.starts_with("river-room:")
+                {
+                    continue;
+                }
+                if let Some((loc, _)) = normalize_mapped(line, &registry) {
+                    trusted.insert(loc);
+                }
             }
         }
+        // Fails toward NO trust, never toward false trust — an unreadable
+        // sources file just means every entry this pass touches is treated
+        // as untrusted (same behavior as `--sources` being empty), which can
+        // only make the content-safety gate MORE strict, never bypass it.
+        // Unlike `run_once`, which fails the whole run loudly on this (`?`),
+        // this pass logs and carries on: `run_once`'s failure would also
+        // stop discovery entirely, which this pass has nothing analogous to
+        // lose.
+        Err(e) => eprintln!(
+            "thin-retired recheck: could not read {} ({e:#}) — every entry this pass \
+             touches is treated as untrusted",
+            cli.sources.display()
+        ),
     }
 
     // Own population, own ceiling: retired-thin locators are a different,
@@ -10446,6 +10487,69 @@ mod tests {
              the renderer-fallback arm, the unresolved-app/placeholder arm, and \
              the plain-transient arm — a new arm that returns without one of \
              these silently reintroduces the every-pass-forever bug"
+        );
+        // A decided locator (indexed, refused, or gone) must actually LEAVE
+        // the schedule, or it keeps burning budget reservations forever after
+        // graduating to a real decision. Both terminal arms must call it.
+        assert_eq!(
+            body.matches("schedule.forget(&loc)").count(),
+            2,
+            "expected exactly 2 forget() call sites: the Ok (indexed-or-refused) \
+             arm and the gone-for-good arm"
+        );
+        assert!(
+            body.contains("fs::read_to_string(&cli.sources)"),
+            "trust must be re-derived from --sources specifically, not some \
+             other file (a wrong path here fails toward under-trusting, not a \
+             safety bypass, but it would silently disable curated fallback)"
+        );
+        for skip_prefix in ["hub ", "hub:", "river-room ", "river-room:"] {
+            assert!(
+                body.contains(&format!("starts_with({skip_prefix:?})")),
+                "the trust-building loop must skip {skip_prefix:?} lines just \
+                 like run_once's own loop does — a hub or river-room line is a \
+                 discovery source, not a locator the operator vouches for"
+            );
+        }
+    }
+
+    /// Same formula shape as `recheck_ceiling_stretches_only_past_the_break_point`,
+    /// applied to `ThinRetiredSchedule`'s own population-derived ceiling — and
+    /// confirming it is driven by `TARGET_DAILY_RENDERS_THIN_RETIRED`
+    /// specifically, not `TARGET_DAILY_RENDERS_STANDARD` (which would silently
+    /// let this population share, and double, the published index's own daily
+    /// render budget — see `TARGET_DAILY_RENDERS_THIN_RETIRED`'s own doc).
+    #[test]
+    fn thin_retired_ceiling_stretches_on_its_own_target_not_standards() {
+        let break_point =
+            (RECHECK_STANDARD_FLOOR_SECS / 86_400) * TARGET_DAILY_RENDERS_THIN_RETIRED;
+        assert_eq!(break_point, 280, "test premise: 28 days * 10/day");
+        assert_eq!(
+            thin_retired_ceiling_secs(break_point as usize),
+            RECHECK_STANDARD_FLOOR_SECS,
+            "at the break point the ceiling is still exactly the fixed floor"
+        );
+        assert_eq!(
+            thin_retired_ceiling_secs(break_point as usize - 1),
+            RECHECK_STANDARD_FLOOR_SECS,
+            "short of the break point the ceiling must not stretch at all"
+        );
+        let doubled = thin_retired_ceiling_secs(break_point as usize * 2);
+        assert_eq!(
+            doubled,
+            RECHECK_STANDARD_FLOOR_SECS * 2,
+            "well past the break point it must stretch proportionally"
+        );
+        // The load-bearing distinction from the published index's own
+        // ceiling: the SAME population size must stretch FURTHER here,
+        // because this tier targets half the daily renders (10 vs 20).
+        assert!(
+            thin_retired_ceiling_secs(break_point as usize * 2)
+                > RecheckTier::Standard.ceiling_secs(break_point as usize * 2),
+            "thin-retired's ceiling must stretch more aggressively than \
+             reusing RecheckTier::Standard.ceiling_secs would have — if these \
+             ever compute equal, this population is silently sharing the \
+             standard tier's daily-render target again"
         );
     }
 
