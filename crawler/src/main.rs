@@ -3255,7 +3255,21 @@ fn run_once(
                         // reaching that final save — permanently strands the
                         // locator: `seen` already recorded it decided, but the
                         // schedule never got the seed. Caught in review.
-                        let _ = thin_retired.save();
+                        //
+                        // Logged on failure, matching the final save below —
+                        // NOT swallowed with `let _ =`. The whole point of
+                        // saving here is to protect against a correlated
+                        // failure (the same disk that is about to fail
+                        // `quarantine.save()` a few lines down); if THIS save
+                        // fails too, that is exactly the moment an operator
+                        // most needs to know, not the moment to go quiet.
+                        if !thin_retired.save() {
+                            eprintln!(
+                                "warn: could not persist the seed for {loc} in the \
+                                 thin-retired recheck schedule — it may not be \
+                                 reconsidered until re-discovered and re-retired"
+                            );
+                        }
                         let _ = decisions.record(
                             &loc,
                             Outcome::RetiredThin,
@@ -3341,10 +3355,16 @@ fn run_once(
     pending.advance_cursor(authors_served.len(), bucket_count);
     pending.report_refusals();
     let _ = pending.save();
-    // Best-effort, like `RecheckSchedule::save`: this is scheduling
-    // bookkeeping for an optimization, not the ledger. Losing a write here
-    // costs one seed being re-derived (or a locator waiting an extra cycle),
-    // never a wrong or missing decision.
+    // A SECOND save, not a substitute for the one at the `RetiredThin` arm
+    // above (which is what actually protects a fresh seed from this run's
+    // own `quarantine.save()` bail a few lines up — see that call site's own
+    // comment for why "best-effort, re-derivable" does NOT hold for this
+    // schedule the way it does for `RecheckSchedule`). This one exists only
+    // to flush any OTHER dirty state the schedule might carry that isn't
+    // seed-related (currently none — `forget`/`record_unchanged`/
+    // `record_changed` are all called from `run_thin_retired_recheck_pass`,
+    // never from here), kept for symmetry with `pending.save()` on the line
+    // above and as a harmless no-op (the `dirty` guard) if there is none.
     if !thin_retired.save() {
         eprintln!("warn: thin-retired recheck schedule could not be fully persisted this run");
     }
@@ -4373,9 +4393,12 @@ impl ThinRetiredSchedule {
         }
     }
 
-    /// Best-effort, like `RecheckSchedule::save`: a write failure here costs
-    /// extra rechecks on the next pass, never data loss on anything
-    /// published.
+    /// Best-effort: a write failure never loses anything PUBLISHED (a
+    /// retired-thin locator was never published). It CAN lose a fresh seed,
+    /// though, unlike `RecheckSchedule::save` — see the `RetiredThin` call
+    /// site's own comment on why this schedule has no live source of truth
+    /// to re-derive a lost seed from. That is exactly why that call site
+    /// does not swallow this return value the way a routine caller would.
     fn save(&mut self) -> bool {
         if !self.dirty {
             return true;
@@ -10397,6 +10420,34 @@ mod tests {
             seed_at < decisions_at,
             "seeding must happen alongside the SAME retirement branch that logs \
              Outcome::RetiredThin, not some other RetiredThin-adjacent path"
+        );
+        // The regression this pin exists to catch (found in review): an
+        // earlier version seeded the schedule here but only PERSISTED it in
+        // a batch at the very end of `run_once`, so a crash — or the
+        // `quarantine.save()` failure asserted below, which `bail!`s and
+        // would `?`-propagate out before that final batched save is ever
+        // reached — permanently lost the seed while `seen` (written durably
+        // two lines above) already recorded the locator as decided. Fixing
+        // it moved the save to right here, immediately after `seed`. A
+        // revert to "seed here, save only in the batch at the end" would
+        // still pass EVERY other test in this file (`seed`/`save` are both
+        // still called, just not adjacent) — this is the one assertion that
+        // would catch it.
+        let save_at = body[seed_at..]
+            .find("thin_retired.save()")
+            .map(|i| seed_at + i)
+            .expect(
+                "retirement must persist the schedule immediately, not only in a \
+                 batch at the end of run_once — see #43's review history",
+            );
+        let quarantine_bail_at = body
+            .find("quarantine could not be persisted")
+            .expect("the quarantine save's fatal bail must still exist");
+        assert!(
+            save_at < quarantine_bail_at,
+            "the immediate save must happen BEFORE the point where a later, \
+             unrelated quarantine.save() failure can bail out of run_once — \
+             otherwise that failure silently strands every seed from this run"
         );
     }
 
