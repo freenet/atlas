@@ -427,9 +427,20 @@ struct Cli {
     recheck_state: Option<PathBuf>,
     /// Safety valve on one `--recheck` pass: bounds LLM/network spend from a
     /// single invocation regardless of how large the backlog past
-    /// `next_check_due` is.
+    /// `next_check_due` is. Shared by the thin-retired recheck pass too, so
+    /// one `--recheck` invocation renders at most `recheck_max` published
+    /// entries AND `recheck_max` retired-thin locators, not `2 * recheck_max`
+    /// of one combined pool.
     #[arg(long, default_value_t = 200)]
     recheck_max: usize,
+    /// File tracking the doubling backoff schedule for `retired-thin`
+    /// locators (default: <key_dir>/crawler-thin-retired.txt). See #43 and
+    /// `ThinRetiredSchedule`: a locator retired by `THIN_VERDICT_RUNS` is
+    /// re-visited on this schedule by the SAME `--recheck` invocation that
+    /// re-verifies the published index, so content that genuinely improves
+    /// after retirement gets a real attempt again.
+    #[arg(long)]
+    thin_retired_state: Option<PathBuf>,
 }
 
 struct Described {
@@ -2642,6 +2653,10 @@ fn main() -> Result<()> {
         .recheck_state
         .clone()
         .unwrap_or_else(|| key_dir.join("crawler-recheck.txt"));
+    let thin_retired_path = cli
+        .thin_retired_state
+        .clone()
+        .unwrap_or_else(|| key_dir.join("crawler-thin-retired.txt"));
     // Two of these pointing at the same file is not a harmless misconfiguration.
     // The quarantine and the pending queue share a line shape but NOT a first
     // column (a unix timestamp vs an attempt count), so if they collide, every
@@ -2661,6 +2676,7 @@ fn main() -> Result<()> {
         ("--quarantine", real(&quarantine_path)),
         ("--decisions", real(&decisions_path)),
         ("--recheck-state", real(&recheck_state_path)),
+        ("--thin-retired-state", real(&thin_retired_path)),
     ];
     for (i, (name_a, a)) in paths.iter().enumerate() {
         for (name_b, b) in &paths[i + 1..] {
@@ -2703,9 +2719,23 @@ fn main() -> Result<()> {
             monthly_max,
             &prices,
         );
-        return run_recheck_pass(
+        run_recheck_pass(
             &cli,
             &recheck_state_path,
+            &decisions_path,
+            &mut budget,
+            &prices,
+            now_secs(),
+        )?;
+        // Same invocation, same shared `budget` — see the module doc above
+        // `ThinRetiredSchedule` for why this is not a second parallel spend
+        // path. Runs second: it only ever affects locators that never
+        // published, so nothing here depends on `run_recheck_pass` having
+        // just run first.
+        return run_thin_retired_recheck_pass(
+            &cli,
+            &thin_retired_path,
+            &seen_path,
             &decisions_path,
             &mut budget,
             &prices,
@@ -2723,6 +2753,7 @@ fn main() -> Result<()> {
             &pending_path,
             &quarantine_path,
             &decisions_path,
+            &thin_retired_path,
             &mut state,
         ) {
             eprintln!("crawl run error: {e:#}");
@@ -2804,6 +2835,7 @@ fn capture_filter(seen: &HashSet<String>, quarantine: &Quarantine) -> HashSet<St
     seen.iter().cloned().chain(quarantine.held()).collect()
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_once(
     cli: &Cli,
     seen_path: &Path,
@@ -2811,6 +2843,7 @@ fn run_once(
     pending_path: &Path,
     quarantine_path: &Path,
     decisions_path: &Path,
+    thin_retired_path: &Path,
     state: &mut CrawlState,
 ) -> Result<()> {
     let mut seen = load_seen(seen_path);
@@ -2906,6 +2939,11 @@ fn run_once(
     // put them back — it would only lose them from the seen file too.
     let mut decisions = DecisionLog::open(decisions_path);
     let (mut quarantine, released, decided) = Quarantine::load(quarantine_path, now_secs(), &seen);
+    // Retired-thin locators awaiting a doubling-schedule recheck — see #43 and
+    // `ThinRetiredSchedule`. Loaded here only so `RetiredThin` retirements
+    // below can seed it; the actual re-visiting happens in the separate
+    // `--recheck` pass, `run_thin_retired_recheck_pass`, not here.
+    let mut thin_retired = ThinRetiredSchedule::load(thin_retired_path, &seen);
     // Out of retry cycles. THIS is where a locator legitimately becomes
     // permanent: not because one fetch failed, but because several attempts
     // spread over months all did. Without this terminal state the quarantine has
@@ -3165,6 +3203,15 @@ fn run_once(
                         append_seen(seen_path, &loc);
                         pending.remove(&loc);
                         quarantine.forget(&loc);
+                        // Give it a path back (see #43): retirement here is
+                        // "3 identical renders", not "never worth asking
+                        // again". Seed the SAME doubling schedule
+                        // `run_recheck_pass` uses for published entries, so
+                        // `--recheck` re-visits this locator on its own
+                        // cadence and hands it straight to `index_locator` —
+                        // a real, billed attempt — the moment its content
+                        // moves past the floor.
+                        thin_retired.seed(&loc, kind, &author, is_trusted, thin.print, now_secs());
                         let _ = decisions.record(
                             &loc,
                             Outcome::RetiredThin,
@@ -3250,6 +3297,13 @@ fn run_once(
     pending.advance_cursor(authors_served.len(), bucket_count);
     pending.report_refusals();
     let _ = pending.save();
+    // Best-effort, like `RecheckSchedule::save`: this is scheduling
+    // bookkeeping for an optimization, not the ledger. Losing a write here
+    // costs one seed being re-derived (or a locator waiting an extra cycle),
+    // never a wrong or missing decision.
+    if !thin_retired.save() {
+        eprintln!("warn: thin-retired recheck schedule could not be fully persisted this run");
+    }
 
     if registry.apps.is_empty() {
         eprintln!(
@@ -4073,6 +4127,441 @@ fn run_recheck_pass(
          skipped (no key) / {skipped_no_budget} skipped (budget) — {} standard, {} \
          high-drift entries tracked",
         standard_pop, highdrift_pop
+    );
+    Ok(())
+}
+
+// ============================================================================
+// Retired-thin recheck: a path back for locators the too-thin gate gave up on
+// ============================================================================
+//
+// `THIN_VERDICT_RUNS` retires a locator once it renders the SAME too-thin
+// content three separate times — a real terminal state (see its own doc for
+// why an unbounded thin refusal is worse), but retirement and `seen` are the
+// same bit, and `run_recheck_pass` above only ever walks `fetch_live_index()`
+// — subjects that are ALREADY PUBLISHED. A `retired-thin` locator was refused
+// *before* it ever became a subject, so it sits permanently outside that
+// sweep's scope, and nothing else ever asks about it again — even after its
+// content genuinely changes.
+//
+// freenet/atlas#43: Freebird (a new decentralized microblogging app) was
+// retired TWICE in one evening — 186, then 196 describable characters — with
+// `<title>Freebird</title>` alone being read the second time (proof #41's
+// meta-description fallback was working) but still short of the floor. Its
+// author then added a real `<meta name="description">` and it cleared the
+// floor at 355 characters. Nothing short of hand-editing `crawler-seen.txt`
+// would ever have found that out.
+//
+// This closes the gap by reusing the SAME content-hash machinery
+// `run_recheck_pass` already has, rather than building a second parallel
+// backoff system: a doubling schedule on `RecheckTier::Standard` — the same
+// tier a published entry gets — re-visits each retired-thin locator, and the
+// real classification attempt, when one is warranted, is just
+// `index_locator` — the SAME call a fresh discovery goes through. No new
+// publish path, no new admission gate, and (see `run_thin_retired_recheck_pass`)
+// no extra LLM spend on an unchanged page: `index_page` already bails before
+// the LLM call when the page is still too thin to describe.
+
+/// One retired-thin locator's re-check bookkeeping — enough to hand it
+/// straight back to [`index_locator`] once it is worth a real attempt,
+/// without re-deriving `kind`/`author`/trust from anywhere else.
+#[derive(Clone)]
+struct ThinRetiredEntry {
+    kind: &'static str,
+    author: String,
+    /// Whether this locator came from the operator's own sources file at the
+    /// moment it was retired. Carried rather than re-derived: `index_page`
+    /// only falls back to the unrated title/meta description for a trusted
+    /// locator, and re-parsing `--sources` here just to recover that would be
+    /// exactly the parallel machinery this mechanism exists to avoid.
+    trusted: bool,
+    next_check_due: u64,
+    current_interval_secs: u64,
+    /// The fingerprint last seen — either the one recorded at retirement, or
+    /// the one from the most recent still-thin recheck. Comparing against
+    /// this is what tells "content is static" from "content just moved,
+    /// still under the floor" apart, exactly as `ThinStreak`/`RecheckEntry`
+    /// do for their own populations.
+    last_print: ThinPrint,
+}
+
+/// The retired-thin re-check sweep's persisted schedule, keyed by locator
+/// (not `subject_id` — a retired-thin locator was never published, so it has
+/// no subject).
+///
+/// Same atomic-sibling-write, corrupt-reads-as-dropped conventions as
+/// `Quarantine`/`RecheckSchedule` — see `sibling_tmp`. Population is bounded
+/// by how many locators actually get retired-thin, which `THIN_VERDICT_RUNS`
+/// already keeps rare (a real terminal verdict, not a routine outcome).
+struct ThinRetiredSchedule {
+    path: PathBuf,
+    entries: HashMap<String, ThinRetiredEntry>,
+    dirty: bool,
+}
+
+impl ThinRetiredSchedule {
+    /// A file that cannot be read starts empty — this is bookkeeping for an
+    /// optimization, not a correctness-critical record, exactly like
+    /// `RecheckSchedule::load`. `kind` is re-derived from `normalize_href` on
+    /// the way in, not trusted from disk, for the same reason `Quarantine`
+    /// does it: an entry captured under an earlier build's guards must not be
+    /// re-queued without being re-checked. Any line that fails to parse in
+    /// ANY field is dropped whole rather than partially trusted.
+    fn load(path: &Path, seen: &HashSet<String>) -> Self {
+        let mut entries = HashMap::new();
+        let mut dropped = 0usize;
+        if let Ok(body) = fs::read_to_string(path) {
+            for line in body.lines() {
+                // due \t interval \t print \t trusted \t author \t locator
+                // (locator last: it may not contain a tab, so this parses
+                // unambiguously — see `Quarantine::load`'s own note.)
+                let mut f = line.splitn(6, '\t');
+                let (
+                    Some(due),
+                    Some(interval),
+                    Some(print_col),
+                    Some(trusted_col),
+                    Some(author),
+                    Some(loc),
+                ) = (f.next(), f.next(), f.next(), f.next(), f.next(), f.next())
+                else {
+                    dropped += 1;
+                    continue;
+                };
+                let (Ok(next_check_due), Ok(current_interval_secs)) =
+                    (due.trim().parse::<u64>(), interval.trim().parse::<u64>())
+                else {
+                    dropped += 1;
+                    continue;
+                };
+                let Some(last_print) = decode_recheck_hash(print_col.trim()) else {
+                    dropped += 1;
+                    continue;
+                };
+                let author = author.trim();
+                if author.contains(['\t', '\n']) {
+                    dropped += 1;
+                    continue;
+                }
+                let Some((canon, kind)) = normalize_href(loc.trim()) else {
+                    dropped += 1;
+                    continue;
+                };
+                // Already decided about by some other path — do not carry a
+                // locator this schedule would otherwise try to re-index.
+                if seen.contains(&canon) || entries.contains_key(&canon) {
+                    dropped += 1;
+                    continue;
+                }
+                entries.insert(
+                    canon,
+                    ThinRetiredEntry {
+                        kind,
+                        author: author.to_string(),
+                        trusted: trusted_col.trim() == "1",
+                        next_check_due,
+                        current_interval_secs,
+                        last_print,
+                    },
+                );
+            }
+        }
+        if dropped > 0 {
+            eprintln!(
+                "warn: dropped {dropped} thin-retired recheck entr(ies) that no longer validate"
+            );
+        }
+        Self {
+            path: path.to_path_buf(),
+            entries,
+            dirty: dropped > 0,
+        }
+    }
+
+    /// Best-effort, like `RecheckSchedule::save`: a write failure here costs
+    /// extra rechecks on the next pass, never data loss on anything
+    /// published.
+    fn save(&mut self) -> bool {
+        if !self.dirty {
+            return true;
+        }
+        let mut lines: Vec<String> = self
+            .entries
+            .iter()
+            .map(|(loc, e)| {
+                format!(
+                    "{}\t{}\t{}\t{}\t{}\t{}\n",
+                    e.next_check_due,
+                    e.current_interval_secs,
+                    encode_recheck_hash(Some(e.last_print)),
+                    if e.trusted { "1" } else { "0" },
+                    e.author,
+                    loc
+                )
+            })
+            .collect();
+        lines.sort();
+        let body: String = lines.concat();
+        let tmp = sibling_tmp(&self.path);
+        if fs::write(&tmp, &body).is_ok() && fs::rename(&tmp, &self.path).is_ok() {
+            self.dirty = false;
+            true
+        } else {
+            let _ = fs::remove_file(&tmp);
+            eprintln!(
+                "error: could not persist thin-retired recheck schedule {} — this run's \
+                 bookkeeping is lost, but nothing published was touched",
+                self.path.display()
+            );
+            false
+        }
+    }
+
+    /// Seed a freshly-retired locator. Called from `run_once`'s `RetiredThin`
+    /// arm the moment a locator is actually retired. Due at
+    /// `RecheckTier::Standard`'s starting interval from now — it was just
+    /// judged deterministically thin, so there is nothing new to learn by
+    /// re-fetching it today.
+    fn seed(
+        &mut self,
+        loc: &str,
+        kind: &'static str,
+        author: &str,
+        trusted: bool,
+        print: ThinPrint,
+        now: u64,
+    ) {
+        let start = RecheckTier::Standard.start_secs();
+        self.entries.insert(
+            loc.to_string(),
+            ThinRetiredEntry {
+                kind,
+                author: author.to_string(),
+                trusted,
+                next_check_due: now.saturating_add(start),
+                current_interval_secs: start,
+                last_print: print,
+            },
+        );
+        self.dirty = true;
+    }
+
+    /// Drop an entry entirely: it has been decided about (indexed, refused,
+    /// gone) by a real attempt, or no longer validates at all. Mirrors
+    /// `Quarantine::forget`.
+    fn forget(&mut self, loc: &str) {
+        if self.entries.remove(loc).is_some() {
+            self.dirty = true;
+        }
+    }
+
+    /// Nothing changed: double the interval (capped at `ceiling`), same
+    /// reasoning as `RecheckSchedule::record_unchanged`.
+    fn record_unchanged(&mut self, loc: &str, ceiling: u64, now: u64) {
+        if let Some(e) = self.entries.get_mut(loc) {
+            e.current_interval_secs = e.current_interval_secs.saturating_mul(2).min(ceiling);
+            e.next_check_due = now.saturating_add(e.current_interval_secs);
+            self.dirty = true;
+        }
+    }
+
+    /// Content moved but is still under the describable-text floor: reset the
+    /// interval to the tier's starting value — a page whose content just
+    /// changed is more likely to change again soon than one that has sat
+    /// static since retirement — and remember the new fingerprint.
+    fn record_changed(&mut self, loc: &str, print: ThinPrint, now: u64) {
+        if let Some(e) = self.entries.get_mut(loc) {
+            let start = RecheckTier::Standard.start_secs();
+            e.current_interval_secs = start;
+            e.next_check_due = now.saturating_add(start);
+            e.last_print = print;
+            self.dirty = true;
+        }
+    }
+}
+
+/// One pass of the retired-thin recheck sweep. Invoked alongside
+/// `run_recheck_pass` under `--recheck`, sharing the SAME `Budget` — see the
+/// module doc above [`ThinRetiredEntry`].
+///
+/// For each due entry this calls [`index_locator`] directly — the exact
+/// function a fresh discovery goes through — so a locator that clears the
+/// floor is admitted, classified, and published through the ordinary path,
+/// never a bespoke one. When the page is STILL too thin, `index_page` bails
+/// with [`TooThin`] before ever calling the LLM, so a locator whose content
+/// has not moved costs this pass a render, never a billed call; the
+/// fingerprint comparison below only decides the BACKOFF schedule (how often
+/// to keep spending a render on it), not whether an LLM call happens.
+fn run_thin_retired_recheck_pass(
+    cli: &Cli,
+    thin_retired_path: &Path,
+    seen_path: &Path,
+    decisions_path: &Path,
+    budget: &mut Budget,
+    prices: &Prices,
+    now: u64,
+) -> Result<()> {
+    let mut seen = load_seen(seen_path);
+    let mut schedule = ThinRetiredSchedule::load(thin_retired_path, &seen);
+
+    let key = std::env::var("OPENAI_API_KEY")
+        .ok()
+        .filter(|k| !k.is_empty());
+    let model = std::env::var("ATLAS_LLM_MODEL")
+        .ok()
+        .filter(|m| !m.is_empty())
+        .unwrap_or_else(|| DEFAULT_LLM_MODEL.to_string());
+    let client = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(FETCH_TIMEOUT_SECS))
+        .redirect(reqwest::redirect::Policy::custom(|attempt| {
+            if attempt.previous().len() >= 3 {
+                return attempt.stop();
+            }
+            match ssrf_check(attempt.url().as_str()) {
+                Ok(()) => attempt.follow(),
+                Err(_) => attempt.stop(),
+            }
+        }))
+        .user_agent("atlas-crawler/0.1")
+        .build()?;
+    let gw = gateway_http_base(&cli.node);
+    let registry = AppRegistryView::load(cli);
+    let mut baselines = AppBaselines::default();
+    let mut decisions = DecisionLog::open(decisions_path);
+
+    // Own population, own ceiling: retired-thin locators are a different,
+    // typically much smaller population than the published index, and their
+    // aggregate render budget must not compete with it — same reasoning as
+    // `TARGET_DAILY_RENDERS_HIGHDRIFT` not sharing with standard.
+    let ceiling = RecheckTier::Standard.ceiling_secs(schedule.entries.len());
+
+    let mut due: Vec<String> = schedule
+        .entries
+        .iter()
+        .filter(|(_, e)| now >= e.next_check_due)
+        .map(|(loc, _)| loc.clone())
+        .collect();
+    due.sort();
+    due.truncate(cli.recheck_max);
+
+    let mut attempted = 0usize;
+    let mut unchanged = 0usize;
+    let mut still_thin_changed = 0usize;
+    let mut indexed = 0usize;
+    let mut decided = 0usize;
+    let mut skipped_no_key = 0usize;
+    let mut skipped_no_budget = 0usize;
+
+    for loc in due {
+        let entry = schedule.entries[&loc].clone();
+        // Mirrors `run_once`'s own Phase 2 guard: no classifier at all, and
+        // this locator was never curated, so a real attempt cannot happen —
+        // leave it exactly as due as it was rather than let `index_locator`
+        // answer ambiguously.
+        if key.is_none() && !entry.trusted {
+            skipped_no_key += 1;
+            continue;
+        }
+        // Same budget the ordinary crawl and `run_recheck_pass` use. A denial
+        // leaves the entry untouched, to be retried on a later pass once
+        // headroom returns — never spent for free, never dropped.
+        match budget.try_take(&loc) {
+            Ok(()) => {}
+            Err(Denied::HostShare) => {
+                skipped_no_budget += 1;
+                continue;
+            }
+            Err(Denied::Exhausted) => {
+                skipped_no_budget += 1;
+                break;
+            }
+        }
+        attempted += 1;
+        let mut usage: Option<Usage> = None;
+        let outcome = index_locator(
+            cli,
+            &client,
+            key.as_deref(),
+            &model,
+            &gw,
+            &loc,
+            entry.kind,
+            entry.trusted,
+            &registry,
+            &mut baselines,
+            &mut usage,
+            &mut decisions,
+            now,
+        );
+        budget.settle(usage.map(|u| prices.cost(&u)));
+        match outcome {
+            // Indexed, or deliberately refused by the content-safety gate.
+            // `index_page` already logged WHY — this locator is decided
+            // about now, exactly as a fresh discovery would be.
+            Ok(was_indexed) => {
+                if was_indexed {
+                    indexed += 1;
+                } else {
+                    decided += 1;
+                }
+                seen.insert(loc.clone());
+                append_seen(seen_path, &loc);
+                schedule.forget(&loc);
+            }
+            Err(e) if is_gone_for_good(&e) => {
+                eprintln!("  thin-recheck: {loc} is gone ({e}); not retrying");
+                seen.insert(loc.clone());
+                append_seen(seen_path, &loc);
+                schedule.forget(&loc);
+                let _ = decisions.record(&loc, Outcome::Gone, &format!("{e}"), now);
+                decided += 1;
+            }
+            Err(e) => {
+                if let Some(thin) = e.chain().find_map(|c| c.downcast_ref::<TooThin>()) {
+                    if !thin.rendered {
+                        // A renderer fallback this run says nothing about
+                        // whether the page is thin — same discipline
+                        // `THIN_VERDICT_RUNS`'s own streak uses: no progress,
+                        // no reset.
+                        eprintln!(
+                            "  thin-recheck: {loc} — renderer fallback this run, not counted"
+                        );
+                    } else if thin.print == entry.last_print {
+                        eprintln!("  thin-recheck: {loc} — unchanged, backing off");
+                        schedule.record_unchanged(&loc, ceiling, now);
+                        unchanged += 1;
+                    } else {
+                        eprintln!(
+                            "  thin-recheck: {loc} — content changed but still only {} \
+                             describable character(s) (min {MIN_DESCRIBABLE_CHARS})",
+                            thin.print.visible
+                        );
+                        schedule.record_changed(&loc, thin.print, now);
+                        still_thin_changed += 1;
+                    }
+                } else if is_unresolvable_app(&e) || is_deterministic_refusal(&e) {
+                    // Configuration state (unregistered app) or a still-
+                    // loading app placeholder — leave the schedule untouched,
+                    // retried next pass, no progress charged either way.
+                    eprintln!("  thin-recheck: deferring {loc}: {e}");
+                } else {
+                    // Transient: a fetch timeout, an LLM hiccup. Retried next
+                    // pass, nothing burned.
+                    eprintln!("  thin-recheck: skip {loc}: {e:#}");
+                }
+            }
+        }
+    }
+
+    if !schedule.save() {
+        eprintln!("warn: thin-retired recheck schedule could not be fully persisted this pass");
+    }
+    eprintln!(
+        "thin-retired recheck complete: {attempted} attempted / {unchanged} unchanged / \
+         {still_thin_changed} still thin but changed / {indexed} indexed / {decided} \
+         otherwise decided / {skipped_no_key} skipped (no key) / {skipped_no_budget} skipped \
+         (budget) — {} tracked",
+        schedule.entries.len()
     );
     Ok(())
 }
@@ -9534,6 +10023,226 @@ mod tests {
         assert_eq!(Outcome::FlaggedOnRecheck.token(), "flagged-on-recheck");
     }
 
+    // --- retired-thin recheck (#43): a path back for a locator the
+    // too-thin gate retired, once its content genuinely improves ---
+
+    /// A freshly-retired locator is not immediately due — mirrors
+    /// `recheck_schedule_seeds_new_subjects_due_later_not_now`: it was just
+    /// judged deterministically thin, so there is nothing new to learn by
+    /// re-fetching it today.
+    #[test]
+    fn thin_retired_schedule_seeds_due_later_not_now() {
+        let f = TmpFile::new("thin-retired-seed");
+        let mut s = ThinRetiredSchedule::load(f.path(), &HashSet::new());
+        let now = 1_000_000;
+        let loc = format!("freenet:{ID}");
+        let print = ThinPrint::of("x", 1);
+        assert!(!s.entries.contains_key(&loc), "must start unseeded");
+        s.seed(&loc, "site", "@alice", false, print, now);
+        assert!(
+            now < s.entries[&loc].next_check_due,
+            "freshly seeded must not be immediately due"
+        );
+        assert_eq!(
+            s.entries[&loc].next_check_due,
+            now + RecheckTier::Standard.start_secs(),
+            "due at exactly the standard tier's starting interval from now"
+        );
+    }
+
+    /// Same doubling-then-reset shape as `RecheckSchedule`'s own backoff
+    /// (`recheck_unchanged_doubles_capped_and_changed_resets`): unchanged
+    /// content doubles the interval, capped at the ceiling; content that
+    /// moved (but is still thin) resets it back to the starting value and
+    /// remembers the new fingerprint.
+    #[test]
+    fn thin_retired_unchanged_doubles_capped_and_changed_resets() {
+        let f = TmpFile::new("thin-retired-backoff");
+        let mut s = ThinRetiredSchedule::load(f.path(), &HashSet::new());
+        let now = 1_000_000;
+        let loc = format!("freenet:{ID}");
+        let print = ThinPrint::of("x", 1);
+        s.seed(&loc, "site", "@alice", false, print, now);
+        let start = RecheckTier::Standard.start_secs();
+        let ceiling = RecheckTier::Standard.floor_secs();
+
+        s.record_unchanged(&loc, ceiling, now);
+        assert_eq!(s.entries[&loc].current_interval_secs, start * 2);
+        s.record_unchanged(&loc, ceiling, now);
+        assert_eq!(s.entries[&loc].current_interval_secs, start * 4);
+        for _ in 0..20 {
+            s.record_unchanged(&loc, ceiling, now);
+        }
+        assert_eq!(
+            s.entries[&loc].current_interval_secs, ceiling,
+            "must never exceed the ceiling"
+        );
+
+        let moved = ThinPrint::of("y", 1);
+        s.record_changed(&loc, moved, now);
+        assert_eq!(
+            s.entries[&loc].current_interval_secs, start,
+            "content moving must reset all the way to the starting interval, \
+             not merely shrink from wherever it had grown to"
+        );
+        assert_eq!(s.entries[&loc].last_print, moved);
+    }
+
+    /// The schedule persists across a reload, INCLUDING `kind`/`author`/
+    /// `trusted` — the fields `run_thin_retired_recheck_pass` needs to hand
+    /// the locator straight back to `index_locator` without re-deriving them.
+    #[test]
+    fn thin_retired_schedule_survives_a_reload() {
+        let f = TmpFile::new("thin-retired-persist");
+        let loc = format!("freenet:{ID}");
+        {
+            let mut s = ThinRetiredSchedule::load(f.path(), &HashSet::new());
+            let print = ThinPrint::of("x", 42);
+            s.seed(&loc, "site", "@curated_author", true, print, 1_000_000);
+            assert!(s.save());
+        }
+        let reloaded = ThinRetiredSchedule::load(f.path(), &HashSet::new());
+        let e = reloaded.entries.get(&loc).expect("must survive a reload");
+        assert_eq!(e.kind, "site");
+        assert_eq!(e.author, "@curated_author");
+        assert!(e.trusted);
+        assert_eq!(e.last_print, ThinPrint::of("x", 42));
+    }
+
+    /// A line with any corrupt field must be dropped whole, not partially
+    /// trusted — same discipline as `recheck_schedule_drops_a_corrupt_line_entirely`.
+    #[test]
+    fn thin_retired_schedule_drops_a_corrupt_line_entirely() {
+        let f = TmpFile::new("thin-retired-corrupt");
+        // Two DISTINCT valid locators (bare id vs. trailing-slash id — see
+        // `normalize_href_variants`), so the well-formed line cannot merely
+        // collide with the corrupt one and pass by accident.
+        fs::write(
+            f.path(),
+            format!(
+                "notanumber\t100\t1:1\t0\t@a\tfreenet:{ID}\n\
+                 1000\t100\t1:1\t0\t@b\tfreenet:{ID}/\n"
+            ),
+        )
+        .unwrap();
+        let s = ThinRetiredSchedule::load(f.path(), &HashSet::new());
+        assert!(
+            !s.entries.contains_key(&format!("freenet:{ID}")),
+            "corrupt line must be dropped"
+        );
+        assert!(
+            s.entries.contains_key(&format!("freenet:{ID}/")),
+            "a well-formed line must still load"
+        );
+    }
+
+    /// A locator already decided about by some OTHER path — indexed, refused,
+    /// gone — must not be carried forward, mirroring `Quarantine::load`'s own
+    /// `seen.contains` purge. Otherwise a locator that reached a final
+    /// decision through a different route stays in this schedule forever,
+    /// re-attempted on every future recheck pass.
+    #[test]
+    fn thin_retired_schedule_drops_entries_already_seen() {
+        let f = TmpFile::new("thin-retired-seen");
+        let loc = format!("freenet:{ID}");
+        fs::write(f.path(), format!("1000\t100\t1:1\t0\t@a\t{loc}\n")).unwrap();
+        let seen: HashSet<String> = [loc.clone()].into_iter().collect();
+        let s = ThinRetiredSchedule::load(f.path(), &seen);
+        assert!(
+            !s.entries.contains_key(&loc),
+            "an already-decided locator must not be carried forward"
+        );
+    }
+
+    /// `forget` is what a real recheck attempt uses once a locator is finally
+    /// decided about (indexed, refused, gone): the schedule must not keep
+    /// re-attempting something that has graduated to a real decision.
+    #[test]
+    fn thin_retired_forget_removes_the_entry() {
+        let f = TmpFile::new("thin-retired-forget");
+        let mut s = ThinRetiredSchedule::load(f.path(), &HashSet::new());
+        let loc = format!("freenet:{ID}");
+        s.seed(&loc, "site", "@a", false, ThinPrint::of("x", 1), 1_000_000);
+        assert!(s.entries.contains_key(&loc));
+        s.forget(&loc);
+        assert!(!s.entries.contains_key(&loc));
+    }
+
+    /// `run_once`'s `RetiredThin` arm must actually seed the schedule at the
+    /// moment of retirement — the whole mechanism is inert if retirement and
+    /// seeding drift apart. Source-scraped like `the_too_thin_refusal_is_wired
+    /// _to_the_retirement`: this branch lives inside `run_once`, which needs a
+    /// node, a renderer and a filesystem to drive directly.
+    #[test]
+    fn thin_retired_retirement_seeds_the_schedule() {
+        let src = include_str!("main.rs");
+        let production = src
+            .split("\nmod tests")
+            .next()
+            .expect("source must have a pre-test region");
+        assert!(
+            !production.contains("fn thin_retired_retirement_seeds_the_schedule"),
+            "the scan region must exclude the test module, or the pin matches itself"
+        );
+        let body = strip_comments(production);
+        let retired_at = body
+            .find("retired_thin += 1;")
+            .expect("the retirement counter must still exist");
+        let seed_at = body[retired_at..]
+            .find("thin_retired.seed(&loc, kind, &author, is_trusted, thin.print, now_secs());")
+            .map(|i| retired_at + i)
+            .expect("retirement must seed the thin-retired recheck schedule (#43)");
+        let decisions_at = body[retired_at..]
+            .find("Outcome::RetiredThin,")
+            .map(|i| retired_at + i)
+            .expect("the RetiredThin decision must still be logged");
+        assert!(
+            seed_at < decisions_at,
+            "seeding must happen alongside the SAME retirement branch that logs \
+             Outcome::RetiredThin, not some other RetiredThin-adjacent path"
+        );
+    }
+
+    /// `run_thin_retired_recheck_pass` must hand a due locator to
+    /// `index_locator` — the SAME call a fresh discovery goes through — rather
+    /// than re-implementing fetch/classify/publish as a second parallel path
+    /// (see #43's own recommendation against building that). Also confirms
+    /// the budget gate runs BEFORE the real attempt, so an exhausted budget
+    /// cannot be bypassed.
+    #[test]
+    fn thin_retired_recheck_reuses_index_locator_and_gates_on_budget() {
+        let src = include_str!("main.rs");
+        let production = src
+            .split("\nmod tests")
+            .next()
+            .expect("source must have a pre-test region");
+        let at = production
+            .find("fn run_thin_retired_recheck_pass(")
+            .expect("run_thin_retired_recheck_pass must exist");
+        let end = production[at..]
+            .find("\nfn ")
+            .map(|e| at + e)
+            .unwrap_or(production.len());
+        let body = strip_comments(&production[at..end]);
+        assert!(
+            !body.contains("get_page_enumerating(") && !body.contains("describe_llm("),
+            "the pass must not re-fetch or re-classify itself — that duplicates \
+             index_locator's own logic and is exactly the second parallel system \
+             #43 recommends against building"
+        );
+        let take_at = body
+            .find("budget.try_take(&loc)")
+            .expect("a real attempt must be gated on the shared budget");
+        let call_at = body
+            .find("index_locator(")
+            .expect("a due entry must be handed to index_locator");
+        assert!(
+            take_at < call_at,
+            "the budget must be reserved BEFORE index_locator runs, or a denied \
+             attempt still spends"
+        );
+    }
+
     // --- deterministic thinness ---
 
     /// A locator whose page is deterministically contentless must LEAVE the
@@ -12428,16 +13137,23 @@ mod tests {
         // helper. Today: the definition, the `Ok` arm (genuinely decided), the
         // gone-for-good arm (the server says it does not exist), the
         // exhausted-cycles loop (out of retries), the author-share eviction
-        // victim, and the deterministic-thinness retirement. A SEVENTH is a
-        // blacklist returning by another name.
+        // victim, the deterministic-thinness retirement, and — see #43 —
+        // `run_thin_retired_recheck_pass`'s own `Ok` arm and gone-for-good
+        // arm (a retired-thin locator that a real recheck attempt finally
+        // decides about, the same two categories `run_once` already has, on
+        // its own separate schedule). AN EIGHTH beyond these is a blacklist
+        // returning by another name.
         //
         // The thinness retirement was added deliberately and this count went 5 ->
         // 6 with it, which is the pin working rather than the pin being wrong: it
         // IS a new permanent exclusion, and it earns its place only because the
         // verdict is proven deterministic first — `THIN_VERDICT_RUNS` identical
-        // renders, with any difference resetting the streak. Do not raise this
-        // number for a path that merely FAILED to reach a locator; that is the
-        // mistake `Quarantine` exists to undo.
+        // renders, with any difference resetting the streak. The #43 recheck pass
+        // took it 6 -> 8 for the identical reason: both its writers gate on
+        // `index_locator` having actually returned a genuine decision (`Ok`, or
+        // `is_gone_for_good`), never on a fetch that merely failed to reach the
+        // locator. Do not raise this number for a path that merely FAILED to
+        // reach a locator; that is the mistake `Quarantine` exists to undo.
         //
         // Counted on both the stripped and raw source: stripping at `//` also
         // truncates at a `https://` in a string literal, which could hide a call
@@ -12446,15 +13162,16 @@ mod tests {
         let stripped = strip_comments(production);
         assert_eq!(
             stripped.matches("append_seen(").count(),
-            6,
+            8,
             "only the decided paths may write to the permanent seen file: the \
              definition, the Ok arm, the gone-for-good arm, the out-of-cycles \
-             loop, the author-share eviction victim, and the \
-             deterministically-thin retirement"
+             loop, the author-share eviction victim, the deterministically-thin \
+             retirement, and the thin-retired recheck pass's own Ok/gone-for-good \
+             arms"
         );
         assert_eq!(
             production.matches("append_seen(").count(),
-            6,
+            8,
             "stripping comments must not have hidden a call site"
         );
         // The Ok arm must release the quarantine entry. Without it a locator we
