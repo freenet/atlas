@@ -24,7 +24,7 @@ bs58.workspace = true
 rand.workspace = true
 # Shared contract upgrade-migration machinery (registry shape, key derivation,
 # backward-probe decision driver). Contract half only: Atlas has no delegate.
-freenet-migrate = "0.5.0"
+freenet-migrate = "0.6"
 
 [build-dependencies]
 # Build-time registry parsing + hash validation + lineage codegen for

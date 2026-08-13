@@ -153,7 +153,7 @@ mod tests {
         let mut probed = Vec::new();
         while let Step::Get(id) = driver.next_action() {
             probed.push(id);
-            driver.on_timeout(id);
+            driver.on_unknown(id);
         }
         assert_eq!(
             probed,

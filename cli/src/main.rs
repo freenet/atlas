@@ -22,7 +22,7 @@ use serde::Serialize;
 
 use api::NodeClient;
 use freenet_migrate::{
-    migrate_contract, FoldAllAck, Outcome, ProbeIo, ProbeStateOps, SelectionPolicy,
+    migrate_contract, FoldAllAck, Outcome, ProbeAnswer, ProbeIo, ProbeStateOps, SelectionPolicy,
 };
 use freenet_stdlib::prelude::{ContractInstanceId, Parameters};
 
@@ -602,9 +602,18 @@ async fn migrate(cli: &Cli, dir: &Path, dry_run: bool, allow_missing: &[String])
             Some(merged)
         }
         Outcome::SeedLocal { .. } => None,
+        // At least one candidate never got a definitive answer (unreachable, or
+        // its state failed pre-flight). Nothing to fold or PUT — the operator
+        // already sees this via `probe_errors`, which every path that can
+        // produce an `Unknown` answer also increments, so the dry-run
+        // `probe_errors > 0` bail below (and a real run's abort through the
+        // `ProbeIo::Err` channel before an outcome is even reached) already
+        // covers it.
+        Outcome::Indeterminate { .. } => None,
         Outcome::NoLegacy { .. } => {
             unreachable!("an empty lineage bails before the probe starts")
         }
+        _ => unreachable!("freenet-migrate added an Outcome variant Atlas does not handle"),
     };
 
     if let Some(folded) = &folded {
@@ -839,7 +848,7 @@ impl<G> MigrateProbeIo<G> {
 impl<G: LegacyGet> ProbeIo for MigrateProbeIo<G> {
     type Error = anyhow::Error;
 
-    async fn get(&mut self, id: ContractInstanceId) -> Result<Option<Vec<u8>>> {
+    async fn get(&mut self, id: ContractInstanceId) -> Result<ProbeAnswer> {
         let i = self.next_idx;
         self.next_idx += 1;
         match classify_probe(self.client.get_state(id).await) {
@@ -856,11 +865,11 @@ impl<G: LegacyGet> ProbeIo for MigrateProbeIo<G> {
                      (merging is idempotent) and confirm with `atlasctl show`."
                 );
                 self.missing.push(id.to_string());
-                Ok(None)
+                Ok(ProbeAnswer::Absent)
             }
             LegacyProbe::Empty => {
                 println!("legacy[{i}] {id} is empty — nothing to carry forward");
-                Ok(None)
+                Ok(ProbeAnswer::Absent)
             }
             LegacyProbe::State { bytes, live, tomb } => {
                 println!("legacy[{i}] {id} holds {live} live / {tomb} tombstone record(s)");
@@ -872,12 +881,17 @@ impl<G: LegacyGet> ProbeIo for MigrateProbeIo<G> {
                 match preflight_generation(&bytes, &self.index_params) {
                     Ok(()) => {
                         self.hits += 1;
-                        Ok(Some(bytes))
+                        Ok(ProbeAnswer::State(bytes))
                     }
                     Err(e) if self.dry_run => {
+                        // Real bytes came back, but they would be rejected by the
+                        // contract, so this generation is unusable, not absent —
+                        // reported and counted the same as a failed dry-run GET
+                        // (below), never a positive Absent (that would understate
+                        // what is actually there).
                         eprintln!("legacy[{i}] {id} PRE-FLIGHT FAILED: {e:#}");
                         self.probe_errors += 1;
-                        Ok(None)
+                        Ok(ProbeAnswer::Unknown)
                     }
                     Err(e) => Err(e).with_context(|| {
                         format!("legacy[{i}] {id} would be rejected by the contract")
@@ -887,7 +901,7 @@ impl<G: LegacyGet> ProbeIo for MigrateProbeIo<G> {
             LegacyProbe::Failed(e) if self.dry_run => {
                 eprintln!("legacy[{i}] {id} GET FAILED (reported, NOT counted as empty): {e:#}");
                 self.probe_errors += 1;
-                Ok(None)
+                Ok(ProbeAnswer::Unknown)
             }
             LegacyProbe::Failed(e) => Err(e).with_context(|| {
                 format!(
