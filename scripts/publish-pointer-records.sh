@@ -146,17 +146,29 @@ say "$POINTER_WASM -> $ACTUAL_PCH (matches)"
 
 # ----------------------------------------- 2. AGAINST WHAT IS ACTUALLY ON THE NETWORK
 #
-# River has to unpack a webapp archive for this. Atlas gets a cleaner check for
-# free, because its index contract IS published standalone and its address is
-# BLAKE3(code_hash || params): derive the address the COMMITTED wasm would have,
-# and confirm the network actually holds a contract there. If the committed wasm
-# were not the live generation, the derived address would be a different one and
-# the GET would come back "not found".
+# Two checks, and it matters which one carries which weight.
 #
-# This is worth having precisely because it has already failed once here. On
-# 2026-08-18 PUBLISHING-KEYS.md named an index id two re-keys stale, and both
-# ids answered a GET — so "it resolves" is not evidence, and only deriving from
-# the committed bytes distinguishes them.
+# (a) The record names a generation that is actually PUBLISHED. Atlas's index is
+#     published standalone at BLAKE3(code_hash || params), so we derive the
+#     address the committed wasm implies and confirm the network holds it.
+#
+# (b) The record does NOT name a SUPERSEDED generation.
+#
+# (b) exists because (a) is weaker than it looks, and I checked rather than
+# assumed: a legacy Atlas index wasm ALSO passes (a). Old generations stay on
+# the network and keep answering — the v0.8.5-pre-classification generation
+# returned 48674 bytes on a live GET while the current one returned 69446. So
+# "the network holds a contract at this address" proves that generation exists,
+# NOT that it is current. Stating otherwise would be a guard that cannot fail.
+#
+# That is not hypothetical: on 2026-08-18 PUBLISHING-KEYS.md named an index id
+# TWO re-keys stale and it answered a GET perfectly well. So (b) compares the
+# record's hash against every preserved wasm under contracts/index-contract/legacy/.
+#
+# What actually guarantees "committed == current" is neither of these: it is
+# Atlas's own `contract-key` CI job, which rebuilds the wasm and diffs it
+# against the committed artifact. These two checks are the network-side
+# complement to that, not a replacement for it.
 echo ""
 echo "[2] the code hash in each record == the artifact LIVE ON THE NETWORK"
 
@@ -198,9 +210,25 @@ but $WASM_PATH hashes to $COMMITTED_HASH. Re-sign before publishing."
     TARGET_ID="$(fdev get-contract-id --code "$WASM_PATH" --parameters "$WORK/idxp_$i.bin" 2>/dev/null | tail -1)"
     [ -n "$TARGET_ID" ] || die "could not derive the index contract id for $APP_ID"
     say "[2] the committed wasm derives index id $TARGET_ID"
+    # (b) first: a superseded generation is on the network too, so the GET below
+    # cannot tell it apart from the current one.
+    if [ -d "$(dirname "$WASM_PATH")/legacy" ]; then
+        for old_wasm in "$(dirname "$WASM_PATH")/legacy"/*.wasm; do
+            [ -f "$old_wasm" ] || continue
+            if [ "$(b3sum "$old_wasm" | cut -d' ' -f1)" = "$CODE_HASH" ]; then
+                die "[2] the record names $CODE_HASH, which is $(basename "$old_wasm") —
+a PRESERVED LEGACY generation, not the current one.
+
+That generation is still on the network and still answers a GET, so nothing
+downstream would have told you. This is exactly the mistake PUBLISHING-KEYS.md
+made: it named an index id two re-keys stale and it resolved fine."
+            fi
+        done
+        say "[2] the record does not name any preserved legacy generation"
+    fi
     if fdev -p "$PORT" execute get --timeout 150 -o "$WORK/live_$i.bin" "$TARGET_ID" >"$WORK/live_$i.log" 2>&1 \
        && [ -s "$WORK/live_$i.bin" ]; then
-        say "[2] the network holds that contract ($(stat -c%s "$WORK/live_$i.bin") bytes) — the record names the LIVE generation"
+        say "[2] the network holds that generation ($(stat -c%s "$WORK/live_$i.bin") bytes) — it is published"
     elif grep -qF "Contract not found: $TARGET_ID" "$WORK/live_$i.log"; then
         die "[2] the network has NO contract at $TARGET_ID.
 
