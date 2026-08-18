@@ -1,0 +1,47 @@
+# Atlas's pointer records — stable identity for a contract that re-keys.
+#
+# A pointer record is a tiny contract at a FIXED address whose state names the
+# CURRENT code hash of one of Atlas's artifacts. Third parties resolve it
+# instead of pinning a key, so they survive our re-keys. See
+# freenet-core#5194 and the contract's README:
+# https://github.com/freenet/freenet-migrate/tree/main/contracts/pointer-contract
+#
+# ## Why Atlas specifically needs this
+#
+# The index contract re-keys on any `common/` or `contracts/` change, which
+# FREENET.md already calls out as "exactly the failure class #5194 is meant to
+# fix". That is not hypothetical here: on 2026-08-18 `PUBLISHING-KEYS.md` was
+# found naming `4uasDWz1zGhT845Tkey9ai3Yo8GRXRvtVC7hX3o5tj6A` as the index id,
+# which derives from a *preserved legacy* WASM and was TWO re-keys behind. Both
+# ids answer a GET — the stale one returned 17209 bytes against the current
+# 69446 — so a reader following that file got a plausible, smaller, frozen index
+# and no error at all. This file exists so that value is published and checked
+# rather than hand-maintained.
+#
+# ## Editing
+#
+# Do not hand-edit code_hash, version, state or pointer_key. Run
+# `scripts/sign-pointer-records.sh` and commit the result; CI's
+# check-pointer-freshness fails the PR if the two drift.
+
+# Atlas's ROOT identity (~/.config/atlas/root.key), the same key that signs the
+# web-container metadata and the KeyAuth authorising the online key. Atlas is a
+# single-writer system, so its trust model already matches the pointer's: one
+# root key, and losing it makes the live Atlas permanently un-updatable.
+#
+# Verified rather than asserted: this key rederives Atlas's own published
+# web-container id 771DvtPMwt2PumPyrFvsz7fpvU1gogcmb5qtS1yYEEH9.
+author_verifying_key = "430b530d2089c82db23df0b6f01e3f7d04069714ad8ee48e3732280f6f31e9f8"
+
+# The pointer contract's own frozen code hash. A CONSTANT, never recomputed:
+# every pointer address is BLAKE3(this ‖ params), so a locally rebuilt pointer
+# WASM lands every record at an address nobody else derives.
+pointer_code_hash = "8wnAPaSRY1oYZCz723fdwK6BgzL6q8ozP3buVovXnt6v"
+
+[[record]]
+app_id = "atlas.index-contract"
+wasm_path = "contracts/index-contract/atlas_index_contract.wasm"
+pointer_key = "BwsKx5iDhjBJGDNAPtZbbC9f6twDAUrnb2Yh1D6Wng2K"
+version = 1
+code_hash = "ee6713f87a43f870f8c697f1749b4e367cb3dd2d5affb9d7a51cd27dce12647b"
+state = "00000001ee6713f87a43f870f8c697f1749b4e367cb3dd2d5affb9d7a51cd27dce12647ba12555d602e821fb61fd06984ad31fe76d3bb794683937278450097fc5957f8ca7af237c8c3bc2223222810fb15bb5fe51c1cd74d3175e6ac67b9cd767b82c0e"

@@ -68,6 +68,57 @@ jobs:
           ATLAS_INDEX_ID: PLACEHOLDERnotARealIndexId111111111111111111
         run: cargo check --locked -p atlas-ui --target wasm32-unknown-unknown
 
+  pointer-freshness:
+    name: pointer records name the committed WASM
+    runs-on: ubuntu-latest
+    # Atlas's index re-keys on any common/ or contracts/ change, and a published
+    # pointer that still names the OLD hash is worse than no pointer: an
+    # integrator resolves it, gets a confident answer, and derives a dead key.
+    # This fails the build when the WASM moved and no new record was signed.
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Full history: the gate compares against the PR's base commit to
+          # confirm the version moved and that no record vanished.
+          fetch-depth: 0
+      - run: command -v b3sum || cargo install b3sum --locked
+
+      # Pinned by revision. This tool decides what a record's bytes ARE; a gate
+      # whose oracle can change under it is not a gate. `--locked` matters as
+      # much as `--rev`: without it cargo re-resolves and the installed binary
+      # is not the one that was tested.
+      - name: Install pointer-record
+        run: |
+          REV="$(grep -m1 '^POINTER_TOOL_REV=' scripts/check-pointer-freshness.sh \
+                 | sed 's/.*:-\([0-9a-f]*\)}.*/\1/')"
+          # Validate the SHAPE, not just non-emptiness: if the line stops
+          # matching, sed passes it through unchanged, which is non-empty and
+          # would sail past a bare `test -n` into a garbage rev.
+          case "$REV" in
+            [0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]*) ;;
+            *) echo "POINTER_TOOL_REV is not a hex SHA: '$REV'"; exit 1 ;;
+          esac
+          cargo install --git https://github.com/freenet/freenet-migrate \
+            --rev "$REV" --features publish --locked freenet-pointer-contract
+
+      # This workflow runs on pushes to main as well as on PRs, and on a push
+      # `github.event.pull_request.*` is EMPTY — passing those through would
+      # invoke `--ci "" ""` on every main push. Two modes, so both events are
+      # actually checked rather than one of them failing on an empty argument.
+      - name: Verify every pointer record (PR)
+        if: github.event_name == 'pull_request'
+        run: |
+          ./scripts/check-pointer-freshness.sh --ci \
+            "${{ github.event.pull_request.base.sha }}" \
+            "${{ github.event.pull_request.head.sha }}"
+
+      # On main the base/head comparison has no meaning, but the invariant that
+      # matters most still does: does the committed record name the committed
+      # WASM, and is it signed by the key FREENET.md publishes?
+      - name: Verify every pointer record (push to main)
+        if: github.event_name != 'pull_request'
+        run: ./scripts/check-pointer-freshness.sh
+
   contract-key:
     name: committed contract WASM is current
     runs-on: ubuntu-latest
