@@ -76,9 +76,23 @@ echo "=============================================================="
 # ---------------------------------------------------------------- PROVENANCE
 echo ""
 echo "[provenance] clean tree, on main, at origin/main, CI green"
-if [ -n "$(git status --porcelain)" ]; then
-    git status --short | sed 's/^/    /'
-    die "working tree is not clean. Publish only from a clean checkout of main."
+# TRACKED modifications only. An untracked file cannot change what is
+# published: every path this script reads (pointer-records.toml, the wasm) is
+# tracked, and the records themselves are compared against the committed blob
+# and the live network further down. Refusing on untracked files would block
+# every real publish here forever, because a working Atlas checkout normally
+# carries `stage/`, `meta.cbor` and `webapp.tar.xz` from the UI publish flow.
+#
+# They are still PRINTED rather than ignored silently — if one of them is a
+# surprise, the operator should see it before writing to the network.
+if [ -n "$(git status --porcelain --untracked-files=no)" ]; then
+    git status --short --untracked-files=no | sed 's/^/    /'
+    die "tracked files are modified. Publish only from a clean checkout of main."
+fi
+UNTRACKED="$(git status --porcelain | grep '^??' || true)"
+if [ -n "$UNTRACKED" ]; then
+    say "note: untracked files present (they cannot affect what is published):"
+    printf '%s\n' "$UNTRACKED" | sed 's/^/      /'
 fi
 BRANCH="$(git rev-parse --abbrev-ref HEAD)"
 [ "$BRANCH" = "main" ] || die "on branch '$BRANCH'. Publish only from main (see ~/.claude/rules/publish-from-main.md)."
