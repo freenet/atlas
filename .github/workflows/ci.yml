@@ -94,10 +94,15 @@ jobs:
           # Validate the SHAPE, not just non-emptiness: if the line stops
           # matching, sed passes it through unchanged, which is non-empty and
           # would sail past a bare `test -n` into a garbage rev.
+          # Reject empty, ANY character that is not lowercase hex, and anything
+          # shorter than a short SHA. The previous form was
+          # `[0-9a-f]x7 *`, which accepts arbitrary TRAILING text: `abcdef1zzzz`
+          # and even `abcdef1 --features evil` passed it. A guard whose comment
+          # says "validates the SHAPE" has to actually do that.
           case "$REV" in
-            [0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]*) ;;
-            *) echo "POINTER_TOOL_REV is not a hex SHA: '$REV'"; exit 1 ;;
+            ""|*[!0-9a-f]*) echo "POINTER_TOOL_REV is not lowercase hex: '$REV'"; exit 1 ;;
           esac
+          test "${#REV}" -ge 7 || { echo "POINTER_TOOL_REV too short: '$REV'"; exit 1; }
           cargo install --git https://github.com/freenet/freenet-migrate \
             --rev "$REV" --features publish --locked freenet-pointer-contract
 

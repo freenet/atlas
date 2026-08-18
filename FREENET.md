@@ -67,4 +67,3 @@ Handle **every** arm — a bare `if let Some(r) = outcome.resolved()` silently d
 **It solves addressing only.** It tells you which code hash is current; it says nothing about whether the state under the previous key came with it. For Atlas the index is curator-published and re-published forward, so in practice it does — but that is a property of how Atlas operates, not something the pointer guarantees, and it is worth keeping the two apart.
 
 - Depend on `atlas-common` for the wire types rather than re-deriving the index's state/summary/delta shapes by hand.
-- Depend on `atlas-common` for the wire types rather than re-deriving the index's state/summary/delta shapes by hand.

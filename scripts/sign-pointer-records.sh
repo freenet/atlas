@@ -43,6 +43,10 @@ for arg in "$@"; do
 done
 
 command -v b3sum >/dev/null 2>&1 || die "b3sum not found. Install with: cargo install b3sum"
+# `xxd` hex-encodes the raw seed on its way to the signer. Without this check a
+# missing xxd surfaces as "no signing key on stdin", which points at the key
+# file rather than at the missing tool.
+command -v xxd >/dev/null 2>&1 || die "xxd not found (needed to hex-encode the raw key seed)"
 command -v pointer-record >/dev/null 2>&1 || die "pointer-record not found — see scripts/check-pointer-freshness.sh for the install line"
 [ -f "$KEY_FILE" ] || die "key file not found: $KEY_FILE"
 [ -f "$TOML_PATH" ] || die "$TOML_PATH not found"

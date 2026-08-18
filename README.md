@@ -66,10 +66,25 @@ atlasctl webapp-put --wasm <container.wasm> --archive webapp.tar.xz --metadata m
 ```
 
 When the rebuild changes the contract WASM, the **re-key ritual** is mandatory
-and CI enforces it: preserve the outgoing generation's WASM under
-`contracts/index-contract/legacy/` and prepend its code hash to
-`LEGACY_INDEX_CODE_HASHES` in `cli/src/migration.rs`, in the same change. Skipping
-it orphans the curated entries at an address nothing probes.
+and CI enforces it, in three parts, all in the same change:
+
+1. Preserve the outgoing generation's WASM under `contracts/index-contract/legacy/`.
+2. Prepend its code hash to `LEGACY_INDEX_CODE_HASHES` in `cli/src/migration.rs`.
+3. **Re-sign the pointer record**: `./scripts/sign-pointer-records.sh`, then
+   `./scripts/publish-pointer-records.sh` from `main` after the change merges.
+
+Steps 1-2 carry OUR curated entries forward. Step 3 carries THIRD PARTIES
+forward — the pointer record is what they resolve instead of pinning an id that
+moves (see `FREENET.md`). Same trigger, different people, and the pointer
+failure is the quieter of the two: a stale pointer answers confidently with a
+dead id rather than erroring. CI's `pointer-freshness` job fails the build if
+step 3 is skipped.
+
+Skipping steps 1-2 orphans the curated entries at an address nothing probes.
+Skipping step 3 strands anyone integrating with Atlas — which has already
+happened once here: `PUBLISHING-KEYS.md` named an index id two re-keys stale,
+and because both the stale and current ids answer a GET, a reader got a
+plausible, smaller, frozen index and no error at all.
 
 ### App registry
 
