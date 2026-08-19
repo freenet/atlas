@@ -226,9 +226,17 @@ but $WASM_PATH hashes to $COMMITTED_HASH. Re-sign before publishing."
     say "[2] the committed wasm derives index id $TARGET_ID"
     # (b) first: a superseded generation is on the network too, so the GET below
     # cannot tell it apart from the current one.
-    if [ -d "$(dirname "$WASM_PATH")/legacy" ]; then
-        for old_wasm in "$(dirname "$WASM_PATH")/legacy"/*.wasm; do
-            [ -f "$old_wasm" ] || continue
+    # Enumerated with `git ls-files`, not a filesystem glob. "Preserved
+    # generation" means COMMITTED, so a stray untracked wasm left in `legacy/`
+    # by a local rebuild is not one and must not be consulted. It would only
+    # ever cause a spurious refusal rather than a bad publish, but a confusing
+    # refusal on a file that is not part of the repo is still worth not having —
+    # and this is the one place where an untracked file is read by logic beyond
+    # the clean-tree check relaxed above, so the two changes belong together.
+    LEGACY_DIR="$(dirname "$WASM_PATH")/legacy"
+    if [ -d "$LEGACY_DIR" ]; then
+        while IFS= read -r old_wasm; do
+            if [ -z "$old_wasm" ] || [ ! -f "$old_wasm" ]; then continue; fi
             if [ "$(b3sum "$old_wasm" | cut -d' ' -f1)" = "$CODE_HASH" ]; then
                 die "[2] the record names $CODE_HASH, which is $(basename "$old_wasm") —
 a PRESERVED LEGACY generation, not the current one.
@@ -237,8 +245,8 @@ That generation is still on the network and still answers a GET, so nothing
 downstream would have told you. This is exactly the mistake PUBLISHING-KEYS.md
 made: it named an index id two re-keys stale and it resolved fine."
             fi
-        done
-        say "[2] the record does not name any preserved legacy generation"
+        done < <(git ls-files "$LEGACY_DIR/*.wasm")
+        say "[2] the record does not name any COMMITTED legacy generation"
     fi
     if fdev -p "$PORT" execute get --timeout 150 -o "$WORK/live_$i.bin" "$TARGET_ID" >"$WORK/live_$i.log" 2>&1 \
        && [ -s "$WORK/live_$i.bin" ]; then
