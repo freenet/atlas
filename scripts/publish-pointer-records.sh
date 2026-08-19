@@ -187,7 +187,8 @@ echo ""
 echo "[2] the code hash in each record == the artifact LIVE ON THE NETWORK"
 
 # --------------------------------------------------------------- PER-RECORD
-N="$(grep -c '^\[\[record\]\]' "$TOML_PATH")"
+N="$(pointer_record_count "$TOML_PATH")"
+[ "${N:-0}" -gt 0 ] || die "no [[record]] blocks in $TOML_PATH"
 # No PUB_STATE array: the bytes live in $WORK/state_$i.bin, written below.
 # Keeping a second copy in a shell variable would be two things that can
 # disagree about what we are publishing.

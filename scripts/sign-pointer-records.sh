@@ -83,7 +83,8 @@ hex_key() {
 AUTHOR_VK="$(top_level_field author_verifying_key)"
 [ -n "$AUTHOR_VK" ] || die "no author_verifying_key in $TOML_PATH"
 
-N="$(grep -c '^\[\[record\]\]' "$TOML_PATH")"
+N="$(pointer_record_count "$TOML_PATH")"
+[ "${N:-0}" -gt 0 ] || die "no [[record]] blocks in $TOML_PATH"
 CHANGED=0
 
 for i in $(seq 1 "$N"); do

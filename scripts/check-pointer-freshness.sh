@@ -126,11 +126,22 @@ AUTHOR_VK="$(top_level_field author_verifying_key)"
 # FREENET.md and verifies every record against it. If this file and that file
 # disagree, we sign records nobody can verify — and it fails silently, because
 # a record signed by the wrong key is perfectly well-formed.
+#
+# Matched as a WHOLE LINE (`-qx`), never as a substring. The key is published in
+# FREENET.md alone on its own line, and a substring match accepts any value that
+# is merely a PREFIX or SUFFIX of it — a truncated key, or one carrying an added
+# prefix in one file only — which is precisely the disagreement this check exists
+# to catch. It failed OPEN on exactly its own subject matter: a key shortened in
+# this file alone still read as "present in FREENET.md".
 echo "== author key =="
-if ! grep -qF "$AUTHOR_VK" "$FREENET_MD"; then
+if ! grep -qxF "$AUTHOR_VK" "$FREENET_MD"; then
     echo "FAILED: $TOML_PATH publishes author_verifying_key"
     echo "  $AUTHOR_VK"
-    echo "but $FREENET_MD does not contain that value."
+    echo "but $FREENET_MD does not carry that value on a line of its own."
+    echo ""
+    echo "A near-miss counts as a mismatch: a truncated key, or one written with a"
+    echo "prefix in only one of the two files, is a DIFFERENT published anchor even"
+    echo "though it reads almost the same."
     echo ""
     echo "Integrators take the author key from $FREENET_MD. If the two disagree,"
     echo "every record we sign is one they will reject — and the record will look"
