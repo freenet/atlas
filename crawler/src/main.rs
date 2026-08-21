@@ -1190,18 +1190,33 @@ impl<'a> Budget<'a> {
     /// the call failed after the tokens were already burned.
     ///
     /// `None` means no measurement exists at all: the attempt never reached the
-    /// LLM (a fetch failure, a page too thin to describe). The reservation then
-    /// STANDS, unchanged. That is the pre-existing charge-before-the-call
-    /// conservatism, kept deliberately: over-counting is the safe direction for a
-    /// spend cap, and an attempt that consumed a fetch and a render is not free
-    /// to the operator merely because it was free to OpenAI.
+    /// LLM (a fetch failure, a page too thin to describe). The reservation is then
+    /// revised to ZERO — no tokens were burned, so no money is owed.
+    ///
+    /// This reverses the earlier charge-before-the-call conservatism, which let a
+    /// fetch failure keep a full worst-case LLM reservation on the grounds that
+    /// over-counting is the safe direction for a spend cap. It is the safe
+    /// direction for the CAP, but the cap is a proxy for money, and charging
+    /// dollars for a call that never happened made retries look expensive when
+    /// they are not. That apparent expense is what justified quarantining a
+    /// briefly-unreachable site for a week (see `QUARANTINE_SECS`), so the
+    /// conservatism bought a rounding error in the ledger and cost real sites
+    /// their place in the index.
+    ///
+    /// The ATTEMPT is still counted: `revise` rewrites the charge in place rather
+    /// than removing it, so the row survives and `calls_in_window` still bills it
+    /// against `--daily-max`. Only `--monthly-max`, the money cap, is refunded.
+    /// That split is the point — attempt caps go on bounding how hard we hammer,
+    /// the money cap stops paying for work OpenAI never did.
+    ///
+    /// `None` genuinely means zero tokens: every path that reaches the model sets
+    /// `usage` (see the two `*usage = Some(...)` assignments), including the
+    /// failure path, which reports a deliberately-high estimate via `Some`.
     fn settle(&mut self, cost: Option<Micros>) {
         let Some(id) = self.in_flight.take() else {
             return;
         };
-        let Some(cost) = cost else {
-            return;
-        };
+        let cost = cost.unwrap_or(0);
         let before = self.ledger.revise(id, cost);
         if cost >= before {
             let extra = cost - before;
@@ -1875,7 +1890,30 @@ impl Pending {
 ///
 /// Doubles on each cycle (see `due_after`), so a link that keeps failing costs
 /// geometrically less over time instead of the same 3 attempts every week.
-const QUARANTINE_SECS: u64 = 7 * 24 * 60 * 60;
+///
+/// ONE HOUR, not one week. The first cooldown is the one that decides how long a
+/// live site stays missing, and the dominant transient failure here is a link
+/// posted in a room minutes after its contract was published: the node answers
+/// the crawler's GET with `NotFound` until that contract propagates, so all three
+/// attempts fail inside the first couple of hours and the site is then exiled for
+/// the whole base cooldown. `2pth6E5wUoA3…` ("Anonymous Freenet Interviews") was
+/// lost exactly this way — discovered 35 minutes after publication, three
+/// `http 500` (node `NotFound`) failures between 09:10 and 11:14, quarantined for
+/// seven days, and still absent when the room asked why four days later. It
+/// served HTTP 200 within a day.
+///
+/// Re-linking cannot rescue such a site either: `capture_filter` suppresses
+/// re-discovery of anything held here, deliberately, so the cooldown is the ONLY
+/// clock that matters.
+///
+/// Shortening it is affordable because a failed attempt is now genuinely free in
+/// money (see `Budget::settle`) — it is one HTTP GET to the local node, no LLM
+/// call. The geometric doubling still protects a genuinely dead link: it reaches
+/// day-scale intervals within a few cycles, and `MAX_QUARANTINE_CYCLES` raises
+/// the total span to ~170 days, LONGER than the ~105 days the old four cycles
+/// covered at a week's base, while cutting time-to-recovery from a week to an
+/// hour. Both directions improve; neither is traded for the other.
+const QUARANTINE_SECS: u64 = 60 * 60;
 
 /// How many retry cycles a locator gets before we accept that it is gone and
 /// mark it seen for good.
@@ -1886,10 +1924,25 @@ const QUARANTINE_SECS: u64 = 7 * 24 * 60 * 60;
 /// billed attempts per cycle FOREVER. With `--daily-max 200` and 3 attempts a
 /// cycle, ~467 dead links is enough for re-testing them to consume the entire
 /// daily budget in perpetuity and the index to stop growing — reachable by
-/// ordinary link rot in months. Four cycles at a doubling cooldown gives a
-/// genuinely transient outage four chances across ~15 weeks, and caps the
-/// lifetime cost of a dead link at 12 attempts rather than an unbounded rate.
-const MAX_QUARANTINE_CYCLES: u32 = 4;
+/// ordinary link rot in months. A doubling cooldown gives a genuinely transient
+/// outage several chances across months, and caps the lifetime cost of a dead
+/// link at `MAX_ATTEMPTS * MAX_QUARANTINE_CYCLES` attempts rather than an
+/// unbounded rate.
+///
+/// TWELVE cycles, paired with the one-hour `QUARANTINE_SECS` base. The two
+/// constants only mean anything together: `2^12 - 1` hours is ~170 days of
+/// coverage, MORE than the ~105 days four cycles bought at a week's base, and
+/// the first retry now lands an hour after the failure instead of a week.
+///
+/// The budget worry that set this at 4 is weaker than it reads. It assumed each
+/// attempt costs a `--daily-max` slot AND a worst-case LLM reservation; the
+/// reservation half is now refunded when no LLM call happened (`Budget::settle`),
+/// so a dead link costs 36 local HTTP GETs across ~170 days and no money at all.
+/// The slot half still holds, which is why this is 12 and not unbounded — but
+/// measured headroom is wide: nova's crawler sits at 29 of 2000 daily attempts
+/// and $1.62 of its $30 month, so 36 slots per dead link spread over half a year
+/// is not the binding constraint the original figure feared.
+const MAX_QUARANTINE_CYCLES: u32 = 12;
 
 /// How long to wait before retrying a release the QUEUE refused (as opposed to
 /// one that was attempted and failed). Short, because nothing was learned about
@@ -3214,10 +3267,13 @@ fn run_once(
                         // locator IS the victim, the two lines would contradict
                         // each other and `grep 'will retry'` would report a
                         // retry that never happens.
+                        // Hours, not days: the base cooldown is an hour, so `/
+                        // 86_400` printed "will retry in 0d" — a line an operator
+                        // reads as "never" while the retry is in fact imminent.
                         eprintln!(
                             "  quarantining {loc} after {MAX_ATTEMPTS} transient failures \
-                             — will retry in {}d",
-                            QUARANTINE_SECS / 86_400
+                             — will retry in {}h",
+                            QUARANTINE_SECS / 3_600
                         );
                     }
                     if let Some(victim) = victim {
@@ -10383,12 +10439,31 @@ mod tests {
             b.settle(Some(p.cost(&cheap)));
             assert_eq!(b.charged, p.cost(&cheap), "and is then corrected down");
 
-            // No measurement at all (fetch failed, page too thin): the reservation
-            // STANDS. Over-counting is the safe direction, and the attempt still
-            // cost the operator a fetch and a render.
+            // No measurement at all (fetch failed, page too thin): the attempt
+            // never reached the model, so the reservation is REFUNDED in full. It
+            // used to stand, which made an unreachable site look as expensive
+            // as a described one and is what justified exiling it for a week.
             b.try_take("https://b.example/").unwrap();
+            assert_eq!(
+                b.charged,
+                p.cost(&cheap) + reserve,
+                "the reservation still lands first — it is refunded at settle, not skipped"
+            );
             b.settle(None);
-            assert_eq!(b.charged, p.cost(&cheap) + reserve);
+            assert_eq!(
+                b.charged,
+                p.cost(&cheap),
+                "a fetch that never reached the LLM costs no money"
+            );
+            // The ATTEMPT is still billed against the rolling 24h cap even though
+            // the money was refunded: the charge row stays, revised to zero. If
+            // this ever drops to 2, a dead link becomes free to retry without
+            // limit and `--daily-max` stops bounding how hard we hammer.
+            assert_eq!(
+                b.ledger.calls_in_window(),
+                2,
+                "a refunded attempt still counts against --daily-max"
+            );
 
             // A call that ran over the reservation is charged the excess, not
             // silently capped at the reservation.
@@ -10398,7 +10473,9 @@ mod tests {
             };
             b.try_take("https://c.example/").unwrap();
             b.settle(Some(p.cost(&huge)));
-            assert_eq!(b.charged, p.cost(&cheap) + reserve + p.cost(&huge));
+            // No `reserve` term: the middle attempt never reached the model, so
+            // the running total carries the two real calls and nothing else.
+            assert_eq!(b.charged, p.cost(&cheap) + p.cost(&huge));
         }
         // All of it survived to disk: a settlement kept only in memory would be
         // discarded by the next run, which is the whole point of the ledger.
@@ -10411,7 +10488,10 @@ mod tests {
             prompt_tokens: 1_000_000,
             completion_tokens: 1_000_000,
         });
-        assert_eq!(reloaded.month_micros(), cheap + reserve + huge);
+        // `reserve` is absent: the un-measured attempt was refunded to zero on
+        // disk too, not merely in memory. A refund kept only in memory would be
+        // undone by the next run's reload, which is the whole point of the ledger.
+        assert_eq!(reloaded.month_micros(), cheap + huge);
     }
 
     /// An overspending call must not be able to hide behind `saturating_sub`: once
@@ -11533,6 +11613,64 @@ mod tests {
         assert!(
             js.contains("\nconst startedAt = Date.now();"),
             "the origin must be taken at MODULE scope, i.e. process start"
+        );
+    }
+
+    /// The incident these two constants exist to prevent, pinned as arithmetic on
+    /// the constants themselves rather than on a hard-coded schedule.
+    ///
+    /// `2pth6E5wUoA3…` ("Anonymous Freenet Interviews") was linked in the official
+    /// room 35 minutes after its contract was published. The node answered every
+    /// GET with `NotFound` while the contract propagated, so all three attempts
+    /// failed inside ~2 hours, and the site was then held for the whole base
+    /// cooldown — which was a WEEK. It served HTTP 200 within a day, was re-linked
+    /// three times to no effect (a held locator is suppressed from re-discovery by
+    /// `capture_filter`), and was still missing when the room asked why.
+    ///
+    /// Two properties, and the change is only correct if BOTH hold — a shorter
+    /// cooldown bought by giving up on dead links sooner would be a regression
+    /// dressed as a fix:
+    ///   1. the FIRST retry lands within hours, so a propagation delay costs
+    ///      hours;
+    ///   2. total coverage still EXCEEDS the ~105 days the old 7-day/4-cycle
+    ///      pairing gave, so a genuinely long outage is not given up on earlier.
+    #[test]
+    fn a_transiently_unreachable_site_is_retried_within_hours_and_still_covered_for_months() {
+        let f = TmpFile::new("quarantine-propagation-delay");
+        let at = 1_000_000_000u64;
+        let none: HashSet<String> = HashSet::new();
+        let loc = "freenet:2pth6E5wUoA39RLuJsMYoDB8b3nMxjYQ8YaEyC6MZWtZ/";
+        {
+            let (mut q, ..) = Quarantine::load(f.path(), at, &none);
+            let _ = q.hold(loc, "site", "MW5XDGZB", at);
+            assert!(q.save());
+        }
+
+        // 1. Due within hours of the failure, not days. Six hours is a deliberately
+        //    loose ceiling: the point is the ORDER OF MAGNITUDE, so this still
+        //    fails loudly if the base cooldown returns to day scale, without
+        //    pinning the exact figure.
+        let (_, released, _) = Quarantine::load(f.path(), at + 6 * 60 * 60, &none);
+        assert_eq!(
+            released.len(),
+            1,
+            "a site that was merely slow to propagate must be retried within hours; \
+             at a 7-day base cooldown this is still held and the site stays missing"
+        );
+
+        // 2. Summed coverage beats the old pairing. `due_after` doubles per cycle
+        //    from cycle 0, so the lifetime span is QUARANTINE_SECS * (2^N - 1).
+        let span: u64 = (0..MAX_QUARANTINE_CYCLES)
+            .map(|c| QUARANTINE_SECS * (1u64 << c))
+            .sum();
+        const OLD_SPAN_SECS: u64 = (7 + 14 + 28 + 56) * 24 * 60 * 60;
+        assert!(
+            span > OLD_SPAN_SECS,
+            "shortening the cooldown must not shorten total coverage: {} days now \
+             vs {} days before — lower MAX_QUARANTINE_CYCLES and a transient outage \
+             is given up on SOONER than it used to be",
+            span / 86_400,
+            OLD_SPAN_SECS / 86_400
         );
     }
 
