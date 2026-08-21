@@ -1212,6 +1212,16 @@ impl<'a> Budget<'a> {
     /// `None` genuinely means zero tokens: every path that reaches the model sets
     /// `usage` (see the two `*usage = Some(...)` assignments), including the
     /// failure path, which reports a deliberately-high estimate via `Some`.
+    ///
+    /// Costs one ledger REWRITE per un-measured attempt, where the old early
+    /// return did no disk I/O at all — `revise` takes its downward branch, which
+    /// rewrites the whole file rather than appending. Bounded by `--max` rewrites
+    /// per run (20) over a file holding one short line per charge in a rolling
+    /// 24h window, so it is kilobytes, and the run cadence is hourly. Worth
+    /// revisiting only if either the cap or the window grows by orders of
+    /// magnitude. A failed rewrite is safe in the direction that matters: the
+    /// file keeps the LARGER reservation, so a refund lost to a write error
+    /// over-charges rather than under-charges.
     fn settle(&mut self, cost: Option<Micros>) {
         let Some(id) = self.in_flight.take() else {
             return;
@@ -1889,7 +1899,7 @@ impl Pending {
 /// Base cooldown for a locator that burned `MAX_ATTEMPTS` on TRANSIENT errors.
 ///
 /// Doubles on each cycle (see `due_after`), so a link that keeps failing costs
-/// geometrically less over time instead of the same 3 attempts every week.
+/// geometrically less over time instead of the same 3 attempts every cycle.
 ///
 /// ONE HOUR, not one week. The first cooldown is the one that decides how long a
 /// live site stays missing, and the dominant transient failure here is a link
@@ -2268,7 +2278,7 @@ impl Quarantine {
             // Drop the entries due FURTHEST out. Note what that actually
             // selects, because it is NOT the recoverability argument
             // `Pending::evict_one` makes: a freshly-held entry is due in one
-            // week, a thrice-cycled one in eight, so the newest sits at the
+            // BASE cooldown, a thrice-cycled one in eight, so the newest sits at the
             // PROTECTED end and what goes is the most-backed-off. That is
             // defensible on its own terms — an entry that has already failed
             // three cycles is the likeliest to be genuinely dead, and it has
@@ -3239,8 +3249,9 @@ fn run_once(
             }
             // The server asserted the resource does not exist. That IS a
             // decision, so it is marked seen like any other — no retry cycle, no
-            // quarantine. Retrying a 404 weekly for ever is what turns ordinary
-            // link rot into a budget that never indexes anything new again.
+            // quarantine. Re-testing a 404 on every cooldown for ever is what
+            // turns ordinary link rot into a budget that never indexes anything
+            // new again.
             Err(e) if is_gone_for_good(&e) => {
                 eprintln!("  {loc} is gone ({e}); not retrying");
                 seen.insert(loc.clone());
