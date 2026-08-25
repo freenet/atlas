@@ -6023,16 +6023,21 @@ fn map_or_collapse(loc: String, registry: &AppRegistryView) -> String {
 /// hiccups.
 ///
 /// Does NOT fold the `""` / `"/"` bare-root alias `contract_web_href` treats as
-/// one page. The fragment collapse above pays the identical cost — an
-/// ALREADY-indexed site stored under a fragment form gets rediscovered as the
-/// bare-root form the SAME way, misses `seen`, and is described and added a
-/// second time, because `dedup_key` (unchanged) treats every distinct URI as a
-/// distinct entry regardless of which normalisation produced it. That cost is
-/// accepted above because it buys fixing the reported live bug: five entries
-/// collapsing to one. Folding `""` into `"/"` too would pay the SAME one-time
-/// cost for a site that was never reported broken (no locator in the reported
-/// shape used the bare form), so it stays out until it is fixing something
-/// concrete rather than something merely inconsistent.
+/// one page — `canonical_contract_path`, in `normalize_href`, does that now, and
+/// it runs BEFORE this function on every path.
+///
+/// This comment used to say the fold stayed out until it was fixing something
+/// concrete rather than something merely inconsistent, on the grounds that no
+/// locator in the reported shape used the bare form. It stopped being merely
+/// inconsistent: six live sites — Freebird, GitForge, SableLinux, Freenet
+/// Survival, FreenetOnLine and the DPZS3n... board — were each listed twice,
+/// differing in nothing but that slash, and the duplicate listings were
+/// reported by a user.
+///
+/// The one-time re-description cost this comment weighed is not paid, because
+/// `load_seen` re-canonicalises the seen file on load rather than letting
+/// already-decided sites miss the set under their new canonical form. The
+/// fragment collapse above did pay that cost; it did not have to.
 fn collapse_unmapped_fragment(loc: String, registry: &AppRegistryView) -> String {
     if registry.all_named_containers.is_empty() {
         return loc;
@@ -6084,6 +6089,28 @@ fn canonical_contract_path(path: &str) -> &str {
     } else {
         path
     }
+}
+
+/// Refuse a locator whose CANONICAL form is over the cap.
+///
+/// `normalize_href` bounds its INPUT at `MAX_LOCATOR_LEN`, which stopped being
+/// sufficient once `canonical_contract_path` began adding a byte: a locator that
+/// is exactly at the cap on the way in (a 44-char id plus a 459-byte fragment)
+/// is one byte over on the way out. Accepting it would break the fixed point
+/// this function is deliberately built to have -- `Pending::load` re-runs
+/// `normalize_href` over the stored string on every restart and drops whatever
+/// no longer validates, so an over-cap locator would be captured, queued, and
+/// then silently discarded on the next restart. That is the exact silent data
+/// loss the `app:` arm above exists to prevent.
+///
+/// It also keeps `RESERVE_LOCATOR_CHARS` honest: the token reservation is sized
+/// on the claim that the queue refuses anything longer than `MAX_LOCATOR_LEN`.
+///
+/// Refusing is the right side to fail on. The alternative -- emitting the
+/// un-canonicalised form for this one case -- would put a second spelling of a
+/// root back into circulation, which is the bug this change exists to close.
+fn within_locator_cap(loc: String, kind: &'static str) -> Option<(String, &'static str)> {
+    (loc.len() <= MAX_LOCATOR_LEN).then_some((loc, kind))
 }
 
 fn normalize_href(href: &str) -> Option<(String, &'static str)> {
@@ -6189,10 +6216,10 @@ fn normalize_href(href: &str) -> Option<(String, &'static str)> {
             if is_asset_path(path) || is_absolute_contract_path(path) {
                 return None;
             }
-            return Some((
+            return within_locator_cap(
                 frag(&format!("freenet:{}{}", &rest[..id_end], path)),
                 "site",
-            ));
+            );
         }
         return None;
     }
@@ -6205,10 +6232,10 @@ fn normalize_href(href: &str) -> Option<(String, &'static str)> {
             if is_asset_path(path) || is_absolute_contract_path(path) {
                 return None;
             }
-            return Some((
+            return within_locator_cap(
                 frag(&format!("freenet:{}{}", &after[..id_end], path)),
                 "site",
-            ));
+            );
         }
         return None;
     }
@@ -7681,6 +7708,30 @@ mod tests {
             host_bucket("freenet:771DvtPMwt2PumPyrFvsz7fpvU1gogcmb5qtS1yYEEHM/^1"),
             a,
             "junk must not share it either"
+        );
+    }
+
+    /// A Delta link written WITHOUT the root slash must still map onto the app.
+    ///
+    /// `map_locator` strips the app's prefix, which for Delta is `/#`. A locator
+    /// written `freenet:<container>#<handle>` has the path `#<handle>`, which
+    /// does not start with `/#`, so before canonicalisation it failed to match,
+    /// fell through to `collapse_unmapped_fragment`, and came back as a raw
+    /// `freenet:` locator -- a SECOND listing for a site already indexed under
+    /// its `app:delta/...` form, and one that does not survive a Delta container
+    /// re-key. The live index carries exactly one such leftover pair.
+    ///
+    /// This is a second duplicate class the trailing-slash fold closes, distinct
+    /// from the bare-root one, so it is pinned separately.
+    #[test]
+    fn a_delta_link_without_the_root_slash_still_maps_onto_the_app() {
+        let reg = delta_registry();
+        let with_slash = normalize_mapped(&format!("freenet:{DELTA}/#DWn4bEFfoo"), &reg).unwrap();
+        let without_slash = normalize_mapped(&format!("freenet:{DELTA}#DWn4bEFfoo"), &reg).unwrap();
+        assert_eq!(with_slash.0, "app:delta/DWn4bEFfoo");
+        assert_eq!(
+            without_slash, with_slash,
+            "both spellings name one Delta site, so they must map to one locator"
         );
     }
 
@@ -13722,6 +13773,39 @@ mod tests {
             atlas_common::contract_web_href(ID, ""),
             atlas_common::contract_web_href(ID, "/"),
             "the fold is only correct because the gateway serves both as one page"
+        );
+    }
+
+    /// Canonicalisation adds a byte, so the input-length guard alone no longer
+    /// bounds the OUTPUT.
+    ///
+    /// A locator exactly at the cap on the way in is one over on the way out.
+    /// `normalize_href` has to stay a fixed point -- `Pending::load` re-runs it
+    /// over every stored line and drops what no longer validates -- so an
+    /// over-cap emission would be captured, queued, and silently lost on the
+    /// next restart. Found by the external review pass on this change.
+    #[test]
+    fn canonicalisation_cannot_push_a_locator_over_the_cap() {
+        // Exactly at the cap on input: `freenet:` + id + `#` + filler.
+        let filler = "a".repeat(MAX_LOCATOR_LEN - "freenet:".len() - ID.len() - 1);
+        let at_cap = format!("freenet:{ID}#{filler}");
+        assert_eq!(at_cap.len(), MAX_LOCATOR_LEN, "test premise");
+        assert_eq!(
+            normalize_href(&at_cap),
+            None,
+            "the canonical form is one byte over the cap, so it must be refused \
+             rather than emitted and then dropped on the next restart"
+        );
+
+        // One byte under the cap still fits once the slash is added.
+        let filler = "a".repeat(MAX_LOCATOR_LEN - "freenet:".len() - ID.len() - 2);
+        let under = format!("freenet:{ID}#{filler}");
+        let (canon, _) = normalize_href(&under).expect("this one must still be accepted");
+        assert_eq!(canon.len(), MAX_LOCATOR_LEN);
+        assert_eq!(
+            normalize_href(&canon).map(|(l, _)| l),
+            Some(canon.clone()),
+            "and it must still be a fixed point at exactly the cap"
         );
     }
 
