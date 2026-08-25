@@ -1580,6 +1580,53 @@ impl Pending {
     }
 
     /// Returns false if an entry with this locator was already present.
+    /// Re-canonicalise every queued locator through the FULL discovery pipeline,
+    /// once the app registry is available.
+    ///
+    /// `load` re-validates through `normalize_href` alone, because it runs before
+    /// the registry is read. That was equivalent until the bare-root fold made a
+    /// fragment-only Delta locator map: a queued entry written
+    /// `freenet:<container>#<handle>` is rewritten by `load` to
+    /// `freenet:<container>/#<handle>`, while discovery this run emits
+    /// `app:delta/<handle>`. `add`/`contains` are string equality, and
+    /// `capture_filter` covers only `seen` and `quarantine` -- a locator that is
+    /// QUEUED but not yet decided is in neither -- so both spellings sat in the
+    /// queue, both were described, both were billed, and both became index
+    /// entries.
+    ///
+    /// The mismatch is older than the fold (a bare-form href always produced an
+    /// unmapped queue entry while the slash form mapped); the fold is what makes
+    /// closing it worthwhile, and what made two independent review lenses find
+    /// the same door.
+    ///
+    /// Collisions are merged, not dropped: `insert_raw` already keeps the LOWER
+    /// attempt and thin counts, so a merge cannot push either survivor closer to
+    /// retirement than it had earned.
+    fn remap(&mut self, registry: &AppRegistryView) -> usize {
+        let mut merged = 0usize;
+        let old = std::mem::take(&mut self.entries);
+        self.index.clear();
+        self.per_author.clear();
+        let mut changed = false;
+        for (loc, e) in old {
+            let canon = canonical_for_run(&loc, registry);
+            changed |= canon != loc;
+            if !self.insert_raw(canon, e.kind, e.author, e.attempts, e.thin) {
+                merged += 1;
+            }
+        }
+        if changed || merged > 0 {
+            self.dirty = true;
+        }
+        if merged > 0 {
+            eprintln!(
+                "warn: {merged} queued locator(s) collided after registry mapping \
+                 and were merged"
+            );
+        }
+        merged
+    }
+
     fn insert_raw(
         &mut self,
         loc: String,
@@ -2107,6 +2154,7 @@ impl Quarantine {
         // Locators leaving this file permanently: out of cycles, or trimmed.
         let mut decided: Vec<(String, Decided)> = Vec::new();
         let mut dropped = 0usize;
+        let mut merged = 0usize;
         let Ok(body) = fs::read_to_string(path) else {
             return (q, released, decided);
         };
@@ -2211,8 +2259,21 @@ impl Quarantine {
             if due_at != due {
                 q.dirty = true;
             }
+            // A collision is a MERGE, not a validation failure. Two lines that
+            // re-canonicalise onto one locator arrive here having validated
+            // perfectly well; reporting them under "no longer validate" tells an
+            // operator their links were rejected when in fact two entries became
+            // one. `Pending::load` already separates the two counters and this
+            // did not, which only stopped mattering by luck: bare/slash pairs
+            // could not collide until `canonical_contract_path` made them fold,
+            // so the first run after that change is exactly when an operator
+            // would have read the wrong message.
+            //
+            // The loss is real either way -- the second entry's cycle count and
+            // author slot are discarded -- so it is still reported, just as what
+            // it is.
             if q.entries.contains_key(&canon) {
-                dropped += 1;
+                merged += 1;
                 q.dirty = true;
                 continue;
             }
@@ -2308,6 +2369,12 @@ impl Quarantine {
         }
         if dropped > 0 {
             eprintln!("warn: dropped {dropped} quarantined locator(s) that no longer validate");
+        }
+        if merged > 0 {
+            eprintln!(
+                "warn: {merged} quarantined locator(s) collided after normalization \
+                 and were merged — each losing its cycle count and author slot"
+            );
         }
         (q, released, decided)
     }
@@ -2426,6 +2493,92 @@ impl Quarantine {
             }
             self.dirty = true;
         }
+    }
+
+    /// Re-key every held locator to the spelling discovery emits this run.
+    ///
+    /// `load` re-validates through `normalize_href` alone (it runs before the
+    /// registry), so a held pre-fold Delta locator stays keyed
+    /// `freenet:<container>/#<handle>` while the pending queue's copy of the same
+    /// locator is remapped to `app:delta/<handle>`.
+    ///
+    /// That split is not cosmetic, because `forget` removes by EXACT key. A
+    /// released locator lives in both structures at once; when the drain indexes
+    /// it successfully and calls `quarantine.forget(&loc)` with the pending
+    /// (mapped) spelling, the quarantine entry under the old key survives. It
+    /// then comes due, is released again, misses a `seen` set that holds only the
+    /// mapped spelling, and is re-queued, re-described, re-billed and indexed a
+    /// second time -- reproducing precisely the duplicate this change exists to
+    /// remove, from the one structure nobody had remapped.
+    ///
+    /// Collisions merge on the entry that is due SOONEST and least-cycled, so a
+    /// merge can never push a locator closer to being given up on than either
+    /// colliding entry had earned -- the same rule `Pending::insert_raw` applies.
+    /// Takes `released` and `decided` rather than only `&mut self`, because all
+    /// three are outputs of ONE `load` and describe the same locators. Remapping
+    /// them independently is what produced the two defects below, and this
+    /// signature is what stops a caller doing it again -- the repo's own
+    /// "paired fields that must co-occur" rule, applied to three of them.
+    fn remap(
+        &mut self,
+        registry: &AppRegistryView,
+        released: &mut Vec<ReleasedLocator>,
+        decided: &mut Vec<(String, Decided)>,
+    ) -> usize {
+        let mut merged = 0usize;
+        // Sorted, so a merge's surviving `author` and `kind` are decided by the
+        // locator that sorts first rather than by HashMap iteration order. The
+        // numeric fields take a `min` below and are order-independent already;
+        // these two are not, and a run-to-run coin flip over which author is
+        // charged for a held locator is not something to leave in.
+        let mut old: Vec<_> = std::mem::take(&mut self.entries).into_iter().collect();
+        old.sort_by(|a, b| a.0.cmp(&b.0));
+        let mut changed = false;
+        for (loc, e) in old {
+            let canon = canonical_for_run(&loc, registry);
+            changed |= canon != loc;
+            match self.entries.entry(canon) {
+                std::collections::hash_map::Entry::Vacant(v) => {
+                    v.insert(e);
+                }
+                std::collections::hash_map::Entry::Occupied(mut o) => {
+                    merged += 1;
+                    let kept = o.get_mut();
+                    kept.due_at = kept.due_at.min(e.due_at);
+                    kept.cycles = kept.cycles.min(e.cycles);
+                    kept.defers = kept.defers.min(e.defers);
+                }
+            }
+        }
+
+        for r in released.iter_mut() {
+            r.1 = canonical_for_run(&r.1, registry);
+        }
+        // Two spellings of one locator can BOTH come due, and remapping makes
+        // them the same locator. Left as duplicates, `requeue_released` calls
+        // `defer_placement` once per alias against the single merged entry, so a
+        // queue that refuses the locator burns N defers in ONE run instead of one
+        // per hourly run -- enough aliases retire a live site outright. Keep the
+        // most forgiving (fewest cycles), matching the merge rule above.
+        released.sort_by(|a, b| a.1.cmp(&b.1).then(a.0.cmp(&b.0)));
+        released.dedup_by(|a, b| a.1 == b.1);
+
+        for d in decided.iter_mut() {
+            d.0 = canonical_for_run(&d.0, registry);
+        }
+        // A terminal decision about ONE spelling must not condemn the locator
+        // when another spelling of it survived. `load` can exhaust or trim one
+        // alias while retaining the other; after remapping, the caller would mark
+        // that locator seen -- permanently blacklisting a site whose surviving
+        // entry still had retry cycles left. The survivor wins.
+        decided.retain(|(loc, _)| !self.entries.contains_key(loc));
+        decided.sort_by(|a, b| a.0.cmp(&b.0));
+        decided.dedup_by(|a, b| a.0 == b.0);
+
+        if changed || merged > 0 {
+            self.dirty = true;
+        }
+        merged
     }
 
     /// Drop a locator that has been decided about.
@@ -2857,14 +3010,51 @@ fn requeue_released(
 }
 
 /// What discovery must NOT re-capture: everything already decided about, plus
-/// everything still cooling down in quarantine.
+/// everything still cooling down in quarantine, each under every spelling that
+/// canonicalisation can produce for it today.
 ///
 /// Without the quarantine half, discovery re-queues on the very next run exactly
 /// what phase 2 just gave up on, so the hold is a no-op and the locator burns
 /// budget every run. `seen` itself stays the record of what has been DECIDED,
 /// and is what phase 2 appends to.
-fn capture_filter(seen: &HashSet<String>, quarantine: &Quarantine) -> HashSet<String> {
-    seen.iter().cloned().chain(quarantine.held()).collect()
+///
+/// The registry half closes a gap `load_seen` cannot: `load_seen` re-canonicalises
+/// through `normalize_href` alone, because it runs before the app registry is
+/// available, whereas every capture path emits the MAPPED form
+/// (`normalize_mapped` = `normalize_href` + `map_or_collapse`). Those agreed until
+/// the bare-root fold made a fragment-only Delta locator map: an entry stored as
+/// `freenet:<container>#<handle>` is now rediscovered as `app:delta/<handle>`,
+/// which `load_seen` never produces. Such entries exist by construction, since
+/// that shape is exactly what the pre-fold code emitted for them. Left alone,
+/// each one that has no `app:` twin already in the file would be described,
+/// billed and added a second time — the duplicate this change exists to stop,
+/// reintroduced through a different door.
+///
+/// Suppressing BOTH spellings rather than replacing one with the other keeps this
+/// strictly more suppressive than before: a locator that stops mapping (an app
+/// de-registered, a registry that failed to load this run) still matches under
+/// the spelling it was written in.
+fn capture_filter(
+    seen: &HashSet<String>,
+    quarantine: &Quarantine,
+    registry: &AppRegistryView,
+) -> HashSet<String> {
+    seen.iter()
+        .cloned()
+        .chain(quarantine.held())
+        .flat_map(|loc| {
+            // The FULL discovery pipeline, not `map_or_collapse` alone: the
+            // bare-root fold lives in `normalize_href`, so mapping without it
+            // leaves a fragment-only Delta locator exactly as stored and the
+            // mapped spelling is never produced. `None` (a stored line that no
+            // longer validates at all) contributes nothing extra, which is
+            // right — the raw form below still suppresses it.
+            let canon = canonical_for_run(&loc, registry);
+            // Collected into a set, so the common case where the two are equal
+            // costs one allocation and collapses back to a single entry.
+            [loc, canon]
+        })
+        .collect()
 }
 
 fn run_once(
@@ -2958,7 +3148,40 @@ fn run_once(
     // (a River room) it is the only chance we get: the message carrying a link
     // can be evicted before we could afford to describe it. So we always record
     // what exists, then decide separately what we can afford to describe.
+    // The registry is read BEFORE the queue so `remap` can run: a queued locator
+    // in the pre-fold Delta shape has to reach the same canonical form discovery
+    // emits this run, or it is described a second time under a spelling that is
+    // already indexed.
+    let registry = AppRegistryView::load(cli);
+
+    // `seen` is the LAST locator store that has to answer the same question, and
+    // it is the one several gates read DIRECTLY rather than through
+    // `capture_filter`: phase 2's skip, `requeue_released`'s no-op check, and the
+    // room scan. Those gates now receive MAPPED locators (the queue and the
+    // released list are remapped above), so testing them against a set
+    // `load_seen` canonicalised through `normalize_href` alone -- it runs before
+    // the registry exists -- misses.
+    //
+    // The reachable case does not even need the same string, because
+    // `map_locator` drops the path: a queued deep link
+    // `freenet:<container>/#H/2/links` and a decided landing page
+    // `freenet:<container>/#H` are different strings that both map to
+    // `app:delta/H`. The site is then re-fetched, re-DESCRIBED and re-BILLED
+    // (the budget is charged before the attempt), and if the old decision was an
+    // index under a `Freenet` locator, `dedup_key` cannot match an `AppResource`
+    // key, so it lands as a second listing.
+    //
+    // Folded into `seen` itself rather than handed to each gate, so a future gate
+    // that reads `seen` gets it for free. NOT replaced by `suppressed`: that
+    // includes `quarantine.held()`, which would skip locators deliberately
+    // released for retry.
+    seen.extend(
+        seen.iter()
+            .map(|loc| canonical_for_run(loc, &registry))
+            .collect::<Vec<_>>(),
+    );
     let mut pending = Pending::load(pending_path);
+    pending.remap(&registry);
     // Locators given up on for transient reasons, plus the ones whose hold has
     // now expired. Released entries are re-queued directly rather than waiting to
     // be rediscovered, because a River room's history is bounded and the message
@@ -2968,7 +3191,14 @@ fn run_once(
     // the queue by the time we get here, so refusing to record the reason cannot
     // put them back — it would only lose them from the seen file too.
     let mut decisions = DecisionLog::open(decisions_path);
-    let (mut quarantine, released, decided) = Quarantine::load(quarantine_path, now_secs(), &seen);
+    let (mut quarantine, mut released, mut decided) =
+        Quarantine::load(quarantine_path, now_secs(), &seen);
+    // Same remap as the pending queue, and for the same reason. The two lists the
+    // load hands back carry locators too: `released` goes straight into the
+    // pending queue via `requeue_released`, and `decided` is appended to the seen
+    // file — so a spelling missed here becomes a stale queue entry or a seen line
+    // that never matches what discovery emits.
+    quarantine.remap(&registry, &mut released, &mut decided);
     // Out of retry cycles. THIS is where a locator legitimately becomes
     // permanent: not because one fetch failed, but because several attempts
     // spread over months all did. Without this terminal state the quarantine has
@@ -2988,10 +3218,9 @@ fn run_once(
     if held_back > 0 {
         eprintln!("warn: {held_back} released locator(s) did not fit the queue — kept quarantined");
     }
-    let suppressed = capture_filter(&seen, &quarantine);
-    // Loaded once per run: which apps the curator has registered, so an app-hosted
-    // link can be recognised as a resource rather than as its container.
-    let registry = AppRegistryView::load(cli);
+    // `registry` is loaded further up, before the pending queue, because both it
+    // and this filter need the mapped spelling of an already-known locator.
+    let suppressed = capture_filter(&seen, &quarantine, &registry);
     let mut trusted: HashSet<String> = HashSet::new();
     let mut captured = 0usize;
     for raw in sources.lines() {
@@ -4624,8 +4853,7 @@ fn get_page_enumerating(
         if let Some(renderer) = &cli.renderer {
             // Render the gateway "shell" URL (no __sandbox query): the shell
             // creates the sandboxed app iframe, which the renderer reads back.
-            let path = if path.is_empty() { "/" } else { path };
-            let shell_url = gateway_url(gw, id, path)?;
+            let shell_url = gateway_url(gw, id, canonical_contract_path(path))?;
             // `is_app` is decided from the ORIGINAL locator, before resolution: a
             // resolved app locator looks like any other container URL.
             match render_page(&cli.node_bin, renderer, &shell_url, enumerate, is_app, None) {
@@ -4660,8 +4888,16 @@ fn get_page_enumerating(
         // because it is plain http, so `fetch` fails. Every attempt still
         // charges the budget, so three of them burned real money and then
         // marked the locator seen forever. The renderer branch already
-        // normalizes this, which is what gave the oversight away.
-        let path_only = if path_only.is_empty() { "/" } else { path_only };
+        // normalized this, which is what gave the oversight away.
+        //
+        // Shares `canonical_contract_path` with `normalize_href` rather than
+        // re-deriving the rule: this fold and that one are the same fact about
+        // the gateway, and they were hand-written copies until the third copy
+        // appeared. A locator reaching here is normally already canonical, so
+        // this is now a backstop for the paths that bypass normalisation (a
+        // registry-resolved `app:` locator, a locator read back from the live
+        // index by the recheck sweep) rather than the primary fold.
+        let path_only = canonical_contract_path(path_only);
         let sep = if path_only.contains('?') { '&' } else { '?' };
         let html = fetch(
             client,
@@ -5957,6 +6193,34 @@ fn locator_identity(loc: &str) -> &str {
 /// Normalize an href, then `map_or_collapse` it: onto a registered app if it
 /// belongs to one, else collapsing its fragment if it names an unregistered
 /// fragment-routed site.
+/// The spelling THIS RUN's discovery emits for an already-known locator.
+///
+/// Persisted locators are re-validated by loaders that run before the app
+/// registry is available, so they come back in `normalize_href` form while every
+/// capture path emits the `normalize_mapped` form. Any code that compares a
+/// stored locator against a discovered one has to close that gap, and four
+/// separate places need to: the seen set (via `capture_filter`), the pending
+/// queue, the quarantine, and the released/decided lists the quarantine hands
+/// back.
+///
+/// Each of those was found by a different reviewer, one at a time, because each
+/// derived the rule itself instead of sharing it. That is the whole reason this
+/// exists as a named function rather than a fourth inline `normalize_mapped`
+/// call: the next loader that reads persisted locators should have something to
+/// reuse, and `rg canonical_for_run` should list everywhere the question is
+/// answered.
+///
+/// Falls back to the locator unchanged when it no longer validates at all. That
+/// is the fail-safe direction for every caller here — these are canonicalisation
+/// passes over state that has already been validated on load, not second
+/// validation gates, and dropping would be the silent loss the queue exists to
+/// prevent.
+fn canonical_for_run(loc: &str, registry: &AppRegistryView) -> String {
+    normalize_mapped(loc, registry)
+        .map(|(l, _)| l)
+        .unwrap_or_else(|| loc.to_string())
+}
+
 fn normalize_mapped(href: &str, registry: &AppRegistryView) -> Option<(String, &'static str)> {
     let (loc, kind) = normalize_href(href)?;
     Some((map_or_collapse(loc, registry), kind))
@@ -6023,16 +6287,23 @@ fn map_or_collapse(loc: String, registry: &AppRegistryView) -> String {
 /// hiccups.
 ///
 /// Does NOT fold the `""` / `"/"` bare-root alias `contract_web_href` treats as
-/// one page. The fragment collapse above pays the identical cost — an
-/// ALREADY-indexed site stored under a fragment form gets rediscovered as the
-/// bare-root form the SAME way, misses `seen`, and is described and added a
-/// second time, because `dedup_key` (unchanged) treats every distinct URI as a
-/// distinct entry regardless of which normalisation produced it. That cost is
-/// accepted above because it buys fixing the reported live bug: five entries
-/// collapsing to one. Folding `""` into `"/"` too would pay the SAME one-time
-/// cost for a site that was never reported broken (no locator in the reported
-/// shape used the bare form), so it stays out until it is fixing something
-/// concrete rather than something merely inconsistent.
+/// one page — `canonical_contract_path`, in `normalize_href`, does that now, and
+/// it runs BEFORE this function on every path.
+///
+/// This comment used to say the fold stayed out until it was fixing something
+/// concrete rather than something merely inconsistent, on the grounds that no
+/// locator in the reported shape used the bare form, and a test
+/// (`the_bare_root_alias_is_folded_at_normalize_href_not_at_map_or_collapse`,
+/// then named for the opposite assertion) pinned that. It stopped being merely
+/// inconsistent: six live sites — Freebird, GitForge, SableLinux, Freenet
+/// Survival, FreenetOnLine and the DPZS3n... board — were each listed twice,
+/// differing in nothing but that slash, and the duplicate listings were
+/// reported by a user.
+///
+/// The one-time re-description cost this comment weighed is not paid, because
+/// `load_seen` re-canonicalises the seen file on load rather than letting
+/// already-decided sites miss the set under their new canonical form. The
+/// fragment collapse above did pay that cost; it did not have to.
 fn collapse_unmapped_fragment(loc: String, registry: &AppRegistryView) -> String {
     if registry.all_named_containers.is_empty() {
         return loc;
@@ -6046,6 +6317,66 @@ fn collapse_unmapped_fragment(loc: String, registry: &AppRegistryView) -> String
     }
     let server_path = path.split('#').next().unwrap_or(path);
     format!("freenet:{id}{server_path}")
+}
+
+/// The canonical in-contract path for a `freenet:` locator, folding the empty
+/// root onto `/`.
+///
+/// `freenet:<id>` and `freenet:<id>/` are the SAME document: `contract_web_href`
+/// builds the identical `/v1/contract/web/<id>/` URL for both, because the
+/// sandbox shell requires that slash and an empty suffix would otherwise
+/// produce a link a click inside the iframe silently drops. They are
+/// nonetheless two different strings, and every dedup surface in this crawler
+/// is string equality on the locator -- the seen set, the pending queue's
+/// collision check, the index's own subject identity. So one site discovered
+/// once as a bare id and once with a trailing slash is described twice, billed
+/// twice, and listed twice.
+///
+/// Reported live as "Atlas is listing duplicates of some sites, Freebird for
+/// example": Freebird, GitForge, SableLinux, Freenet Survival, FreenetOnLine
+/// and the DPZS3n... board were each listed twice, differing in nothing but
+/// this slash.
+///
+/// `collapse_unmapped_fragment` deferred exactly this fold, on the stated
+/// grounds that no locator in the reported shape used the bare form. That is no
+/// longer true, so the deferral is spent. Folding it HERE rather than at the
+/// index is what makes it true for every discovery path at once -- curated
+/// sources, hub link mining and River-room scanning all funnel through
+/// `normalize_href` -- and it leaves the contract untouched, so it does not
+/// re-key the index.
+///
+/// The fold is toward `/`, not away from it: `contract_web_href` already treats
+/// `/` as the canonical form, most live entries carry it, and a fragment-only
+/// locator (`freenet:<id>#frag`) has to grow the slash anyway to render a
+/// clickable link.
+fn canonical_contract_path(path: &str) -> &str {
+    if path.is_empty() {
+        "/"
+    } else {
+        path
+    }
+}
+
+/// Refuse a locator whose CANONICAL form is over the cap.
+///
+/// `normalize_href` bounds its INPUT at `MAX_LOCATOR_LEN`, which stopped being
+/// sufficient once `canonical_contract_path` began adding a byte: a locator that
+/// is exactly at the cap on the way in (a 44-char id plus a 459-byte fragment)
+/// is one byte over on the way out. Accepting it would break the fixed point
+/// this function is deliberately built to have -- `Pending::load` re-runs
+/// `normalize_href` over the stored string on every restart and drops whatever
+/// no longer validates, so an over-cap locator would be captured, queued, and
+/// then silently discarded on the next restart. That is the exact silent data
+/// loss the `app:` arm above exists to prevent.
+///
+/// It also keeps `RESERVE_LOCATOR_CHARS` honest: the token reservation is sized
+/// on the claim that the queue refuses anything longer than `MAX_LOCATOR_LEN`.
+///
+/// Refusing is the right side to fail on. The alternative -- emitting the
+/// un-canonicalised form for this one case -- would put a second spelling of a
+/// root back into circulation, which is the bug this change exists to close.
+fn within_locator_cap(loc: String, kind: &'static str) -> Option<(String, &'static str)> {
+    (loc.len() <= MAX_LOCATOR_LEN).then_some((loc, kind))
 }
 
 fn normalize_href(href: &str) -> Option<(String, &'static str)> {
@@ -6147,14 +6478,14 @@ fn normalize_href(href: &str) -> Option<(String, &'static str)> {
     if let Some(rest) = path_part.strip_prefix("freenet:") {
         let id_end = rest.find(|c: char| !is_b58(c)).unwrap_or(rest.len());
         if matches!(id_end, 43 | 44) {
-            let path = &rest[id_end..];
+            let path = canonical_contract_path(&rest[id_end..]);
             if is_asset_path(path) || is_absolute_contract_path(path) {
                 return None;
             }
-            return Some((
+            return within_locator_cap(
                 frag(&format!("freenet:{}{}", &rest[..id_end], path)),
                 "site",
-            ));
+            );
         }
         return None;
     }
@@ -6163,14 +6494,14 @@ fn normalize_href(href: &str) -> Option<(String, &'static str)> {
         let after = &path_part[pos + "/v1/contract/web/".len()..];
         let id_end = after.find(|c: char| !is_b58(c)).unwrap_or(after.len());
         if matches!(id_end, 43 | 44) {
-            let path = &after[id_end..];
+            let path = canonical_contract_path(&after[id_end..]);
             if is_asset_path(path) || is_absolute_contract_path(path) {
                 return None;
             }
-            return Some((
+            return within_locator_cap(
                 frag(&format!("freenet:{}{}", &after[..id_end], path)),
                 "site",
-            ));
+            );
         }
         return None;
     }
@@ -6897,13 +7228,62 @@ fn add_entry(cli: &Cli, loc: &str, kind: &str, d: &Described) -> Result<()> {
     Ok(())
 }
 
+/// Load the seen set, carrying every line in under BOTH the form it was written
+/// in and the form `normalize_href` would produce for it today.
+///
+/// The file is append-only and never expires, so it holds locators canonicalised
+/// by every build that ever ran. When canonicalisation changes -- as it did when
+/// `canonical_contract_path` began folding the bare root onto `/` -- a site
+/// already decided about would be rediscovered under its NEW canonical form,
+/// miss a set keyed on the old one, and be described and added a second time.
+/// The whole point of that change is to stop minting duplicate entries, so
+/// paying for it with a fresh round of duplicates would be self-defeating.
+///
+/// Measured, not assumed: against the production seen file at the time of the
+/// change this saves NOTHING, because all eight bare-root lines in it already
+/// had their trailing-slash twin present -- which is exactly how the duplicate
+/// index entries arose in the first place. So this makes the property hold by
+/// CONSTRUCTION rather than by a lucky property of one file. What it actually
+/// protects is a locator seen only in the pre-canonicalisation form, which is
+/// unreachable for new captures (they are canonicalised on the way in) and so
+/// exists only among lines already on disk. Do not restate this as a saving it
+/// did not make.
+///
+/// Scope, precisely: this re-canonicalises through `normalize_href` ALONE, not
+/// the full `normalize_mapped` pipeline, because it runs before the app registry
+/// is available. The mapped spelling is covered by `capture_filter` instead --
+/// see its doc comment, which is where the Delta fragment-only class is handled.
+///
+/// Both forms are inserted rather than only the re-canonicalised one, because a
+/// line that no longer validates at all (an off-Freenet `https://` locator from
+/// before Atlas stopped indexing the web) returns `None` here and must still
+/// suppress rediscovery.
+///
+/// Keeping the raw line makes this match MORE than it did before -- which means
+/// SUPPRESSING more, so it is not safe merely for being "more". It is safe
+/// because `normalize_href` is resource-PRESERVING: every extra spelling it
+/// yields names the same document as the line it came from, so a suppressed
+/// locator is never a different site. The one shape that would break that is a
+/// non-`freenet:` line whose path embeds `/v1/contract/web/<id>`, which would
+/// mint a `freenet:<id>` entry naming something else entirely; it is
+/// unreachable, because the gateway branch has always been matched before the
+/// off-Freenet refusal, so a gateway-form URL was never stored in the
+/// `https://` shape to begin with.
 fn load_seen(path: &Path) -> HashSet<String> {
     fs::read_to_string(path)
         .map(|s| {
-            s.lines()
-                .map(|l| l.trim().to_string())
-                .filter(|l| !l.is_empty())
-                .collect()
+            let mut out = HashSet::new();
+            for line in s.lines() {
+                let l = line.trim();
+                if l.is_empty() {
+                    continue;
+                }
+                if let Some((canon, _)) = normalize_href(l) {
+                    out.insert(canon);
+                }
+                out.insert(l.to_string());
+            }
+            out
         })
         .unwrap_or_default()
 }
@@ -7620,6 +8000,30 @@ mod tests {
         );
     }
 
+    /// A Delta link written WITHOUT the root slash must still map onto the app.
+    ///
+    /// `map_locator` strips the app's prefix, which for Delta is `/#`. A locator
+    /// written `freenet:<container>#<handle>` has the path `#<handle>`, which
+    /// does not start with `/#`, so before canonicalisation it failed to match,
+    /// fell through to `collapse_unmapped_fragment`, and came back as a raw
+    /// `freenet:` locator -- a SECOND listing for a site already indexed under
+    /// its `app:delta/...` form, and one that does not survive a Delta container
+    /// re-key. The live index carries exactly one such leftover pair.
+    ///
+    /// This is a second duplicate class the trailing-slash fold closes, distinct
+    /// from the bare-root one, so it is pinned separately.
+    #[test]
+    fn a_delta_link_without_the_root_slash_still_maps_onto_the_app() {
+        let reg = delta_registry();
+        let with_slash = normalize_mapped(&format!("freenet:{DELTA}/#DWn4bEFfoo"), &reg).unwrap();
+        let without_slash = normalize_mapped(&format!("freenet:{DELTA}#DWn4bEFfoo"), &reg).unwrap();
+        assert_eq!(with_slash.0, "app:delta/DWn4bEFfoo");
+        assert_eq!(
+            without_slash, with_slash,
+            "both spellings name one Delta site, so they must map to one locator"
+        );
+    }
+
     #[test]
     fn normalize_mapped_maps_gateway_urls_too() {
         let reg = delta_registry();
@@ -7683,20 +8087,41 @@ mod tests {
         }
     }
 
-    /// Deliberately UNCHANGED: the bare `""` form and the `"/"` form are left as
-    /// two distinct locators, even though they resolve to the same page. Folding
-    /// them was tried and reverted (see the doc comment on
-    /// `collapse_unmapped_fragment`) because it would rediscover any ALREADY-
-    /// indexed bare-form site as a second, undeduped `/`-form listing. This test
-    /// exists so a future attempt at that fold trips over it rather than
-    /// reintroducing the regression silently.
+    /// WHICH LAYER folds the bare-root alias, pinned so the answer cannot drift.
+    ///
+    /// This test used to assert the OPPOSITE — that `map_or_collapse` leaves the
+    /// two forms distinct — as a deliberate tripwire against folding them at all,
+    /// on the reasoning that the fold would rediscover every already-indexed
+    /// bare-form site as a second listing. The fold has since been made, at
+    /// `normalize_href` (see `canonical_contract_path`), because six live sites
+    /// were being listed twice and a user reported it; `load_seen` is what
+    /// removes the cost the tripwire was protecting against.
+    ///
+    /// The tripwire is worth recording rather than just deleting, because it did
+    /// NOT fire: it exercised `map_or_collapse` directly, and the fold landed one
+    /// layer up, so a test written precisely to catch this change sat green
+    /// through it. A guard on one layer says nothing about the layer above it.
+    ///
+    /// So this now pins both halves of the real arrangement: end to end the two
+    /// spellings are ONE locator, and `map_or_collapse` is still not the place
+    /// that makes them one — it only ever sees an already-canonical path.
     #[test]
-    fn map_or_collapse_leaves_the_bare_root_alias_unfolded() {
+    fn the_bare_root_alias_is_folded_at_normalize_href_not_at_map_or_collapse() {
         const SITE: &str = "DPZS3nmaS8XRqLufy3cq4t2DWkfG8k22gi8jcbykRzAH";
         let reg = delta_registry();
+        assert_eq!(
+            normalize_mapped(&format!("freenet:{SITE}"), &reg),
+            normalize_mapped(&format!("freenet:{SITE}/"), &reg),
+            "end to end, one page must be one locator"
+        );
+        // `map_or_collapse` is downstream of the fold and does not perform it.
+        // If a future change moves the fold down here, this stops being true and
+        // the reader is told where to look.
         assert_ne!(
             map_or_collapse(format!("freenet:{SITE}"), &reg),
             map_or_collapse(format!("freenet:{SITE}/"), &reg),
+            "the fold lives in normalize_href; if that changed, update the docs \
+             on canonical_contract_path and collapse_unmapped_fragment too"
         );
     }
 
@@ -7957,13 +8382,30 @@ mod tests {
 
     #[test]
     fn normalize_href_variants() {
+        // The bare id and the trailing-slash form are the SAME page -- both
+        // render `/v1/contract/web/<id>/` -- so they must normalise to one
+        // locator or the index lists the site twice.
         assert_eq!(
             normalize_href(&format!("freenet:{ID}")),
-            Some((format!("freenet:{ID}"), "site"))
+            Some((format!("freenet:{ID}/"), "site"))
+        );
+        assert_eq!(
+            normalize_href(&format!("/v1/contract/web/{ID}")),
+            Some((format!("freenet:{ID}/"), "site"))
         );
         assert_eq!(
             normalize_href(&format!("/v1/contract/web/{ID}/")),
             Some((format!("freenet:{ID}/"), "site"))
+        );
+        // A fragment-only locator grows the slash too, so it agrees with the
+        // form the same site is reached by elsewhere.
+        assert_eq!(
+            normalize_href(&format!("freenet:{ID}#frag")),
+            Some((format!("freenet:{ID}/#frag"), "site"))
+        );
+        assert_eq!(
+            normalize_href(&format!("freenet:{ID}/#frag")),
+            Some((format!("freenet:{ID}/#frag"), "site"))
         );
         // absolute gateway url, sandbox query dropped
         assert_eq!(
@@ -8003,7 +8445,7 @@ mod tests {
         );
         assert!(locs
             .iter()
-            .any(|(l, k)| l == &format!("freenet:{ID}") && *k == "site"));
+            .any(|(l, k)| l == &format!("freenet:{ID}/") && *k == "site"));
         assert!(
             !locs.iter().any(|(l, _)| l.starts_with("https://")),
             "an off-Freenet link must never reach the queue: {locs:?}"
@@ -8062,7 +8504,7 @@ mod tests {
     fn scan_urls_extracts_and_normalizes() {
         let text = format!(
             "Check https://github.com/freenet/river and <freenet:{ID}/about> too. \
-             Markdown [link](freenet:{ID}/p)! bare freenet:{ID}",
+             Markdown [link](freenet:{ID}/p)! bare freenet:{ID} and freenet:{ID}/",
         );
         let urls = scan_urls(&text);
         // Angle-bracket wrapping stripped.
@@ -8075,9 +8517,10 @@ mod tests {
             urls.contains(&(format!("freenet:{ID}/p"), "site")),
             "got {urls:?}"
         );
-        // Bare locator, and the duplicate of it collapsed.
+        // Bare locator, and the duplicate of it collapsed -- canonicalised to
+        // the trailing-slash form, which is the same page.
         assert!(
-            urls.contains(&(format!("freenet:{ID}"), "site")),
+            urls.contains(&(format!("freenet:{ID}/"), "site")),
             "got {urls:?}"
         );
         // The https link is NOT extracted: Atlas indexes Freenet, not the web.
@@ -12021,6 +12464,522 @@ mod tests {
         );
     }
 
+    /// The QUEUE is the third door, and it needs the registry to reach the same
+    /// canonical form discovery emits.
+    ///
+    /// `Pending::load` re-validates through `normalize_href` alone, because it
+    /// runs before the registry is read. So a queued entry written
+    /// `freenet:<container>#<handle>` is rewritten only as far as
+    /// `freenet:<container>/#<handle>`, while discovery this run emits
+    /// `app:delta/<handle>`. `add`/`contains` are string equality and
+    /// `capture_filter` covers only `seen` and `quarantine` -- a locator that is
+    /// queued but not yet DECIDED is in neither -- so both spellings sat in the
+    /// queue, both were described, both were billed, and both became index
+    /// entries.
+    ///
+    /// Found independently by two review lenses on this branch, which is the
+    /// reason it is pinned rather than just fixed: the same mismatch has now
+    /// appeared at three separate files, and the next one will be found by
+    /// whoever asks "which spelling does THIS loader produce?".
+    #[test]
+    fn the_pending_queue_is_remapped_to_the_spelling_discovery_emits() {
+        let tmp = TmpFile::new("pending-remap");
+        fs::write(
+            tmp.path(),
+            format!("0\tsite\t@curated\tfreenet:{DELTA}#DWn4bEFfoo\n"),
+        )
+        .unwrap();
+        let mut p = Pending::load(tmp.path());
+        assert!(
+            p.contains(&format!("freenet:{DELTA}/#DWn4bEFfoo")),
+            "load alone reaches only the normalize_href form"
+        );
+
+        p.remap(&delta_registry());
+        let (discovered, _) =
+            normalize_mapped(&format!("freenet:{DELTA}/#DWn4bEFfoo"), &delta_registry())
+                .expect("a Delta link must normalise");
+        assert_eq!(discovered, "app:delta/DWn4bEFfoo", "test premise");
+        assert!(
+            p.contains(&discovered),
+            "after remap the queued entry must be the spelling discovery emits, \
+             or it is described a second time under a locator already indexed"
+        );
+        assert_eq!(p.len(), 1, "remap rewrites in place, it does not duplicate");
+    }
+
+    /// The failure Codex described, reproduced end to end: a held locator whose
+    /// key was never remapped survives `forget` and comes back as a duplicate.
+    ///
+    /// A released locator is in the pending queue AND the quarantine at once.
+    /// `forget` removes by EXACT key, so if the queue's copy is remapped to
+    /// `app:delta/<handle>` and the quarantine's is still
+    /// `freenet:<container>/#<handle>`, indexing the locator successfully drops
+    /// the queue entry and leaves the quarantine one. It comes due, is released,
+    /// misses a `seen` set holding only the mapped spelling, and is re-queued,
+    /// re-described, re-billed and indexed a second time.
+    ///
+    /// Asserting on `forget` with the PENDING spelling is the point: that is what
+    /// the drain actually calls, so this fails if the two structures disagree
+    /// about a locator's identity for any reason, not just this one.
+    #[test]
+    fn a_held_locator_is_forgotten_by_the_spelling_the_queue_uses() {
+        let none: HashSet<String> = HashSet::new();
+        let qf = TmpFile::new("q-remap");
+        let reg = delta_registry();
+        let pre_fold = format!("freenet:{DELTA}#DWn4bEFfoo");
+
+        let (mut q, _, _) = Quarantine::load(qf.path(), 0, &none);
+        let _ = q.hold(&pre_fold, "site", "ALICE", 1_000);
+        q.remap(&reg, &mut Vec::new(), &mut Vec::new());
+
+        // What the drain holds after the pending queue is remapped.
+        let from_queue = canonical_for_run(&pre_fold, &reg);
+        assert_eq!(from_queue, "app:delta/DWn4bEFfoo", "test premise");
+
+        q.forget(&from_queue);
+        assert!(
+            q.held().next().is_none(),
+            "the held entry must be gone: a survivor comes due, is released, \
+             misses the seen set, and is indexed a second time"
+        );
+    }
+
+    /// A terminal decision about ONE spelling must not condemn a locator whose
+    /// OTHER spelling survived with retry cycles left.
+    ///
+    /// `Quarantine::load` can exhaust or capacity-trim one alias while retaining
+    /// the other. Remapping then makes them the same locator, and the caller
+    /// marks everything in `decided` as seen — permanently blacklisting a site
+    /// that still had a live, more-forgiving entry. That is the failure the
+    /// quarantine exists to prevent (a good site lost for good), reintroduced by
+    /// remapping the three `load` outputs independently.
+    #[test]
+    fn a_decision_about_one_alias_does_not_condemn_a_surviving_one() {
+        let none: HashSet<String> = HashSet::new();
+        let qf = TmpFile::new("q-alias-decided");
+        let reg = delta_registry();
+        let (mut q, _, _) = Quarantine::load(qf.path(), 0, &none);
+
+        // The surviving entry, under the pre-fold spelling.
+        let _ = q.hold(
+            &format!("freenet:{DELTA}#DWn4bEFfoo"),
+            "site",
+            "ALICE",
+            1_000,
+        );
+        // A terminal decision recorded for the OTHER spelling of the same site.
+        let mut decided = vec![("app:delta/DWn4bEFfoo".to_string(), Decided::Exhausted)];
+        let mut released: Vec<ReleasedLocator> = Vec::new();
+
+        q.remap(&reg, &mut released, &mut decided);
+
+        assert!(
+            decided.is_empty(),
+            "the survivor wins: marking this locator seen would blacklist a site \
+             whose live entry still had cycles left, got {decided:?}"
+        );
+        assert_eq!(q.held().count(), 1, "and the live entry stays held");
+    }
+
+    /// Source pin, deliberately: a merge's surviving `author`/`kind` must be
+    /// decided by a SORT, not by HashMap iteration order.
+    ///
+    /// The numeric fields take a `min` and are order-independent already; these
+    /// two are not, so without the sort, which author is charged for a merged
+    /// held locator is a run-to-run coin flip. That is a property about iteration
+    /// order, and Rust seeds each HashMap randomly, so a behavioural test could
+    /// only SAMPLE it -- it would pass or fail by luck, which is a flaky test
+    /// asserting a real invariant, the worst of both. Pinning the mechanism is
+    /// the honest instrument here, and this comment is why.
+    #[test]
+    fn a_quarantine_merge_picks_its_survivor_deterministically() {
+        let src = include_str!("main.rs");
+        let production = src
+            .split("\nmod tests")
+            .next()
+            .expect("source must have a pre-test region");
+        let all = strip_comments(production);
+        // Scoped to the Quarantine impl: `Pending` has a `remap` too, and it
+        // sorts nothing (a Vec is already ordered), so an unscoped search finds
+        // the wrong function and the pin is vacuous.
+        let imp = all
+            .find("impl Quarantine {")
+            .expect("impl Quarantine must exist");
+        let start = imp
+            + all[imp..]
+                .find("fn remap(")
+                .expect("Quarantine::remap must exist");
+        let body = &all[start..];
+        let body = &body[..body.find("\n    }\n").unwrap_or(body.len())];
+        let flat = body.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(
+            flat.contains("old.sort_by(|a, b| a.0.cmp(&b.0))"),
+            "the merge must iterate in a sorted order, or the surviving author \
+             and kind depend on HashMap iteration order"
+        );
+    }
+
+    /// Two spellings coming due together must be released ONCE.
+    ///
+    /// `requeue_released` calls `defer_placement` per released locator. Left as
+    /// duplicates after remapping, a queue that refuses the locator burns one
+    /// defer per alias in a SINGLE run rather than one per hourly run, so enough
+    /// aliases push it through `MAX_CONSECUTIVE_DEFERS` into an extra retry cycle
+    /// and on toward premature retirement — against the one merged entry that
+    /// was supposed to be the more forgiving of the two.
+    #[test]
+    fn two_spellings_coming_due_together_are_released_once() {
+        let none: HashSet<String> = HashSet::new();
+        let qf = TmpFile::new("q-alias-released");
+        let reg = delta_registry();
+        let (mut q, _, _) = Quarantine::load(qf.path(), 0, &none);
+
+        let mut released: Vec<ReleasedLocator> = vec![
+            (
+                3,
+                format!("freenet:{DELTA}#DWn4bEFfoo"),
+                "site",
+                "ALICE".to_string(),
+            ),
+            (
+                1,
+                "app:delta/DWn4bEFfoo".to_string(),
+                "site",
+                "ALICE".to_string(),
+            ),
+        ];
+        let mut decided: Vec<(String, Decided)> = Vec::new();
+
+        q.remap(&reg, &mut released, &mut decided);
+
+        assert_eq!(
+            released.len(),
+            1,
+            "one site, one release, or defer_placement is charged twice in one \
+             run against a single entry: {released:?}"
+        );
+        assert_eq!(released[0].1, "app:delta/DWn4bEFfoo");
+        assert_eq!(
+            released[0].0, 1,
+            "and the surviving release keeps the FEWEST cycles, matching the \
+             entry merge rule — a merge must never move a locator closer to \
+             being given up on"
+        );
+    }
+
+    /// Two spellings of one held site must merge, keeping the SOONEST due time
+    /// and the LOWEST cycle count — a merge must never move a locator closer to
+    /// being given up on than either entry had earned.
+    #[test]
+    fn remapping_the_quarantine_merges_on_the_more_forgiving_entry() {
+        let none: HashSet<String> = HashSet::new();
+        let qf = TmpFile::new("q-remap-merge");
+        let reg = delta_registry();
+        let (mut q, _, _) = Quarantine::load(qf.path(), 0, &none);
+
+        let a = format!("freenet:{DELTA}#DWn4bEFfoo");
+        let b = "app:delta/DWn4bEFfoo".to_string();
+        let _ = q.hold(&a, "site", "ALICE", 1_000);
+        let _ = q.hold(&b, "site", "ALICE", 1_000);
+        assert_eq!(q.held().count(), 2, "distinct strings before the remap");
+
+        assert_eq!(
+            q.remap(&reg, &mut Vec::new(), &mut Vec::new()),
+            1,
+            "one collision"
+        );
+        assert_eq!(q.held().count(), 1, "one site, one held entry");
+    }
+
+    /// The remap must be WIRED, not merely available.
+    ///
+    /// The two tests above pin `Pending::remap` itself, and both stay green if the
+    /// call is deleted from `run_once` — which is the whole defect they exist to
+    /// prevent, since an unwired remap leaves the queue producing the old
+    /// spelling exactly as before. This file's convention is to pin the call site
+    /// too (see `hub_outbound_links_collapses_an_unregistered_sites_fragment`),
+    /// and this is that pin.
+    ///
+    /// Also pins the ORDERING that makes it possible: the registry has to be read
+    /// before the queue, or there is nothing to map with. That ordering is easy
+    /// to undo while tidying, and undoing it fails to compile only by luck.
+    #[test]
+    fn the_pending_remap_is_wired_into_the_run() {
+        let src = include_str!("main.rs");
+        let production = src
+            .split("\nmod tests")
+            .next()
+            .expect("source must have a pre-test region");
+        assert!(
+            !production.contains("fn the_pending_remap_is_wired_into_the_run"),
+            "the scan region must exclude the test module, or the pin matches itself"
+        );
+        // Scoped to `run_once`'s own body, and COUNTED rather than searched.
+        // `let registry = AppRegistryView::load(cli)` appears TWICE in the
+        // production region (`run_once` and the recheck sweep), so a bare
+        // `find` took whichever came first in file order -- correct today only
+        // by accident, and silently comparing the wrong pair if the two
+        // functions were ever reordered. The file's own
+        // `the_source_pins_name_things_that_exist` states the rule this broke:
+        // COUNT, not `contains`.
+        let all = strip_comments(production);
+        let start = all.find("fn run_once(").expect("run_once must exist");
+        let body = &all[start..];
+        let body = &body[..body.find("\nfn ").unwrap_or(body.len())];
+        // Whitespace-collapsed, because these calls are long enough for
+        // `cargo fmt` to wrap them across lines, and a source pin that breaks on
+        // reformatting is a pin that gets deleted rather than fixed.
+        let flat = body.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert_eq!(
+            flat.matches("let registry = AppRegistryView::load(cli)")
+                .count(),
+            1,
+            "run_once must read the registry exactly once, or this pin is \
+             ambiguous about which load it is talking about"
+        );
+        // The `seen` expansion is a bare statement rather than a method call, so
+        // it is the easiest of the five to delete while tidying.
+        assert!(
+            flat.contains("seen.extend(") && flat.contains("canonical_for_run(loc, &registry)"),
+            "`seen` must be expanded with the mapped spelling, or the gates that \
+             read it directly (phase 2, requeue_released, the room scan) miss an \
+             already-decided site and re-bill it"
+        );
+        assert!(
+            flat.contains("pending.remap(&registry)"),
+            "the queue must be remapped through the registry on load, or a queued \
+             pre-fold locator is described a second time under a spelling that is \
+             already indexed"
+        );
+        // The quarantine is the fourth structure that needed remapping, found
+        // only after the other three were fixed one at a time. `forget` removes
+        // by exact key, so a quarantine left on the old spelling survives being
+        // forgotten and comes back as a duplicate.
+        // `released` feeds the pending queue and `decided` feeds the seen file,
+        // so a spelling missed in either becomes a stale queue entry or a seen
+        // line that never matches what discovery emits. They are passed INTO
+        // `remap` rather than remapped separately, so that they cannot be
+        // forgotten or reconciled inconsistently.
+        assert!(
+            flat.contains("quarantine.remap(&registry, &mut released, &mut decided)"),
+            "the quarantine, released and decided must all be remapped by ONE \
+             call, or `forget` misses the entry the drain just indexed and alias \
+             collisions are reconciled inconsistently"
+        );
+        // The remaps must come before the two things that CONSUME the queue:
+        // `requeue_released` inserts released locators verbatim, and the drain
+        // reads the queue. A remap that ran after either would leave exactly the
+        // unmapped spellings it exists to remove.
+        //
+        // NOT asserted: registry-before-`Pending::load`. An earlier version of
+        // this pin required that and justified it as "the remap would have
+        // nothing to map with", which is backwards -- moving the registry load
+        // below `remap` does not compile, so the borrow checker enforces that
+        // property reliably and this pin does not need to. Requiring the
+        // stronger ordering only made the pin red on a correct refactor.
+        let at = |needle: &str| {
+            flat.find(needle)
+                .unwrap_or_else(|| panic!("run_once must contain {needle}"))
+        };
+        assert!(
+            at("pending.remap(&registry)") < at("requeue_released("),
+            "the queue must be remapped BEFORE released locators are requeued, \
+             or a released pre-fold locator enters the queue unmapped and is \
+             described a second time"
+        );
+        assert!(
+            at("quarantine.remap(&registry, &mut released, &mut decided)")
+                < at("requeue_released("),
+            "and the released list must be remapped before it is consumed"
+        );
+    }
+
+    /// Remapping must carry retry state and rebuild the author counts.
+    ///
+    /// Both mutations below passed the whole suite before this test existed, and
+    /// both would be money bugs, because `remap` now runs on EVERY run:
+    ///
+    /// - Passing `0, None` to `insert_raw` instead of `e.attempts, e.thin` resets
+    ///   the retry count and the thin streak every run, so no locator ever
+    ///   reaches `MAX_ATTEMPTS`, nothing ever enters the quarantine, and a
+    ///   permanently-failing link is re-fetched and re-charged forever.
+    /// - Dropping `self.per_author.clear()` double-counts every author after the
+    ///   first remap, halving the per-author share in practice (captures silently
+    ///   refused) and skewing `evict_one`, which picks its victim by `max_by_key`
+    ///   on those counts.
+    ///
+    /// The earlier remap fixtures could not catch either, because every entry in
+    /// them had `attempts = 0`, no thin streak, and one author.
+    #[test]
+    fn remapping_preserves_retry_state_and_rebuilds_author_counts() {
+        let tmp = TmpFile::new("pending-remap-state");
+        let mut p = Pending::load(tmp.path());
+        let streak = ThinStreak {
+            print: ThinPrint::of("some thin page", 12),
+            runs: 2,
+        };
+        // Two authors, non-zero retry state, and a locator whose spelling the
+        // remap will actually change.
+        assert!(p.insert_raw(
+            format!("freenet:{DELTA}#DWn4bEFfoo"),
+            "site",
+            "ALICE".to_string(),
+            2,
+            Some(streak),
+        ));
+        assert!(p.insert_raw(
+            format!("freenet:{ID}/a"),
+            "site",
+            "BOB".to_string(),
+            1,
+            None,
+        ));
+
+        p.remap(&delta_registry());
+
+        let remapped = p
+            .entries
+            .iter()
+            .find(|(l, _)| l == "app:delta/DWn4bEFfoo")
+            .map(|(_, e)| e)
+            .expect("the Delta locator must have been remapped");
+        assert_eq!(
+            remapped.attempts, 2,
+            "the retry count must survive the remap"
+        );
+        assert_eq!(
+            remapped.thin.map(|t| t.runs),
+            Some(2),
+            "the thin streak must survive too, or a hopeless locator is never retired"
+        );
+        assert_eq!(remapped.author, "ALICE");
+
+        assert_eq!(
+            p.per_author.get("ALICE").copied(),
+            Some(1),
+            "author counts must be REBUILT, not accumulated: {:?}",
+            p.per_author
+        );
+        assert_eq!(p.per_author.get("BOB").copied(), Some(1));
+
+        // Idempotent: a second remap must not inflate the counts either.
+        p.remap(&delta_registry());
+        assert_eq!(p.per_author.get("ALICE").copied(), Some(1));
+        assert_eq!(p.per_author.get("BOB").copied(), Some(1));
+        assert_eq!(p.len(), 2);
+    }
+
+    /// Two spellings of one site already in the queue must MERGE, not both drain.
+    #[test]
+    fn remapping_merges_two_spellings_of_one_queued_site() {
+        let tmp = TmpFile::new("pending-remap-merge");
+        fs::write(
+            tmp.path(),
+            format!(
+                "0\tsite\t@curated\tfreenet:{DELTA}#DWn4bEFfoo\n\
+                 0\tsite\t@curated\tapp:delta/DWn4bEFfoo\n"
+            ),
+        )
+        .unwrap();
+        let mut p = Pending::load(tmp.path());
+        assert_eq!(p.len(), 2, "they are distinct strings before the remap");
+        assert_eq!(p.remap(&delta_registry()), 1, "one collision, merged");
+        assert_eq!(p.len(), 1, "one site, one queue entry");
+    }
+
+    /// The gates that read `seen` DIRECTLY must see the mapped spelling too.
+    ///
+    /// `capture_filter` covers discovery. Three gates bypass it and read `seen`
+    /// itself -- phase 2's skip, `requeue_released`'s no-op check, and the room
+    /// scan -- and they now receive MAPPED locators, because the queue and the
+    /// released list are remapped. `load_seen` runs before the registry exists,
+    /// so it can only produce the `normalize_href` spelling. Testing one against
+    /// the other misses, and the site is re-fetched, re-described and re-BILLED.
+    ///
+    /// The nastiest part is that it does not need the same string. `map_locator`
+    /// drops the path, so a queued deep link and a decided landing page are
+    /// different strings that map to the same locator -- which is why this test
+    /// uses a deep link rather than the identical locator.
+    ///
+    /// This is the fifth locator store to need the same treatment, each found one
+    /// at a time. The expansion is folded into `seen` itself so a sixth gate gets
+    /// it without anyone remembering to.
+    #[test]
+    fn the_seen_set_covers_the_mapped_spelling_for_gates_that_read_it_directly() {
+        let reg = delta_registry();
+        // What a pre-fold run recorded: a decision about the landing page.
+        let decided_landing = format!("freenet:{DELTA}/#DWn4bEFfoo");
+        let mut seen: HashSet<String> = [decided_landing.clone()].into_iter().collect();
+
+        // The expansion `run_once` performs once the registry is available.
+        seen.extend(
+            seen.iter()
+                .map(|loc| canonical_for_run(loc, &reg))
+                .collect::<Vec<_>>(),
+        );
+
+        // A DIFFERENT string for the same site: a deep link into the same Delta
+        // resource, as the queue would hold it after `Pending::remap`.
+        let queued_deep_link = format!("freenet:{DELTA}/#DWn4bEFfoo/2/links");
+        let from_queue = canonical_for_run(&queued_deep_link, &reg);
+        assert_eq!(from_queue, "app:delta/DWn4bEFfoo", "test premise");
+        assert_ne!(
+            queued_deep_link, decided_landing,
+            "test premise: not equal as strings"
+        );
+
+        assert!(
+            seen.contains(&from_queue),
+            "the drain's `seen.contains` gate must match, or an already-decided \
+             site is re-fetched, re-described and re-billed: {seen:?}"
+        );
+        assert!(
+            seen.contains(&decided_landing),
+            "and the spelling it was recorded under must keep matching"
+        );
+    }
+
+    /// A seen entry stored in the PRE-FOLD Delta shape must suppress the
+    /// locator that shape now canonicalises to.
+    ///
+    /// `load_seen` re-canonicalises through `normalize_href` only — it runs
+    /// before the app registry is available — while every capture path emits the
+    /// MAPPED form. Those agreed until the bare-root fold made a fragment-only
+    /// Delta locator map, so an entry written `freenet:<container>#<handle>` is
+    /// now rediscovered as `app:delta/<handle>`, a spelling `load_seen` cannot
+    /// produce. Entries in that shape exist by construction: it is exactly what
+    /// the pre-fold code emitted for them. Without this, each one lacking an
+    /// `app:` twin already in the file is described, billed and added a second
+    /// time — the duplicate this whole change exists to stop, coming back
+    /// through a different door.
+    #[test]
+    fn capture_filter_suppresses_the_mapped_spelling_of_a_pre_fold_entry() {
+        let none: HashSet<String> = HashSet::new();
+        let (q, _, _) = Quarantine::load(TmpFile::new("capfilter-mapped").path(), 0, &none);
+        let reg = delta_registry();
+
+        // Written by a build that predates the fold: raw, fragment-only, unmapped.
+        let pre_fold = format!("freenet:{DELTA}#DWn4bEFfoo");
+        let seen: HashSet<String> = [pre_fold.clone()].into_iter().collect();
+        let f = capture_filter(&seen, &q, &reg);
+
+        // What discovery produces for that same site today.
+        let (rediscovered, _) = normalize_mapped(&format!("freenet:{DELTA}/#DWn4bEFfoo"), &reg)
+            .expect("a Delta link must still normalise");
+        assert_eq!(rediscovered, "app:delta/DWn4bEFfoo", "test premise");
+        assert!(
+            f.contains(&rediscovered),
+            "an already-decided site must not be re-captured under the spelling \
+             canonicalisation now produces for it: {f:?}"
+        );
+        assert!(
+            f.contains(&pre_fold),
+            "and the form it was written in must keep matching, so a locator that \
+             stops mapping is not un-suppressed"
+        );
+    }
+
     /// The hold is only meaningful if discovery is actually filtered by it.
     #[test]
     fn capture_filter_suppresses_held_but_not_unrelated_locators() {
@@ -12032,7 +12991,7 @@ mod tests {
         let _ = q.hold(&held, "site", "ALICE", 1_000);
         let seen: HashSet<String> = [indexed.clone()].into_iter().collect();
 
-        let f = capture_filter(&seen, &q);
+        let f = capture_filter(&seen, &q, &delta_registry());
         assert!(f.contains(&held), "a held locator must not be re-captured");
         assert!(f.contains(&indexed), "seen must still suppress capture");
         assert!(
@@ -13597,6 +14556,159 @@ mod tests {
              `freenet:` form, not discarded"
         );
         assert!(p.contains(&format!("freenet:{ID}/keep")));
+    }
+
+    /// The reported duplicate-listing bug, in the shape it was reported in.
+    ///
+    /// Freebird reached the crawler once as a bare `freenet:<id>` (a River-room
+    /// message) and once as `freenet:<id>/` (a hub link). Both name the one
+    /// page -- `contract_web_href` builds the identical URL for each -- but they
+    /// are different strings, so the seen set treated them as two sites and the
+    /// index ended up with two Freebird entries. Five more sites were listed
+    /// twice for the same reason.
+    ///
+    /// Asserting on the SET rather than on each form separately is deliberate:
+    /// the property that matters is that every spelling of the root collapses
+    /// onto ONE locator, not that it collapses onto any particular one.
+    #[test]
+    fn every_spelling_of_a_contract_root_is_one_locator() {
+        let spellings = [
+            format!("freenet:{ID}"),
+            format!("freenet:{ID}/"),
+            format!("/v1/contract/web/{ID}"),
+            format!("/v1/contract/web/{ID}/"),
+            format!("http://gw.example/v1/contract/web/{ID}/?__sandbox=1"),
+        ];
+        let canon: HashSet<String> = spellings
+            .iter()
+            .map(|h| {
+                normalize_href(h)
+                    .unwrap_or_else(|| panic!("{h} must normalise to a locator"))
+                    .0
+            })
+            .collect();
+        assert_eq!(
+            canon.len(),
+            1,
+            "one page must have one locator, or it is indexed once per spelling: {canon:?}"
+        );
+        // And the surviving form is the one that renders a working link.
+        let only = canon.iter().next().unwrap();
+        assert_eq!(only, &format!("freenet:{ID}/"));
+        assert_eq!(
+            atlas_common::contract_web_href(ID, ""),
+            atlas_common::contract_web_href(ID, "/"),
+            "the fold is only correct because the gateway serves both as one page"
+        );
+    }
+
+    /// Canonicalisation adds a byte, so the input-length guard alone no longer
+    /// bounds the OUTPUT.
+    ///
+    /// A locator exactly at the cap on the way in is one over on the way out.
+    /// `normalize_href` has to stay a fixed point -- `Pending::load` re-runs it
+    /// over every stored line and drops what no longer validates -- so an
+    /// over-cap emission would be captured, queued, and silently lost on the
+    /// next restart. Found by the external review pass on this change.
+    #[test]
+    fn canonicalisation_cannot_push_a_locator_over_the_cap() {
+        // Exactly at the cap on input: `freenet:` + id + `#` + filler.
+        let filler = "a".repeat(MAX_LOCATOR_LEN - "freenet:".len() - ID.len() - 1);
+        let at_cap = format!("freenet:{ID}#{filler}");
+        assert_eq!(at_cap.len(), MAX_LOCATOR_LEN, "test premise");
+        assert_eq!(
+            normalize_href(&at_cap),
+            None,
+            "the canonical form is one byte over the cap, so it must be refused \
+             rather than emitted and then dropped on the next restart"
+        );
+
+        // One byte under the cap still fits once the slash is added.
+        let filler = "a".repeat(MAX_LOCATOR_LEN - "freenet:".len() - ID.len() - 2);
+        let under = format!("freenet:{ID}#{filler}");
+        let (canon, _) = normalize_href(&under).expect("this one must still be accepted");
+        assert_eq!(canon.len(), MAX_LOCATOR_LEN);
+        assert_eq!(
+            normalize_href(&canon).map(|(l, _)| l),
+            Some(canon.clone()),
+            "and it must still be a fixed point at exactly the cap"
+        );
+
+        // The GATEWAY branch is bounded BY CONSTRUCTION, not by the cap check,
+        // and this pins the reason rather than pretending otherwise.
+        //
+        // An earlier version of this test asserted `len() <= cap ||
+        // normalize_href returned None`, which cannot fail: the gateway branch
+        // builds its locator only from the text AFTER `/v1/contract/web/`, so a
+        // 17-byte prefix becomes an 8-byte one and the fold adds at most 1 —
+        // output is always at least 8 bytes SHORTER than input. Deleting
+        // `within_locator_cap` from that branch changes nothing observable, so
+        // the assertion read as coverage while establishing nothing. The cap
+        // call stays there as a belt (it costs a comparison and survives someone
+        // changing how the branch builds its output), but the property worth
+        // pinning is the arithmetic that makes it unreachable.
+        let prefix = format!("/v1/contract/web/{ID}");
+        let filler = "a".repeat(MAX_LOCATOR_LEN - prefix.len() - 1);
+        let gw_at_cap = format!("{prefix}#{filler}");
+        assert_eq!(gw_at_cap.len(), MAX_LOCATOR_LEN, "test premise");
+        let (emitted, _) = normalize_href(&gw_at_cap)
+            .expect("an at-cap gateway URL is within the cap once rewritten");
+        assert!(
+            emitted.len() + "/v1/contract/web/".len() <= gw_at_cap.len() + "freenet:".len() + 1,
+            "the gateway rewrite must keep shortening: {} -> {}",
+            gw_at_cap.len(),
+            emitted.len()
+        );
+        assert!(emitted.len() < MAX_LOCATOR_LEN);
+    }
+
+    /// A locator already decided about must not be re-described just because
+    /// canonicalisation changed underneath the seen file.
+    ///
+    /// The file is append-only and holds locators written by every build that
+    /// ever ran, so the bare-root form is in there for sites indexed months ago.
+    /// Without the re-canonicalisation on load, the fix above would rediscover
+    /// each of them under the new form, miss the set, and mint exactly the
+    /// duplicate entries it exists to prevent -- once, permanently, across the
+    /// whole index.
+    #[test]
+    fn the_seen_set_matches_locators_written_before_canonicalisation_changed() {
+        let tmp = TmpFile::new("seen-canon");
+        fs::write(
+            tmp.path(),
+            format!(
+                "freenet:{ID}\n\
+                 /v1/contract/web/{ID}/docs\n\
+                 https://example.com/gone\n"
+            ),
+        )
+        .unwrap();
+        let seen = load_seen(tmp.path());
+        // A GATEWAY-form line is what makes this test about re-canonicalisation
+        // rather than about appending a slash. Without it the whole fixture is
+        // satisfied by `out.insert(format!("{l}/"))`, so the mutation that
+        // replaces the `normalize_href` call with naive string-munging survives —
+        // and the seen file genuinely holds gateway-form lines from before
+        // off-Freenet URLs were refused, which under that mutation would stop
+        // suppressing rediscovery and be re-described.
+        assert!(
+            seen.contains(&format!("freenet:{ID}/docs")),
+            "a gateway-form line must come back under the scheme it canonicalises \
+             to, which only a real normalize_href pass produces: {seen:?}"
+        );
+        assert!(
+            seen.contains(&format!("freenet:{ID}/")),
+            "a pre-canonicalisation line must match today's canonical form: {seen:?}"
+        );
+        assert!(
+            seen.contains(&format!("freenet:{ID}")),
+            "and must keep matching the form it was written in"
+        );
+        assert!(
+            seen.contains("https://example.com/gone"),
+            "a line that no longer validates at all must still suppress \
+             rediscovery, or every retired external link comes back"
+        );
     }
 
     #[test]
