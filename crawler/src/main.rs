@@ -2526,7 +2526,13 @@ impl Quarantine {
         decided: &mut Vec<(String, Decided)>,
     ) -> usize {
         let mut merged = 0usize;
-        let old = std::mem::take(&mut self.entries);
+        // Sorted, so a merge's surviving `author` and `kind` are decided by the
+        // locator that sorts first rather than by HashMap iteration order. The
+        // numeric fields take a `min` below and are order-independent already;
+        // these two are not, and a run-to-run coin flip over which author is
+        // charged for a held locator is not something to leave in.
+        let mut old: Vec<_> = std::mem::take(&mut self.entries).into_iter().collect();
+        old.sort_by(|a, b| a.0.cmp(&b.0));
         let mut changed = false;
         for (loc, e) in old {
             let canon = canonical_for_run(&loc, registry);
@@ -3147,6 +3153,33 @@ fn run_once(
     // emits this run, or it is described a second time under a spelling that is
     // already indexed.
     let registry = AppRegistryView::load(cli);
+
+    // `seen` is the LAST locator store that has to answer the same question, and
+    // it is the one several gates read DIRECTLY rather than through
+    // `capture_filter`: phase 2's skip, `requeue_released`'s no-op check, and the
+    // room scan. Those gates now receive MAPPED locators (the queue and the
+    // released list are remapped above), so testing them against a set
+    // `load_seen` canonicalised through `normalize_href` alone -- it runs before
+    // the registry exists -- misses.
+    //
+    // The reachable case does not even need the same string, because
+    // `map_locator` drops the path: a queued deep link
+    // `freenet:<container>/#H/2/links` and a decided landing page
+    // `freenet:<container>/#H` are different strings that both map to
+    // `app:delta/H`. The site is then re-fetched, re-DESCRIBED and re-BILLED
+    // (the budget is charged before the attempt), and if the old decision was an
+    // index under a `Freenet` locator, `dedup_key` cannot match an `AppResource`
+    // key, so it lands as a second listing.
+    //
+    // Folded into `seen` itself rather than handed to each gate, so a future gate
+    // that reads `seen` gets it for free. NOT replaced by `suppressed`: that
+    // includes `quarantine.held()`, which would skip locators deliberately
+    // released for retry.
+    seen.extend(
+        seen.iter()
+            .map(|loc| canonical_for_run(loc, &registry))
+            .collect::<Vec<_>>(),
+    );
     let mut pending = Pending::load(pending_path);
     pending.remap(&registry);
     // Locators given up on for transient reasons, plus the ones whose hold has
@@ -12549,6 +12582,44 @@ mod tests {
         assert_eq!(q.held().count(), 1, "and the live entry stays held");
     }
 
+    /// Source pin, deliberately: a merge's surviving `author`/`kind` must be
+    /// decided by a SORT, not by HashMap iteration order.
+    ///
+    /// The numeric fields take a `min` and are order-independent already; these
+    /// two are not, so without the sort, which author is charged for a merged
+    /// held locator is a run-to-run coin flip. That is a property about iteration
+    /// order, and Rust seeds each HashMap randomly, so a behavioural test could
+    /// only SAMPLE it -- it would pass or fail by luck, which is a flaky test
+    /// asserting a real invariant, the worst of both. Pinning the mechanism is
+    /// the honest instrument here, and this comment is why.
+    #[test]
+    fn a_quarantine_merge_picks_its_survivor_deterministically() {
+        let src = include_str!("main.rs");
+        let production = src
+            .split("\nmod tests")
+            .next()
+            .expect("source must have a pre-test region");
+        let all = strip_comments(production);
+        // Scoped to the Quarantine impl: `Pending` has a `remap` too, and it
+        // sorts nothing (a Vec is already ordered), so an unscoped search finds
+        // the wrong function and the pin is vacuous.
+        let imp = all
+            .find("impl Quarantine {")
+            .expect("impl Quarantine must exist");
+        let start = imp
+            + all[imp..]
+                .find("fn remap(")
+                .expect("Quarantine::remap must exist");
+        let body = &all[start..];
+        let body = &body[..body.find("\n    }\n").unwrap_or(body.len())];
+        let flat = body.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(
+            flat.contains("old.sort_by(|a, b| a.0.cmp(&b.0))"),
+            "the merge must iterate in a sorted order, or the surviving author \
+             and kind depend on HashMap iteration order"
+        );
+    }
+
     /// Two spellings coming due together must be released ONCE.
     ///
     /// `requeue_released` calls `defer_placement` per released locator. Left as
@@ -12666,6 +12737,14 @@ mod tests {
             1,
             "run_once must read the registry exactly once, or this pin is \
              ambiguous about which load it is talking about"
+        );
+        // The `seen` expansion is a bare statement rather than a method call, so
+        // it is the easiest of the five to delete while tidying.
+        assert!(
+            flat.contains("seen.extend(") && flat.contains("canonical_for_run(loc, &registry)"),
+            "`seen` must be expanded with the mapped spelling, or the gates that \
+             read it directly (phase 2, requeue_released, the room scan) miss an \
+             already-decided site and re-bill it"
         );
         assert!(
             flat.contains("pending.remap(&registry)"),
@@ -12807,6 +12886,58 @@ mod tests {
         assert_eq!(p.len(), 2, "they are distinct strings before the remap");
         assert_eq!(p.remap(&delta_registry()), 1, "one collision, merged");
         assert_eq!(p.len(), 1, "one site, one queue entry");
+    }
+
+    /// The gates that read `seen` DIRECTLY must see the mapped spelling too.
+    ///
+    /// `capture_filter` covers discovery. Three gates bypass it and read `seen`
+    /// itself -- phase 2's skip, `requeue_released`'s no-op check, and the room
+    /// scan -- and they now receive MAPPED locators, because the queue and the
+    /// released list are remapped. `load_seen` runs before the registry exists,
+    /// so it can only produce the `normalize_href` spelling. Testing one against
+    /// the other misses, and the site is re-fetched, re-described and re-BILLED.
+    ///
+    /// The nastiest part is that it does not need the same string. `map_locator`
+    /// drops the path, so a queued deep link and a decided landing page are
+    /// different strings that map to the same locator -- which is why this test
+    /// uses a deep link rather than the identical locator.
+    ///
+    /// This is the fifth locator store to need the same treatment, each found one
+    /// at a time. The expansion is folded into `seen` itself so a sixth gate gets
+    /// it without anyone remembering to.
+    #[test]
+    fn the_seen_set_covers_the_mapped_spelling_for_gates_that_read_it_directly() {
+        let reg = delta_registry();
+        // What a pre-fold run recorded: a decision about the landing page.
+        let decided_landing = format!("freenet:{DELTA}/#DWn4bEFfoo");
+        let mut seen: HashSet<String> = [decided_landing.clone()].into_iter().collect();
+
+        // The expansion `run_once` performs once the registry is available.
+        seen.extend(
+            seen.iter()
+                .map(|loc| canonical_for_run(loc, &reg))
+                .collect::<Vec<_>>(),
+        );
+
+        // A DIFFERENT string for the same site: a deep link into the same Delta
+        // resource, as the queue would hold it after `Pending::remap`.
+        let queued_deep_link = format!("freenet:{DELTA}/#DWn4bEFfoo/2/links");
+        let from_queue = canonical_for_run(&queued_deep_link, &reg);
+        assert_eq!(from_queue, "app:delta/DWn4bEFfoo", "test premise");
+        assert_ne!(
+            queued_deep_link, decided_landing,
+            "test premise: not equal as strings"
+        );
+
+        assert!(
+            seen.contains(&from_queue),
+            "the drain's `seen.contains` gate must match, or an already-decided \
+             site is re-fetched, re-described and re-billed: {seen:?}"
+        );
+        assert!(
+            seen.contains(&decided_landing),
+            "and the spelling it was recorded under must keep matching"
+        );
     }
 
     /// A seen entry stored in the PRE-FOLD Delta shape must suppress the
