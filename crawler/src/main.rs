@@ -2107,6 +2107,7 @@ impl Quarantine {
         // Locators leaving this file permanently: out of cycles, or trimmed.
         let mut decided: Vec<(String, Decided)> = Vec::new();
         let mut dropped = 0usize;
+        let mut merged = 0usize;
         let Ok(body) = fs::read_to_string(path) else {
             return (q, released, decided);
         };
@@ -2211,8 +2212,21 @@ impl Quarantine {
             if due_at != due {
                 q.dirty = true;
             }
+            // A collision is a MERGE, not a validation failure. Two lines that
+            // re-canonicalise onto one locator arrive here having validated
+            // perfectly well; reporting them under "no longer validate" tells an
+            // operator their links were rejected when in fact two entries became
+            // one. `Pending::load` already separates the two counters and this
+            // did not, which only stopped mattering by luck: bare/slash pairs
+            // could not collide until `canonical_contract_path` made them fold,
+            // so the first run after that change is exactly when an operator
+            // would have read the wrong message.
+            //
+            // The loss is real either way -- the second entry's cycle count and
+            // author slot are discarded -- so it is still reported, just as what
+            // it is.
             if q.entries.contains_key(&canon) {
-                dropped += 1;
+                merged += 1;
                 q.dirty = true;
                 continue;
             }
@@ -2308,6 +2322,12 @@ impl Quarantine {
         }
         if dropped > 0 {
             eprintln!("warn: dropped {dropped} quarantined locator(s) that no longer validate");
+        }
+        if merged > 0 {
+            eprintln!(
+                "warn: {merged} quarantined locator(s) collided after normalization \
+                 and were merged — each losing its cycle count and author slot"
+            );
         }
         (q, released, decided)
     }
@@ -4664,8 +4684,7 @@ fn get_page_enumerating(
         if let Some(renderer) = &cli.renderer {
             // Render the gateway "shell" URL (no __sandbox query): the shell
             // creates the sandboxed app iframe, which the renderer reads back.
-            let path = if path.is_empty() { "/" } else { path };
-            let shell_url = gateway_url(gw, id, path)?;
+            let shell_url = gateway_url(gw, id, canonical_contract_path(path))?;
             // `is_app` is decided from the ORIGINAL locator, before resolution: a
             // resolved app locator looks like any other container URL.
             match render_page(&cli.node_bin, renderer, &shell_url, enumerate, is_app, None) {
@@ -4700,8 +4719,16 @@ fn get_page_enumerating(
         // because it is plain http, so `fetch` fails. Every attempt still
         // charges the budget, so three of them burned real money and then
         // marked the locator seen forever. The renderer branch already
-        // normalizes this, which is what gave the oversight away.
-        let path_only = if path_only.is_empty() { "/" } else { path_only };
+        // normalized this, which is what gave the oversight away.
+        //
+        // Shares `canonical_contract_path` with `normalize_href` rather than
+        // re-deriving the rule: this fold and that one are the same fact about
+        // the gateway, and they were hand-written copies until the third copy
+        // appeared. A locator reaching here is normally already canonical, so
+        // this is now a backstop for the paths that bypass normalisation (a
+        // registry-resolved `app:` locator, a locator read back from the live
+        // index by the recheck sweep) rather than the primary fold.
+        let path_only = canonical_contract_path(path_only);
         let sep = if path_only.contains('?') { '&' } else { '?' };
         let html = fetch(
             client,
@@ -7025,11 +7052,26 @@ fn add_entry(cli: &Cli, loc: &str, kind: &str, d: &Described) -> Result<()> {
 /// exists only among lines already on disk. Do not restate this as a saving it
 /// did not make.
 ///
+/// Scope, precisely: this re-canonicalises through `normalize_href` ALONE, not
+/// the full `normalize_mapped` pipeline, because it runs before the app registry
+/// is available. The mapped spelling is covered by `capture_filter` instead --
+/// see its doc comment, which is where the Delta fragment-only class is handled.
+///
 /// Both forms are inserted rather than only the re-canonicalised one, because a
 /// line that no longer validates at all (an off-Freenet `https://` locator from
 /// before Atlas stopped indexing the web) returns `None` here and must still
-/// suppress rediscovery. Keeping the raw line means this can only ever match
-/// MORE than it did before, never less.
+/// suppress rediscovery.
+///
+/// Keeping the raw line makes this match MORE than it did before -- which means
+/// SUPPRESSING more, so it is not safe merely for being "more". It is safe
+/// because `normalize_href` is resource-PRESERVING: every extra spelling it
+/// yields names the same document as the line it came from, so a suppressed
+/// locator is never a different site. The one shape that would break that is a
+/// non-`freenet:` line whose path embeds `/v1/contract/web/<id>`, which would
+/// mint a `freenet:<id>` entry naming something else entirely; it is
+/// unreachable, because the gateway branch has always been matched before the
+/// off-Freenet refusal, so a gateway-form URL was never stored in the
+/// `https://` shape to begin with.
 fn load_seen(path: &Path) -> HashSet<String> {
     fs::read_to_string(path)
         .map(|s| {
