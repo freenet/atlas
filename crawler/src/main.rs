@@ -2514,7 +2514,17 @@ impl Quarantine {
     /// Collisions merge on the entry that is due SOONEST and least-cycled, so a
     /// merge can never push a locator closer to being given up on than either
     /// colliding entry had earned -- the same rule `Pending::insert_raw` applies.
-    fn remap(&mut self, registry: &AppRegistryView) -> usize {
+    /// Takes `released` and `decided` rather than only `&mut self`, because all
+    /// three are outputs of ONE `load` and describe the same locators. Remapping
+    /// them independently is what produced the two defects below, and this
+    /// signature is what stops a caller doing it again -- the repo's own
+    /// "paired fields that must co-occur" rule, applied to three of them.
+    fn remap(
+        &mut self,
+        registry: &AppRegistryView,
+        released: &mut Vec<ReleasedLocator>,
+        decided: &mut Vec<(String, Decided)>,
+    ) -> usize {
         let mut merged = 0usize;
         let old = std::mem::take(&mut self.entries);
         let mut changed = false;
@@ -2534,6 +2544,31 @@ impl Quarantine {
                 }
             }
         }
+
+        for r in released.iter_mut() {
+            r.1 = canonical_for_run(&r.1, registry);
+        }
+        // Two spellings of one locator can BOTH come due, and remapping makes
+        // them the same locator. Left as duplicates, `requeue_released` calls
+        // `defer_placement` once per alias against the single merged entry, so a
+        // queue that refuses the locator burns N defers in ONE run instead of one
+        // per hourly run -- enough aliases retire a live site outright. Keep the
+        // most forgiving (fewest cycles), matching the merge rule above.
+        released.sort_by(|a, b| a.1.cmp(&b.1).then(a.0.cmp(&b.0)));
+        released.dedup_by(|a, b| a.1 == b.1);
+
+        for d in decided.iter_mut() {
+            d.0 = canonical_for_run(&d.0, registry);
+        }
+        // A terminal decision about ONE spelling must not condemn the locator
+        // when another spelling of it survived. `load` can exhaust or trim one
+        // alias while retaining the other; after remapping, the caller would mark
+        // that locator seen -- permanently blacklisting a site whose surviving
+        // entry still had retry cycles left. The survivor wins.
+        decided.retain(|(loc, _)| !self.entries.contains_key(loc));
+        decided.sort_by(|a, b| a.0.cmp(&b.0));
+        decided.dedup_by(|a, b| a.0 == b.0);
+
         if changed || merged > 0 {
             self.dirty = true;
         }
@@ -3130,13 +3165,7 @@ fn run_once(
     // pending queue via `requeue_released`, and `decided` is appended to the seen
     // file — so a spelling missed here becomes a stale queue entry or a seen line
     // that never matches what discovery emits.
-    quarantine.remap(&registry);
-    for r in &mut released {
-        r.1 = canonical_for_run(&r.1, &registry);
-    }
-    for d in &mut decided {
-        d.0 = canonical_for_run(&d.0, &registry);
-    }
+    quarantine.remap(&registry, &mut released, &mut decided);
     // Out of retry cycles. THIS is where a locator legitimately becomes
     // permanent: not because one fetch failed, but because several attempts
     // spread over months all did. Without this terminal state the quarantine has
@@ -12469,7 +12498,7 @@ mod tests {
 
         let (mut q, _, _) = Quarantine::load(qf.path(), 0, &none);
         let _ = q.hold(&pre_fold, "site", "ALICE", 1_000);
-        q.remap(&reg);
+        q.remap(&reg, &mut Vec::new(), &mut Vec::new());
 
         // What the drain holds after the pending queue is remapped.
         let from_queue = canonical_for_run(&pre_fold, &reg);
@@ -12480,6 +12509,91 @@ mod tests {
             q.held().next().is_none(),
             "the held entry must be gone: a survivor comes due, is released, \
              misses the seen set, and is indexed a second time"
+        );
+    }
+
+    /// A terminal decision about ONE spelling must not condemn a locator whose
+    /// OTHER spelling survived with retry cycles left.
+    ///
+    /// `Quarantine::load` can exhaust or capacity-trim one alias while retaining
+    /// the other. Remapping then makes them the same locator, and the caller
+    /// marks everything in `decided` as seen — permanently blacklisting a site
+    /// that still had a live, more-forgiving entry. That is the failure the
+    /// quarantine exists to prevent (a good site lost for good), reintroduced by
+    /// remapping the three `load` outputs independently.
+    #[test]
+    fn a_decision_about_one_alias_does_not_condemn_a_surviving_one() {
+        let none: HashSet<String> = HashSet::new();
+        let qf = TmpFile::new("q-alias-decided");
+        let reg = delta_registry();
+        let (mut q, _, _) = Quarantine::load(qf.path(), 0, &none);
+
+        // The surviving entry, under the pre-fold spelling.
+        let _ = q.hold(
+            &format!("freenet:{DELTA}#DWn4bEFfoo"),
+            "site",
+            "ALICE",
+            1_000,
+        );
+        // A terminal decision recorded for the OTHER spelling of the same site.
+        let mut decided = vec![("app:delta/DWn4bEFfoo".to_string(), Decided::Exhausted)];
+        let mut released: Vec<ReleasedLocator> = Vec::new();
+
+        q.remap(&reg, &mut released, &mut decided);
+
+        assert!(
+            decided.is_empty(),
+            "the survivor wins: marking this locator seen would blacklist a site \
+             whose live entry still had cycles left, got {decided:?}"
+        );
+        assert_eq!(q.held().count(), 1, "and the live entry stays held");
+    }
+
+    /// Two spellings coming due together must be released ONCE.
+    ///
+    /// `requeue_released` calls `defer_placement` per released locator. Left as
+    /// duplicates after remapping, a queue that refuses the locator burns one
+    /// defer per alias in a SINGLE run rather than one per hourly run, so enough
+    /// aliases push it through `MAX_CONSECUTIVE_DEFERS` into an extra retry cycle
+    /// and on toward premature retirement — against the one merged entry that
+    /// was supposed to be the more forgiving of the two.
+    #[test]
+    fn two_spellings_coming_due_together_are_released_once() {
+        let none: HashSet<String> = HashSet::new();
+        let qf = TmpFile::new("q-alias-released");
+        let reg = delta_registry();
+        let (mut q, _, _) = Quarantine::load(qf.path(), 0, &none);
+
+        let mut released: Vec<ReleasedLocator> = vec![
+            (
+                3,
+                format!("freenet:{DELTA}#DWn4bEFfoo"),
+                "site",
+                "ALICE".to_string(),
+            ),
+            (
+                1,
+                "app:delta/DWn4bEFfoo".to_string(),
+                "site",
+                "ALICE".to_string(),
+            ),
+        ];
+        let mut decided: Vec<(String, Decided)> = Vec::new();
+
+        q.remap(&reg, &mut released, &mut decided);
+
+        assert_eq!(
+            released.len(),
+            1,
+            "one site, one release, or defer_placement is charged twice in one \
+             run against a single entry: {released:?}"
+        );
+        assert_eq!(released[0].1, "app:delta/DWn4bEFfoo");
+        assert_eq!(
+            released[0].0, 1,
+            "and the surviving release keeps the FEWEST cycles, matching the \
+             entry merge rule — a merge must never move a locator closer to \
+             being given up on"
         );
     }
 
@@ -12499,7 +12613,11 @@ mod tests {
         let _ = q.hold(&b, "site", "ALICE", 1_000);
         assert_eq!(q.held().count(), 2, "distinct strings before the remap");
 
-        assert_eq!(q.remap(&reg), 1, "one collision");
+        assert_eq!(
+            q.remap(&reg, &mut Vec::new(), &mut Vec::new()),
+            1,
+            "one collision"
+        );
         assert_eq!(q.held().count(), 1, "one site, one held entry");
     }
 
@@ -12538,35 +12656,37 @@ mod tests {
         let start = all.find("fn run_once(").expect("run_once must exist");
         let body = &all[start..];
         let body = &body[..body.find("\nfn ").unwrap_or(body.len())];
+        // Whitespace-collapsed, because these calls are long enough for
+        // `cargo fmt` to wrap them across lines, and a source pin that breaks on
+        // reformatting is a pin that gets deleted rather than fixed.
+        let flat = body.split_whitespace().collect::<Vec<_>>().join(" ");
         assert_eq!(
-            body.matches("let registry = AppRegistryView::load(cli)")
+            flat.matches("let registry = AppRegistryView::load(cli)")
                 .count(),
             1,
             "run_once must read the registry exactly once, or this pin is \
              ambiguous about which load it is talking about"
         );
         assert!(
-            body.contains("pending.remap(&registry)"),
+            flat.contains("pending.remap(&registry)"),
             "the queue must be remapped through the registry on load, or a queued \
              pre-fold locator is described a second time under a spelling that is \
              already indexed"
         );
-        // The quarantine is the fourth structure that needed this, found only
-        // after the other three were fixed one at a time. `forget` removes by
-        // exact key, so a quarantine left on the old spelling survives being
+        // The quarantine is the fourth structure that needed remapping, found
+        // only after the other three were fixed one at a time. `forget` removes
+        // by exact key, so a quarantine left on the old spelling survives being
         // forgotten and comes back as a duplicate.
-        assert!(
-            body.contains("quarantine.remap(&registry)"),
-            "the quarantine must be remapped too, or `forget` cannot remove the \
-             entry the drain just indexed"
-        );
         // `released` feeds the pending queue and `decided` feeds the seen file,
         // so a spelling missed in either becomes a stale queue entry or a seen
-        // line that never matches what discovery emits.
+        // line that never matches what discovery emits. They are passed INTO
+        // `remap` rather than remapped separately, so that they cannot be
+        // forgotten or reconciled inconsistently.
         assert!(
-            body.contains("canonical_for_run(&r.1, &registry)")
-                && body.contains("canonical_for_run(&d.0, &registry)"),
-            "the released and decided lists must be remapped as well"
+            flat.contains("quarantine.remap(&registry, &mut released, &mut decided)"),
+            "the quarantine, released and decided must all be remapped by ONE \
+             call, or `forget` misses the entry the drain just indexed and alias \
+             collisions are reconciled inconsistently"
         );
         // The remaps must come before the two things that CONSUME the queue:
         // `requeue_released` inserts released locators verbatim, and the drain
@@ -12580,7 +12700,7 @@ mod tests {
         // property reliably and this pin does not need to. Requiring the
         // stronger ordering only made the pin red on a correct refactor.
         let at = |needle: &str| {
-            body.find(needle)
+            flat.find(needle)
                 .unwrap_or_else(|| panic!("run_once must contain {needle}"))
         };
         assert!(
@@ -12590,8 +12710,9 @@ mod tests {
              described a second time"
         );
         assert!(
-            at("r.1 = canonical_for_run(&r.1, &registry)") < at("requeue_released("),
-            "and the released list itself must be remapped before it is consumed"
+            at("quarantine.remap(&registry, &mut released, &mut decided)")
+                < at("requeue_released("),
+            "and the released list must be remapped before it is consumed"
         );
     }
 
