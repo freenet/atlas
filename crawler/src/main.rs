@@ -1609,16 +1609,7 @@ impl Pending {
         self.per_author.clear();
         let mut changed = false;
         for (loc, e) in old {
-            let canon = match normalize_mapped(&loc, registry) {
-                Some((c, _)) => c,
-                // Unreachable in practice: `load` already dropped anything that
-                // fails `normalize_href`, and mapping only ever rewrites. Keeping
-                // the entry is the fail-safe direction either way -- this is a
-                // canonicalisation pass, not a second validation gate, and
-                // dropping here would be the silent loss the queue exists to
-                // prevent.
-                None => loc.clone(),
-            };
+            let canon = canonical_for_run(&loc, registry);
             changed |= canon != loc;
             if !self.insert_raw(canon, e.kind, e.author, e.attempts, e.thin) {
                 merged += 1;
@@ -2504,6 +2495,51 @@ impl Quarantine {
         }
     }
 
+    /// Re-key every held locator to the spelling discovery emits this run.
+    ///
+    /// `load` re-validates through `normalize_href` alone (it runs before the
+    /// registry), so a held pre-fold Delta locator stays keyed
+    /// `freenet:<container>/#<handle>` while the pending queue's copy of the same
+    /// locator is remapped to `app:delta/<handle>`.
+    ///
+    /// That split is not cosmetic, because `forget` removes by EXACT key. A
+    /// released locator lives in both structures at once; when the drain indexes
+    /// it successfully and calls `quarantine.forget(&loc)` with the pending
+    /// (mapped) spelling, the quarantine entry under the old key survives. It
+    /// then comes due, is released again, misses a `seen` set that holds only the
+    /// mapped spelling, and is re-queued, re-described, re-billed and indexed a
+    /// second time -- reproducing precisely the duplicate this change exists to
+    /// remove, from the one structure nobody had remapped.
+    ///
+    /// Collisions merge on the entry that is due SOONEST and least-cycled, so a
+    /// merge can never push a locator closer to being given up on than either
+    /// colliding entry had earned -- the same rule `Pending::insert_raw` applies.
+    fn remap(&mut self, registry: &AppRegistryView) -> usize {
+        let mut merged = 0usize;
+        let old = std::mem::take(&mut self.entries);
+        let mut changed = false;
+        for (loc, e) in old {
+            let canon = canonical_for_run(&loc, registry);
+            changed |= canon != loc;
+            match self.entries.entry(canon) {
+                std::collections::hash_map::Entry::Vacant(v) => {
+                    v.insert(e);
+                }
+                std::collections::hash_map::Entry::Occupied(mut o) => {
+                    merged += 1;
+                    let kept = o.get_mut();
+                    kept.due_at = kept.due_at.min(e.due_at);
+                    kept.cycles = kept.cycles.min(e.cycles);
+                    kept.defers = kept.defers.min(e.defers);
+                }
+            }
+        }
+        if changed || merged > 0 {
+            self.dirty = true;
+        }
+        merged
+    }
+
     /// Drop a locator that has been decided about.
     fn forget(&mut self, loc: &str) {
         if self.entries.remove(loc).is_some() {
@@ -2972,12 +3008,11 @@ fn capture_filter(
             // mapped spelling is never produced. `None` (a stored line that no
             // longer validates at all) contributes nothing extra, which is
             // right — the raw form below still suppresses it.
-            let canon = normalize_mapped(&loc, registry).map(|(l, _)| l);
+            let canon = canonical_for_run(&loc, registry);
             // Collected into a set, so the common case where the two are equal
             // costs one allocation and collapses back to a single entry.
-            [Some(loc), canon]
+            [loc, canon]
         })
-        .flatten()
         .collect()
 }
 
@@ -3088,7 +3123,20 @@ fn run_once(
     // the queue by the time we get here, so refusing to record the reason cannot
     // put them back — it would only lose them from the seen file too.
     let mut decisions = DecisionLog::open(decisions_path);
-    let (mut quarantine, released, decided) = Quarantine::load(quarantine_path, now_secs(), &seen);
+    let (mut quarantine, mut released, mut decided) =
+        Quarantine::load(quarantine_path, now_secs(), &seen);
+    // Same remap as the pending queue, and for the same reason. The two lists the
+    // load hands back carry locators too: `released` goes straight into the
+    // pending queue via `requeue_released`, and `decided` is appended to the seen
+    // file — so a spelling missed here becomes a stale queue entry or a seen line
+    // that never matches what discovery emits.
+    quarantine.remap(&registry);
+    for r in &mut released {
+        r.1 = canonical_for_run(&r.1, &registry);
+    }
+    for d in &mut decided {
+        d.0 = canonical_for_run(&d.0, &registry);
+    }
     // Out of retry cycles. THIS is where a locator legitimately becomes
     // permanent: not because one fetch failed, but because several attempts
     // spread over months all did. Without this terminal state the quarantine has
@@ -6083,6 +6131,34 @@ fn locator_identity(loc: &str) -> &str {
 /// Normalize an href, then `map_or_collapse` it: onto a registered app if it
 /// belongs to one, else collapsing its fragment if it names an unregistered
 /// fragment-routed site.
+/// The spelling THIS RUN's discovery emits for an already-known locator.
+///
+/// Persisted locators are re-validated by loaders that run before the app
+/// registry is available, so they come back in `normalize_href` form while every
+/// capture path emits the `normalize_mapped` form. Any code that compares a
+/// stored locator against a discovered one has to close that gap, and four
+/// separate places need to: the seen set (via `capture_filter`), the pending
+/// queue, the quarantine, and the released/decided lists the quarantine hands
+/// back.
+///
+/// Each of those was found by a different reviewer, one at a time, because each
+/// derived the rule itself instead of sharing it. That is the whole reason this
+/// exists as a named function rather than a fourth inline `normalize_mapped`
+/// call: the next loader that reads persisted locators should have something to
+/// reuse, and `rg canonical_for_run` should list everywhere the question is
+/// answered.
+///
+/// Falls back to the locator unchanged when it no longer validates at all. That
+/// is the fail-safe direction for every caller here — these are canonicalisation
+/// passes over state that has already been validated on load, not second
+/// validation gates, and dropping would be the silent loss the queue exists to
+/// prevent.
+fn canonical_for_run(loc: &str, registry: &AppRegistryView) -> String {
+    normalize_mapped(loc, registry)
+        .map(|(l, _)| l)
+        .unwrap_or_else(|| loc.to_string())
+}
+
 fn normalize_mapped(href: &str, registry: &AppRegistryView) -> Option<(String, &'static str)> {
     let (loc, kind) = normalize_href(href)?;
     Some((map_or_collapse(loc, registry), kind))
@@ -12370,6 +12446,63 @@ mod tests {
         assert_eq!(p.len(), 1, "remap rewrites in place, it does not duplicate");
     }
 
+    /// The failure Codex described, reproduced end to end: a held locator whose
+    /// key was never remapped survives `forget` and comes back as a duplicate.
+    ///
+    /// A released locator is in the pending queue AND the quarantine at once.
+    /// `forget` removes by EXACT key, so if the queue's copy is remapped to
+    /// `app:delta/<handle>` and the quarantine's is still
+    /// `freenet:<container>/#<handle>`, indexing the locator successfully drops
+    /// the queue entry and leaves the quarantine one. It comes due, is released,
+    /// misses a `seen` set holding only the mapped spelling, and is re-queued,
+    /// re-described, re-billed and indexed a second time.
+    ///
+    /// Asserting on `forget` with the PENDING spelling is the point: that is what
+    /// the drain actually calls, so this fails if the two structures disagree
+    /// about a locator's identity for any reason, not just this one.
+    #[test]
+    fn a_held_locator_is_forgotten_by_the_spelling_the_queue_uses() {
+        let none: HashSet<String> = HashSet::new();
+        let qf = TmpFile::new("q-remap");
+        let reg = delta_registry();
+        let pre_fold = format!("freenet:{DELTA}#DWn4bEFfoo");
+
+        let (mut q, _, _) = Quarantine::load(qf.path(), 0, &none);
+        let _ = q.hold(&pre_fold, "site", "ALICE", 1_000);
+        q.remap(&reg);
+
+        // What the drain holds after the pending queue is remapped.
+        let from_queue = canonical_for_run(&pre_fold, &reg);
+        assert_eq!(from_queue, "app:delta/DWn4bEFfoo", "test premise");
+
+        q.forget(&from_queue);
+        assert!(
+            q.held().next().is_none(),
+            "the held entry must be gone: a survivor comes due, is released, \
+             misses the seen set, and is indexed a second time"
+        );
+    }
+
+    /// Two spellings of one held site must merge, keeping the SOONEST due time
+    /// and the LOWEST cycle count — a merge must never move a locator closer to
+    /// being given up on than either entry had earned.
+    #[test]
+    fn remapping_the_quarantine_merges_on_the_more_forgiving_entry() {
+        let none: HashSet<String> = HashSet::new();
+        let qf = TmpFile::new("q-remap-merge");
+        let reg = delta_registry();
+        let (mut q, _, _) = Quarantine::load(qf.path(), 0, &none);
+
+        let a = format!("freenet:{DELTA}#DWn4bEFfoo");
+        let b = "app:delta/DWn4bEFfoo".to_string();
+        let _ = q.hold(&a, "site", "ALICE", 1_000);
+        let _ = q.hold(&b, "site", "ALICE", 1_000);
+        assert_eq!(q.held().count(), 2, "distinct strings before the remap");
+
+        assert_eq!(q.remap(&reg), 1, "one collision");
+        assert_eq!(q.held().count(), 1, "one site, one held entry");
+    }
+
     /// The remap must be WIRED, not merely available.
     ///
     /// The two tests above pin `Pending::remap` itself, and both stay green if the
@@ -12399,6 +12532,23 @@ mod tests {
             "the queue must be remapped through the registry on load, or a queued \
              pre-fold locator is described a second time under a spelling that is \
              already indexed"
+        );
+        // The quarantine is the fourth structure that needed this, found only
+        // after the other three were fixed one at a time. `forget` removes by
+        // exact key, so a quarantine left on the old spelling survives being
+        // forgotten and comes back as a duplicate.
+        assert!(
+            body.contains("quarantine.remap(&registry)"),
+            "the quarantine must be remapped too, or `forget` cannot remove the \
+             entry the drain just indexed"
+        );
+        // `released` feeds the pending queue and `decided` feeds the seen file,
+        // so a spelling missed in either becomes a stale queue entry or a seen
+        // line that never matches what discovery emits.
+        assert!(
+            body.contains("canonical_for_run(&r.1, &registry)")
+                && body.contains("canonical_for_run(&d.0, &registry)"),
+            "the released and decided lists must be remapped as well"
         );
         let reg_at = body
             .find("let registry = AppRegistryView::load(cli)")
