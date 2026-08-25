@@ -12526,7 +12526,25 @@ mod tests {
             !production.contains("fn the_pending_remap_is_wired_into_the_run"),
             "the scan region must exclude the test module, or the pin matches itself"
         );
-        let body = strip_comments(production);
+        // Scoped to `run_once`'s own body, and COUNTED rather than searched.
+        // `let registry = AppRegistryView::load(cli)` appears TWICE in the
+        // production region (`run_once` and the recheck sweep), so a bare
+        // `find` took whichever came first in file order -- correct today only
+        // by accident, and silently comparing the wrong pair if the two
+        // functions were ever reordered. The file's own
+        // `the_source_pins_name_things_that_exist` states the rule this broke:
+        // COUNT, not `contains`.
+        let all = strip_comments(production);
+        let start = all.find("fn run_once(").expect("run_once must exist");
+        let body = &all[start..];
+        let body = &body[..body.find("\nfn ").unwrap_or(body.len())];
+        assert_eq!(
+            body.matches("let registry = AppRegistryView::load(cli)")
+                .count(),
+            1,
+            "run_once must read the registry exactly once, or this pin is \
+             ambiguous about which load it is talking about"
+        );
         assert!(
             body.contains("pending.remap(&registry)"),
             "the queue must be remapped through the registry on load, or a queued \
@@ -12550,17 +12568,106 @@ mod tests {
                 && body.contains("canonical_for_run(&d.0, &registry)"),
             "the released and decided lists must be remapped as well"
         );
-        let reg_at = body
-            .find("let registry = AppRegistryView::load(cli)")
-            .expect("the registry must be loaded in run_once");
-        let pending_at = body
-            .find("let mut pending = Pending::load(pending_path)")
-            .expect("the queue must be loaded in run_once");
+        // The remaps must come before the two things that CONSUME the queue:
+        // `requeue_released` inserts released locators verbatim, and the drain
+        // reads the queue. A remap that ran after either would leave exactly the
+        // unmapped spellings it exists to remove.
+        //
+        // NOT asserted: registry-before-`Pending::load`. An earlier version of
+        // this pin required that and justified it as "the remap would have
+        // nothing to map with", which is backwards -- moving the registry load
+        // below `remap` does not compile, so the borrow checker enforces that
+        // property reliably and this pin does not need to. Requiring the
+        // stronger ordering only made the pin red on a correct refactor.
+        let at = |needle: &str| {
+            body.find(needle)
+                .unwrap_or_else(|| panic!("run_once must contain {needle}"))
+        };
         assert!(
-            reg_at < pending_at,
-            "the registry has to be read BEFORE the queue, or the remap has \
-             nothing to map with"
+            at("pending.remap(&registry)") < at("requeue_released("),
+            "the queue must be remapped BEFORE released locators are requeued, \
+             or a released pre-fold locator enters the queue unmapped and is \
+             described a second time"
         );
+        assert!(
+            at("r.1 = canonical_for_run(&r.1, &registry)") < at("requeue_released("),
+            "and the released list itself must be remapped before it is consumed"
+        );
+    }
+
+    /// Remapping must carry retry state and rebuild the author counts.
+    ///
+    /// Both mutations below passed the whole suite before this test existed, and
+    /// both would be money bugs, because `remap` now runs on EVERY run:
+    ///
+    /// - Passing `0, None` to `insert_raw` instead of `e.attempts, e.thin` resets
+    ///   the retry count and the thin streak every run, so no locator ever
+    ///   reaches `MAX_ATTEMPTS`, nothing ever enters the quarantine, and a
+    ///   permanently-failing link is re-fetched and re-charged forever.
+    /// - Dropping `self.per_author.clear()` double-counts every author after the
+    ///   first remap, halving the per-author share in practice (captures silently
+    ///   refused) and skewing `evict_one`, which picks its victim by `max_by_key`
+    ///   on those counts.
+    ///
+    /// The earlier remap fixtures could not catch either, because every entry in
+    /// them had `attempts = 0`, no thin streak, and one author.
+    #[test]
+    fn remapping_preserves_retry_state_and_rebuilds_author_counts() {
+        let tmp = TmpFile::new("pending-remap-state");
+        let mut p = Pending::load(tmp.path());
+        let streak = ThinStreak {
+            print: ThinPrint::of("some thin page", 12),
+            runs: 2,
+        };
+        // Two authors, non-zero retry state, and a locator whose spelling the
+        // remap will actually change.
+        assert!(p.insert_raw(
+            format!("freenet:{DELTA}#DWn4bEFfoo"),
+            "site",
+            "ALICE".to_string(),
+            2,
+            Some(streak),
+        ));
+        assert!(p.insert_raw(
+            format!("freenet:{ID}/a"),
+            "site",
+            "BOB".to_string(),
+            1,
+            None,
+        ));
+
+        p.remap(&delta_registry());
+
+        let remapped = p
+            .entries
+            .iter()
+            .find(|(l, _)| l == "app:delta/DWn4bEFfoo")
+            .map(|(_, e)| e)
+            .expect("the Delta locator must have been remapped");
+        assert_eq!(
+            remapped.attempts, 2,
+            "the retry count must survive the remap"
+        );
+        assert_eq!(
+            remapped.thin.map(|t| t.runs),
+            Some(2),
+            "the thin streak must survive too, or a hopeless locator is never retired"
+        );
+        assert_eq!(remapped.author, "ALICE");
+
+        assert_eq!(
+            p.per_author.get("ALICE").copied(),
+            Some(1),
+            "author counts must be REBUILT, not accumulated: {:?}",
+            p.per_author
+        );
+        assert_eq!(p.per_author.get("BOB").copied(), Some(1));
+
+        // Idempotent: a second remap must not inflate the counts either.
+        p.remap(&delta_registry());
+        assert_eq!(p.per_author.get("ALICE").copied(), Some(1));
+        assert_eq!(p.per_author.get("BOB").copied(), Some(1));
+        assert_eq!(p.len(), 2);
     }
 
     /// Two spellings of one site already in the queue must MERGE, not both drain.
