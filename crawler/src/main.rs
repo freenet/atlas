@@ -2857,14 +2857,52 @@ fn requeue_released(
 }
 
 /// What discovery must NOT re-capture: everything already decided about, plus
-/// everything still cooling down in quarantine.
+/// everything still cooling down in quarantine, each under every spelling that
+/// canonicalisation can produce for it today.
 ///
 /// Without the quarantine half, discovery re-queues on the very next run exactly
 /// what phase 2 just gave up on, so the hold is a no-op and the locator burns
 /// budget every run. `seen` itself stays the record of what has been DECIDED,
 /// and is what phase 2 appends to.
-fn capture_filter(seen: &HashSet<String>, quarantine: &Quarantine) -> HashSet<String> {
-    seen.iter().cloned().chain(quarantine.held()).collect()
+///
+/// The registry half closes a gap `load_seen` cannot: `load_seen` re-canonicalises
+/// through `normalize_href` alone, because it runs before the app registry is
+/// available, whereas every capture path emits the MAPPED form
+/// (`normalize_mapped` = `normalize_href` + `map_or_collapse`). Those agreed until
+/// the bare-root fold made a fragment-only Delta locator map: an entry stored as
+/// `freenet:<container>#<handle>` is now rediscovered as `app:delta/<handle>`,
+/// which `load_seen` never produces. Such entries exist by construction, since
+/// that shape is exactly what the pre-fold code emitted for them. Left alone,
+/// each one that has no `app:` twin already in the file would be described,
+/// billed and added a second time — the duplicate this change exists to stop,
+/// reintroduced through a different door.
+///
+/// Suppressing BOTH spellings rather than replacing one with the other keeps this
+/// strictly more suppressive than before: a locator that stops mapping (an app
+/// de-registered, a registry that failed to load this run) still matches under
+/// the spelling it was written in.
+fn capture_filter(
+    seen: &HashSet<String>,
+    quarantine: &Quarantine,
+    registry: &AppRegistryView,
+) -> HashSet<String> {
+    seen.iter()
+        .cloned()
+        .chain(quarantine.held())
+        .flat_map(|loc| {
+            // The FULL discovery pipeline, not `map_or_collapse` alone: the
+            // bare-root fold lives in `normalize_href`, so mapping without it
+            // leaves a fragment-only Delta locator exactly as stored and the
+            // mapped spelling is never produced. `None` (a stored line that no
+            // longer validates at all) contributes nothing extra, which is
+            // right — the raw form below still suppresses it.
+            let canon = normalize_mapped(&loc, registry).map(|(l, _)| l);
+            // Collected into a set, so the common case where the two are equal
+            // costs one allocation and collapses back to a single entry.
+            [Some(loc), canon]
+        })
+        .flatten()
+        .collect()
 }
 
 fn run_once(
@@ -2988,10 +3026,12 @@ fn run_once(
     if held_back > 0 {
         eprintln!("warn: {held_back} released locator(s) did not fit the queue — kept quarantined");
     }
-    let suppressed = capture_filter(&seen, &quarantine);
     // Loaded once per run: which apps the curator has registered, so an app-hosted
-    // link can be recognised as a resource rather than as its container.
+    // link can be recognised as a resource rather than as its container. Loaded
+    // BEFORE the capture filter is built, because that filter needs it to
+    // suppress the mapped spelling of an already-decided locator.
     let registry = AppRegistryView::load(cli);
+    let suppressed = capture_filter(&seen, &quarantine, &registry);
     let mut trusted: HashSet<String> = HashSet::new();
     let mut captured = 0usize;
     for raw in sources.lines() {
@@ -6028,7 +6068,9 @@ fn map_or_collapse(loc: String, registry: &AppRegistryView) -> String {
 ///
 /// This comment used to say the fold stayed out until it was fixing something
 /// concrete rather than something merely inconsistent, on the grounds that no
-/// locator in the reported shape used the bare form. It stopped being merely
+/// locator in the reported shape used the bare form, and a test
+/// (`the_bare_root_alias_is_folded_at_normalize_href_not_at_map_or_collapse`,
+/// then named for the opposite assertion) pinned that. It stopped being merely
 /// inconsistent: six live sites — Freebird, GitForge, SableLinux, Freenet
 /// Survival, FreenetOnLine and the DPZS3n... board — were each listed twice,
 /// differing in nothing but that slash, and the duplicate listings were
@@ -6968,12 +7010,20 @@ fn add_entry(cli: &Cli, loc: &str, kind: &str, d: &Described) -> Result<()> {
 /// The file is append-only and never expires, so it holds locators canonicalised
 /// by every build that ever ran. When canonicalisation changes -- as it did when
 /// `canonical_contract_path` began folding the bare root onto `/` -- a site
-/// already decided about is rediscovered under its NEW canonical form, misses a
-/// set keyed on the old one, and is described and added a second time. That is
-/// the one-time re-description cost the fragment collapse paid and this
-/// deliberately does not: the whole point of the change is to stop minting
-/// duplicate entries, so paying for it with a fresh round of duplicates would
-/// be self-defeating.
+/// already decided about would be rediscovered under its NEW canonical form,
+/// miss a set keyed on the old one, and be described and added a second time.
+/// The whole point of that change is to stop minting duplicate entries, so
+/// paying for it with a fresh round of duplicates would be self-defeating.
+///
+/// Measured, not assumed: against the production seen file at the time of the
+/// change this saves NOTHING, because all eight bare-root lines in it already
+/// had their trailing-slash twin present -- which is exactly how the duplicate
+/// index entries arose in the first place. So this makes the property hold by
+/// CONSTRUCTION rather than by a lucky property of one file. What it actually
+/// protects is a locator seen only in the pre-canonicalisation form, which is
+/// unreachable for new captures (they are canonicalised on the way in) and so
+/// exists only among lines already on disk. Do not restate this as a saving it
+/// did not make.
 ///
 /// Both forms are inserted rather than only the re-canonicalised one, because a
 /// line that no longer validates at all (an off-Freenet `https://` locator from
@@ -7798,20 +7848,41 @@ mod tests {
         }
     }
 
-    /// Deliberately UNCHANGED: the bare `""` form and the `"/"` form are left as
-    /// two distinct locators, even though they resolve to the same page. Folding
-    /// them was tried and reverted (see the doc comment on
-    /// `collapse_unmapped_fragment`) because it would rediscover any ALREADY-
-    /// indexed bare-form site as a second, undeduped `/`-form listing. This test
-    /// exists so a future attempt at that fold trips over it rather than
-    /// reintroducing the regression silently.
+    /// WHICH LAYER folds the bare-root alias, pinned so the answer cannot drift.
+    ///
+    /// This test used to assert the OPPOSITE — that `map_or_collapse` leaves the
+    /// two forms distinct — as a deliberate tripwire against folding them at all,
+    /// on the reasoning that the fold would rediscover every already-indexed
+    /// bare-form site as a second listing. The fold has since been made, at
+    /// `normalize_href` (see `canonical_contract_path`), because six live sites
+    /// were being listed twice and a user reported it; `load_seen` is what
+    /// removes the cost the tripwire was protecting against.
+    ///
+    /// The tripwire is worth recording rather than just deleting, because it did
+    /// NOT fire: it exercised `map_or_collapse` directly, and the fold landed one
+    /// layer up, so a test written precisely to catch this change sat green
+    /// through it. A guard on one layer says nothing about the layer above it.
+    ///
+    /// So this now pins both halves of the real arrangement: end to end the two
+    /// spellings are ONE locator, and `map_or_collapse` is still not the place
+    /// that makes them one — it only ever sees an already-canonical path.
     #[test]
-    fn map_or_collapse_leaves_the_bare_root_alias_unfolded() {
+    fn the_bare_root_alias_is_folded_at_normalize_href_not_at_map_or_collapse() {
         const SITE: &str = "DPZS3nmaS8XRqLufy3cq4t2DWkfG8k22gi8jcbykRzAH";
         let reg = delta_registry();
+        assert_eq!(
+            normalize_mapped(&format!("freenet:{SITE}"), &reg),
+            normalize_mapped(&format!("freenet:{SITE}/"), &reg),
+            "end to end, one page must be one locator"
+        );
+        // `map_or_collapse` is downstream of the fold and does not perform it.
+        // If a future change moves the fold down here, this stops being true and
+        // the reader is told where to look.
         assert_ne!(
             map_or_collapse(format!("freenet:{SITE}"), &reg),
             map_or_collapse(format!("freenet:{SITE}/"), &reg),
+            "the fold lives in normalize_href; if that changed, update the docs \
+             on canonical_contract_path and collapse_unmapped_fragment too"
         );
     }
 
@@ -12154,6 +12225,46 @@ mod tests {
         );
     }
 
+    /// A seen entry stored in the PRE-FOLD Delta shape must suppress the
+    /// locator that shape now canonicalises to.
+    ///
+    /// `load_seen` re-canonicalises through `normalize_href` only — it runs
+    /// before the app registry is available — while every capture path emits the
+    /// MAPPED form. Those agreed until the bare-root fold made a fragment-only
+    /// Delta locator map, so an entry written `freenet:<container>#<handle>` is
+    /// now rediscovered as `app:delta/<handle>`, a spelling `load_seen` cannot
+    /// produce. Entries in that shape exist by construction: it is exactly what
+    /// the pre-fold code emitted for them. Without this, each one lacking an
+    /// `app:` twin already in the file is described, billed and added a second
+    /// time — the duplicate this whole change exists to stop, coming back
+    /// through a different door.
+    #[test]
+    fn capture_filter_suppresses_the_mapped_spelling_of_a_pre_fold_entry() {
+        let none: HashSet<String> = HashSet::new();
+        let (q, _, _) = Quarantine::load(TmpFile::new("capfilter-mapped").path(), 0, &none);
+        let reg = delta_registry();
+
+        // Written by a build that predates the fold: raw, fragment-only, unmapped.
+        let pre_fold = format!("freenet:{DELTA}#DWn4bEFfoo");
+        let seen: HashSet<String> = [pre_fold.clone()].into_iter().collect();
+        let f = capture_filter(&seen, &q, &reg);
+
+        // What discovery produces for that same site today.
+        let (rediscovered, _) = normalize_mapped(&format!("freenet:{DELTA}/#DWn4bEFfoo"), &reg)
+            .expect("a Delta link must still normalise");
+        assert_eq!(rediscovered, "app:delta/DWn4bEFfoo", "test premise");
+        assert!(
+            f.contains(&rediscovered),
+            "an already-decided site must not be re-captured under the spelling \
+             canonicalisation now produces for it: {f:?}"
+        );
+        assert!(
+            f.contains(&pre_fold),
+            "and the form it was written in must keep matching, so a locator that \
+             stops mapping is not un-suppressed"
+        );
+    }
+
     /// The hold is only meaningful if discovery is actually filtered by it.
     #[test]
     fn capture_filter_suppresses_held_but_not_unrelated_locators() {
@@ -12165,7 +12276,7 @@ mod tests {
         let _ = q.hold(&held, "site", "ALICE", 1_000);
         let seen: HashSet<String> = [indexed.clone()].into_iter().collect();
 
-        let f = capture_filter(&seen, &q);
+        let f = capture_filter(&seen, &q, &delta_registry());
         assert!(f.contains(&held), "a held locator must not be re-captured");
         assert!(f.contains(&indexed), "seen must still suppress capture");
         assert!(
@@ -13806,6 +13917,20 @@ mod tests {
             normalize_href(&canon).map(|(l, _)| l),
             Some(canon.clone()),
             "and it must still be a fixed point at exactly the cap"
+        );
+
+        // The GATEWAY branch emits its own locator and needs the same bound.
+        // Covering only the `freenet:` branch above left a mutation that drops
+        // the cap check from just this one alive.
+        let prefix = format!("/v1/contract/web/{ID}");
+        let filler = "a".repeat(MAX_LOCATOR_LEN - prefix.len() - 1);
+        let gw_at_cap = format!("{prefix}#{filler}");
+        assert_eq!(gw_at_cap.len(), MAX_LOCATOR_LEN, "test premise");
+        assert!(
+            normalize_href(&gw_at_cap)
+                .map(|(l, _)| l.len() <= MAX_LOCATOR_LEN)
+                .unwrap_or(true),
+            "the gateway branch must not emit an over-cap locator either"
         );
     }
 
