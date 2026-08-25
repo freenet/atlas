@@ -6048,6 +6048,44 @@ fn collapse_unmapped_fragment(loc: String, registry: &AppRegistryView) -> String
     format!("freenet:{id}{server_path}")
 }
 
+/// The canonical in-contract path for a `freenet:` locator, folding the empty
+/// root onto `/`.
+///
+/// `freenet:<id>` and `freenet:<id>/` are the SAME document: `contract_web_href`
+/// builds the identical `/v1/contract/web/<id>/` URL for both, because the
+/// sandbox shell requires that slash and an empty suffix would otherwise
+/// produce a link a click inside the iframe silently drops. They are
+/// nonetheless two different strings, and every dedup surface in this crawler
+/// is string equality on the locator -- the seen set, the pending queue's
+/// collision check, the index's own subject identity. So one site discovered
+/// once as a bare id and once with a trailing slash is described twice, billed
+/// twice, and listed twice.
+///
+/// Reported live as "Atlas is listing duplicates of some sites, Freebird for
+/// example": Freebird, GitForge, SableLinux, Freenet Survival, FreenetOnLine
+/// and the DPZS3n... board were each listed twice, differing in nothing but
+/// this slash.
+///
+/// `collapse_unmapped_fragment` deferred exactly this fold, on the stated
+/// grounds that no locator in the reported shape used the bare form. That is no
+/// longer true, so the deferral is spent. Folding it HERE rather than at the
+/// index is what makes it true for every discovery path at once -- curated
+/// sources, hub link mining and River-room scanning all funnel through
+/// `normalize_href` -- and it leaves the contract untouched, so it does not
+/// re-key the index.
+///
+/// The fold is toward `/`, not away from it: `contract_web_href` already treats
+/// `/` as the canonical form, most live entries carry it, and a fragment-only
+/// locator (`freenet:<id>#frag`) has to grow the slash anyway to render a
+/// clickable link.
+fn canonical_contract_path(path: &str) -> &str {
+    if path.is_empty() {
+        "/"
+    } else {
+        path
+    }
+}
+
 fn normalize_href(href: &str) -> Option<(String, &'static str)> {
     if href.len() > MAX_LOCATOR_LEN {
         return None;
@@ -6147,7 +6185,7 @@ fn normalize_href(href: &str) -> Option<(String, &'static str)> {
     if let Some(rest) = path_part.strip_prefix("freenet:") {
         let id_end = rest.find(|c: char| !is_b58(c)).unwrap_or(rest.len());
         if matches!(id_end, 43 | 44) {
-            let path = &rest[id_end..];
+            let path = canonical_contract_path(&rest[id_end..]);
             if is_asset_path(path) || is_absolute_contract_path(path) {
                 return None;
             }
@@ -6163,7 +6201,7 @@ fn normalize_href(href: &str) -> Option<(String, &'static str)> {
         let after = &path_part[pos + "/v1/contract/web/".len()..];
         let id_end = after.find(|c: char| !is_b58(c)).unwrap_or(after.len());
         if matches!(id_end, 43 | 44) {
-            let path = &after[id_end..];
+            let path = canonical_contract_path(&after[id_end..]);
             if is_asset_path(path) || is_absolute_contract_path(path) {
                 return None;
             }
@@ -6897,13 +6935,39 @@ fn add_entry(cli: &Cli, loc: &str, kind: &str, d: &Described) -> Result<()> {
     Ok(())
 }
 
+/// Load the seen set, carrying every line in under BOTH the form it was written
+/// in and the form `normalize_href` would produce for it today.
+///
+/// The file is append-only and never expires, so it holds locators canonicalised
+/// by every build that ever ran. When canonicalisation changes -- as it did when
+/// `canonical_contract_path` began folding the bare root onto `/` -- a site
+/// already decided about is rediscovered under its NEW canonical form, misses a
+/// set keyed on the old one, and is described and added a second time. That is
+/// the one-time re-description cost the fragment collapse paid and this
+/// deliberately does not: the whole point of the change is to stop minting
+/// duplicate entries, so paying for it with a fresh round of duplicates would
+/// be self-defeating.
+///
+/// Both forms are inserted rather than only the re-canonicalised one, because a
+/// line that no longer validates at all (an off-Freenet `https://` locator from
+/// before Atlas stopped indexing the web) returns `None` here and must still
+/// suppress rediscovery. Keeping the raw line means this can only ever match
+/// MORE than it did before, never less.
 fn load_seen(path: &Path) -> HashSet<String> {
     fs::read_to_string(path)
         .map(|s| {
-            s.lines()
-                .map(|l| l.trim().to_string())
-                .filter(|l| !l.is_empty())
-                .collect()
+            let mut out = HashSet::new();
+            for line in s.lines() {
+                let l = line.trim();
+                if l.is_empty() {
+                    continue;
+                }
+                if let Some((canon, _)) = normalize_href(l) {
+                    out.insert(canon);
+                }
+                out.insert(l.to_string());
+            }
+            out
         })
         .unwrap_or_default()
 }
@@ -7957,13 +8021,30 @@ mod tests {
 
     #[test]
     fn normalize_href_variants() {
+        // The bare id and the trailing-slash form are the SAME page -- both
+        // render `/v1/contract/web/<id>/` -- so they must normalise to one
+        // locator or the index lists the site twice.
         assert_eq!(
             normalize_href(&format!("freenet:{ID}")),
-            Some((format!("freenet:{ID}"), "site"))
+            Some((format!("freenet:{ID}/"), "site"))
+        );
+        assert_eq!(
+            normalize_href(&format!("/v1/contract/web/{ID}")),
+            Some((format!("freenet:{ID}/"), "site"))
         );
         assert_eq!(
             normalize_href(&format!("/v1/contract/web/{ID}/")),
             Some((format!("freenet:{ID}/"), "site"))
+        );
+        // A fragment-only locator grows the slash too, so it agrees with the
+        // form the same site is reached by elsewhere.
+        assert_eq!(
+            normalize_href(&format!("freenet:{ID}#frag")),
+            Some((format!("freenet:{ID}/#frag"), "site"))
+        );
+        assert_eq!(
+            normalize_href(&format!("freenet:{ID}/#frag")),
+            Some((format!("freenet:{ID}/#frag"), "site"))
         );
         // absolute gateway url, sandbox query dropped
         assert_eq!(
@@ -8003,7 +8084,7 @@ mod tests {
         );
         assert!(locs
             .iter()
-            .any(|(l, k)| l == &format!("freenet:{ID}") && *k == "site"));
+            .any(|(l, k)| l == &format!("freenet:{ID}/") && *k == "site"));
         assert!(
             !locs.iter().any(|(l, _)| l.starts_with("https://")),
             "an off-Freenet link must never reach the queue: {locs:?}"
@@ -8075,9 +8156,10 @@ mod tests {
             urls.contains(&(format!("freenet:{ID}/p"), "site")),
             "got {urls:?}"
         );
-        // Bare locator, and the duplicate of it collapsed.
+        // Bare locator, and the duplicate of it collapsed -- canonicalised to
+        // the trailing-slash form, which is the same page.
         assert!(
-            urls.contains(&(format!("freenet:{ID}"), "site")),
+            urls.contains(&(format!("freenet:{ID}/"), "site")),
             "got {urls:?}"
         );
         // The https link is NOT extracted: Atlas indexes Freenet, not the web.
@@ -13597,6 +13679,86 @@ mod tests {
              `freenet:` form, not discarded"
         );
         assert!(p.contains(&format!("freenet:{ID}/keep")));
+    }
+
+    /// The reported duplicate-listing bug, in the shape it was reported in.
+    ///
+    /// Freebird reached the crawler once as a bare `freenet:<id>` (a River-room
+    /// message) and once as `freenet:<id>/` (a hub link). Both name the one
+    /// page -- `contract_web_href` builds the identical URL for each -- but they
+    /// are different strings, so the seen set treated them as two sites and the
+    /// index ended up with two Freebird entries. Five more sites were listed
+    /// twice for the same reason.
+    ///
+    /// Asserting on the SET rather than on each form separately is deliberate:
+    /// the property that matters is that every spelling of the root collapses
+    /// onto ONE locator, not that it collapses onto any particular one.
+    #[test]
+    fn every_spelling_of_a_contract_root_is_one_locator() {
+        let spellings = [
+            format!("freenet:{ID}"),
+            format!("freenet:{ID}/"),
+            format!("/v1/contract/web/{ID}"),
+            format!("/v1/contract/web/{ID}/"),
+            format!("http://gw.example/v1/contract/web/{ID}/?__sandbox=1"),
+        ];
+        let canon: HashSet<String> = spellings
+            .iter()
+            .map(|h| {
+                normalize_href(h)
+                    .unwrap_or_else(|| panic!("{h} must normalise to a locator"))
+                    .0
+            })
+            .collect();
+        assert_eq!(
+            canon.len(),
+            1,
+            "one page must have one locator, or it is indexed once per spelling: {canon:?}"
+        );
+        // And the surviving form is the one that renders a working link.
+        let only = canon.iter().next().unwrap();
+        assert_eq!(only, &format!("freenet:{ID}/"));
+        assert_eq!(
+            atlas_common::contract_web_href(ID, ""),
+            atlas_common::contract_web_href(ID, "/"),
+            "the fold is only correct because the gateway serves both as one page"
+        );
+    }
+
+    /// A locator already decided about must not be re-described just because
+    /// canonicalisation changed underneath the seen file.
+    ///
+    /// The file is append-only and holds locators written by every build that
+    /// ever ran, so the bare-root form is in there for sites indexed months ago.
+    /// Without the re-canonicalisation on load, the fix above would rediscover
+    /// each of them under the new form, miss the set, and mint exactly the
+    /// duplicate entries it exists to prevent -- once, permanently, across the
+    /// whole index.
+    #[test]
+    fn the_seen_set_matches_locators_written_before_canonicalisation_changed() {
+        let tmp = TmpFile::new("seen-canon");
+        fs::write(
+            tmp.path(),
+            format!(
+                "freenet:{ID}\n\
+                 https://example.com/gone\n"
+            ),
+        )
+        .unwrap();
+        let seen = load_seen(tmp.path());
+        assert!(
+            seen.contains(&format!("freenet:{ID}/")),
+            "a pre-canonicalisation line must match today's canonical form: {seen:?}"
+        );
+        assert!(
+            seen.contains(&format!("freenet:{ID}")),
+            "and must keep matching the form it was written in"
+        );
+        assert!(
+            seen.contains("https://example.com/gone"),
+            "a line that no longer validates at all must still suppress \
+             rediscovery, or every retired external link comes back"
+        );
     }
 
     #[test]
