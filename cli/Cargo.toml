@@ -16,7 +16,7 @@ ciborium.workspace = true
 ed25519-dalek = { workspace = true, features = ["rand_core"] }
 freenet-stdlib = { workspace = true, features = ["net"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
-tokio-tungstenite = { version = "0.27", features = ["rustls-tls-webpki-roots"] }
+tokio-tungstenite = { version = "0.30", features = ["rustls-tls-webpki-roots"] }
 anyhow = "1"
 serde.workspace = true
 clap = { version = "4", features = ["derive"] }
