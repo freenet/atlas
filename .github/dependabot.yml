@@ -89,17 +89,7 @@ updates:
           - "minor"
           - "patch"
 
-# WARNING -- this workspace contains contract and/or delegate crates whose
-# COMPILED WASM IS THE CONTRACT ADDRESS. A cargo workspace shares one Cargo.lock,
-# so a grouped dependency bump merged here can silently re-key a deployed
-# contract and strand existing user data. ANY wasm change moves the address: a
-# direct bump, a transitive bump, or a rustc upgrade.
-#
-# This repo has NO migration or wasm-hash guard workflow, so nothing here will
-# turn red when that happens. Before merging a cargo PR, rebuild and compare the
-# contract key, and ship a migration if it moved. See the `freenet-app-migration`
-# skill and `.claude/rules/` in the freenet tree.
-#
-# Dependabot does not create this hazard -- a hand-run `cargo update` does the
-# same thing -- but it does deliver a steady stream of routine-LOOKING PRs, and
-# that is exactly the context in which a re-key gets merged unnoticed.
+# NOTE -- this workspace contains contract and/or delegate crates whose compiled
+# WASM IS THE CONTRACT ADDRESS, so a grouped dependency bump can re-key a
+# deployed contract. `ci.yml (pointer-freshness + contract-key jobs)` guards that here: do not merge a cargo
+# PR if that check is red or did not run. See the `freenet-app-migration` skill.
