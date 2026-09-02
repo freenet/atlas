@@ -2834,8 +2834,26 @@ fn main() -> Result<()> {
         // Loaded here rather than inside, so the repair is testable without a node
         // and so the one network dependency is visible at the call site.
         let registry = AppRegistryView::load(&cli);
+        // Best effort, and deliberately non-fatal: a repair must still work when
+        // the node is down. Without it, forgetting an already-published locator
+        // silently queues a re-describe that `atlasctl add` will refuse as a
+        // duplicate for as long as the retry budget lasts.
+        let published: HashSet<String> = match fetch_live_index(&cli) {
+            Ok(entries) => entries
+                .iter()
+                .filter_map(|e| normalize_mapped(&e.locator, &registry).map(|(c, _)| c))
+                .collect(),
+            Err(e) => {
+                eprintln!(
+                    "warn: could not read the live index ({e:#}), so an \
+                     already-published locator cannot be detected and refused"
+                );
+                HashSet::new()
+            }
+        };
         return forget_locators(
             &registry,
+            &published,
             &cli.forget,
             &ForgetPaths {
                 seen: &seen_path,
@@ -3673,6 +3691,14 @@ fn recheck_update(
             cmd.arg(format!("--landing={}", a.landing.flag()));
             cmd.arg(format!("--adult-sections={}", a.has_adult_sections));
             cmd.arg(format!("--volatility={}", a.volatility.flag()));
+            // The classifier id belongs with the answers it produced. Without it, a
+            // recheck-corrected entry carries a taxonomy-3 volatility answer
+            // stamped `classifier=2`, which defeats the reason the field exists: a
+            // curator selecting `classifier == 2` would re-run entries already
+            // re-judged under 3, and would trust `classifier == 2` entries whose
+            // volatility in fact came from the new prompt. Sent in THIS branch
+            // because this is where the classification was actually re-derived.
+            cmd.arg(format!("--classifier={CLASSIFIER_ID}"));
         }
     }
     let out = cmd.output().with_context(|| "running atlasctl update")?;
@@ -7116,7 +7142,12 @@ fn append_seen(path: &Path, url: &str) {
 /// A line with no tab at all (the pending file's `#cursor` header, or a corrupt
 /// line) yields itself, which then matches no target.
 fn stored_locator(line: &str) -> &str {
-    line.rsplit('\t').next().unwrap_or(line)
+    // `trim_end` first: `Quarantine::load` trims its locator field, so a line with
+    // a trailing tab still parses THERE. Without the trim, `rsplit` yields an empty
+    // string here, the line matches no target and survives the forget, re-arming
+    // the `Decided::Exhausted` re-blacklist this clearing exists to prevent — on
+    // exactly the hand-edited file an operator is most likely to have touched.
+    line.trim_end().rsplit('\t').next().unwrap_or(line)
 }
 
 /// Read a store, treating ONLY "does not exist" as empty.
@@ -7206,6 +7237,7 @@ struct ForgetPaths<'a> {
 
 fn forget_locators(
     registry: &AppRegistryView,
+    published: &HashSet<String>,
     targets: &[String],
     paths: &ForgetPaths<'_>,
 ) -> Result<()> {
@@ -7307,6 +7339,27 @@ fn forget_locators(
             eprintln!("  {canon} is not on record as decided — not queued");
             continue;
         }
+        // An INDEXED locator sits in the seen file like any other decision, so it
+        // matches — but forgetting it is a money sink with a guaranteed-zero
+        // return. The re-describe is billed, then `add_entry` runs `atlasctl add`
+        // without `--allow-duplicate`, which refuses it as already listed; that
+        // error is not `is_gone_for_good`, so it lands in the transient arm and
+        // burns MAX_ATTEMPTS across MAX_QUARANTINE_CYCLES, roughly 39 billed
+        // describes over months, and can never succeed.
+        //
+        // "This entry's description is wrong, re-do it" is the most natural reach
+        // for this flag and is exactly this case, so refuse it by name rather than
+        // let it drain the budget quietly.
+        if published.contains(&canon) {
+            eprintln!(
+                "  refusing {canon}: it is already PUBLISHED in the index, and \
+                 requeueing it would burn billed attempts on a duplicate \
+                 `atlasctl add` that can never succeed. Use `atlasctl update` to \
+                 re-describe it, or `atlasctl remove` it first to have it judged \
+                 from scratch."
+            );
+            continue;
+        }
         // Drop every existing spelling first, so the locator restarts CLEAN.
         //
         // Two reasons, and the second is easy to miss. A stale entry carries its
@@ -7336,7 +7389,9 @@ fn forget_locators(
             eprintln!(
                 "warn: could not queue {canon} — the pending queue is at its global \
                  limit, or @curated is at its own. Its stored decision has been LEFT \
-                 in place rather than removed, so nothing is lost."
+                 in place, so it stays suppressed rather than becoming unfindable. NOTE: if \
+                 it already had a queue entry, that entry was dropped; rerun once \
+                 there is room."
             );
         }
     }
@@ -7416,7 +7471,18 @@ fn forget_locators(
         if !clear(i, &ts) {
             continue;
         }
-        let name = t.canon.as_ref().map_or(t.raw.as_str(), |(c, _)| c.as_str());
+        // `DecisionLog::record` strips control characters from `reason` but not
+        // from `loc`, because every other caller passes an already-normalised
+        // locator. This is the one call site where `loc` can be raw argv, and a tab
+        // there would shift every column of the audit file.
+        let sanitized;
+        let name = match t.canon.as_ref() {
+            Some((c, _)) => c.as_str(),
+            None => {
+                sanitized = t.raw.replace(['\t', '\n', '\r'], " ");
+                sanitized.as_str()
+            }
+        };
         let why = if t.queued {
             "operator --forget: prior decision discarded, requeued for re-judgement"
         } else {
@@ -7675,6 +7741,7 @@ mod tests {
 
         forget_locators(
             &reg,
+            &HashSet::new(),
             &[format!(
                 "http://127.0.0.1:7509/v1/contract/web/{DELTA}/#DWn4bEFfoo/"
             )],
@@ -7722,6 +7789,7 @@ mod tests {
 
         forget_locators(
             &AppRegistryView::default(),
+            &HashSet::new(),
             &[ferrybot.to_string()],
             &ForgetPaths {
                 seen: seen.path(),
@@ -7774,6 +7842,7 @@ mod tests {
 
         forget_locators(
             &AppRegistryView::default(),
+            &HashSet::new(),
             &[canonical.to_string()],
             &ForgetPaths {
                 seen: seen.path(),
@@ -7807,6 +7876,7 @@ mod tests {
 
         forget_locators(
             &AppRegistryView::default(),
+            &HashSet::new(),
             &[root.to_string()],
             &ForgetPaths {
                 seen: seen.path(),
@@ -7841,6 +7911,7 @@ mod tests {
 
         forget_locators(
             &AppRegistryView::default(),
+            &HashSet::new(),
             &[typo.to_string()],
             &ForgetPaths {
                 seen: seen.path(),
@@ -7883,6 +7954,7 @@ mod tests {
 
         forget_locators(
             &AppRegistryView::default(),
+            &HashSet::new(),
             &[miss.to_string(), hit.to_string()],
             &ForgetPaths {
                 seen: seen.path(),
@@ -7926,6 +7998,7 @@ mod tests {
 
         forget_locators(
             &AppRegistryView::default(),
+            &HashSet::new(),
             &[loc.to_string()],
             &ForgetPaths {
                 seen: seen.path(),
@@ -7970,6 +8043,7 @@ mod tests {
 
         forget_locators(
             &AppRegistryView::default(),
+            &HashSet::new(),
             &[loc.to_string()],
             &ForgetPaths {
                 seen: seen.path(),
@@ -8050,6 +8124,7 @@ mod tests {
 
         forget_locators(
             &reg,
+            &HashSet::new(),
             &["app:delta/DWn4bEFfoo".to_string()],
             &ForgetPaths {
                 seen: seen.path(),
@@ -8090,6 +8165,7 @@ mod tests {
 
         let err = forget_locators(
             &AppRegistryView::default(),
+            &HashSet::new(),
             &["freenet:F86dYD2hJ8DLiiEDbuvPFGFBiE1JDevTZ8r3SnbCEg69/".to_string()],
             &ForgetPaths {
                 seen: seen.path(),
@@ -8127,6 +8203,7 @@ mod tests {
 
         forget_locators(
             &AppRegistryView::default(),
+            &HashSet::new(),
             &[gone.to_string()],
             &ForgetPaths {
                 seen: seen.path(),
@@ -8154,6 +8231,81 @@ mod tests {
                 .unwrap_or_default()
                 .contains("does not parse"),
             "the audit line must say it was removed WITHOUT being requeued"
+        );
+    }
+
+    /// Forgetting an already-PUBLISHED locator is a money sink with a
+    /// guaranteed-zero return, and it is the most natural misuse of the flag
+    /// ("this entry's description is wrong, re-do it").
+    ///
+    /// The re-describe is billed, then `atlasctl add` refuses it as already
+    /// listed, and that refusal is not `is_gone_for_good`, so it burns
+    /// MAX_ATTEMPTS across MAX_QUARANTINE_CYCLES — roughly 39 billed describes
+    /// over months — and can never succeed.
+    #[test]
+    fn forget_refuses_a_locator_that_is_already_published() {
+        let seen = TmpFile::new("forget-pub-seen");
+        let pending = TmpFile::new("forget-pub-pending");
+        let quarantine = TmpFile::new("forget-pub-quarantine");
+        let decisions = TmpFile::new("forget-pub-decisions");
+        let loc = "freenet:F86dYD2hJ8DLiiEDbuvPFGFBiE1JDevTZ8r3SnbCEg69/";
+        fs::write(seen.path(), format!("{loc}\n")).unwrap();
+        let published: HashSet<String> = [loc.to_string()].into_iter().collect();
+
+        forget_locators(
+            &AppRegistryView::default(),
+            &published,
+            &[loc.to_string()],
+            &ForgetPaths {
+                seen: seen.path(),
+                pending: pending.path(),
+                quarantine: quarantine.path(),
+                decisions: decisions.path(),
+            },
+        )
+        .expect("refusing one target is not a hard error");
+
+        assert!(
+            load_seen(seen.path()).contains(loc),
+            "a refused target must keep its stored decision, or it is left neither \
+             published-and-findable nor queued"
+        );
+        assert!(
+            !fs::read_to_string(pending.path())
+                .unwrap_or_default()
+                .contains(loc),
+            "queueing this is the whole defect: every attempt is billed and every \
+             attempt is refused by atlasctl as a duplicate"
+        );
+    }
+
+    /// The classifier id must travel with the answers it produced.
+    ///
+    /// `add_entry` stamps `--classifier`, but `recheck_update` re-derives the
+    /// classification and publishes `--volatility` from it. If it does not also
+    /// stamp the id, a recheck-corrected entry carries a taxonomy-3 answer labelled
+    /// classifier 2, which destroys the only thing the field is for: selecting the
+    /// entries judged under a superseded taxonomy.
+    ///
+    /// A source scrape because reaching `recheck_update` needs a live node and a
+    /// live index. It anchors on the argument, not on a variable name.
+    #[test]
+    fn the_recheck_path_stamps_the_classifier_it_used() {
+        let src = strip_comments(include_str!("main.rs"));
+        let body = &src[src
+            .find("fn recheck_update(")
+            .expect("recheck_update must exist")..];
+        let end = body.find("\nfn ").unwrap_or(body.len());
+        let body = &body[..end];
+        assert!(
+            body.contains("--volatility="),
+            "guard for this test: recheck_update is expected to publish volatility"
+        );
+        assert!(
+            body.contains("--classifier={CLASSIFIER_ID}"),
+            "recheck_update publishes a re-derived volatility, so it must stamp the \
+             classifier that produced it — otherwise the id says 2 while the answer \
+             came from prompt 3"
         );
     }
 
