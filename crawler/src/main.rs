@@ -416,6 +416,30 @@ struct Cli {
     /// `run_recheck_pass`.
     #[arg(long)]
     recheck: bool,
+    /// Drop a locator from the seen set, the quarantine and the pending queue, so
+    /// the next run rediscovers and re-judges it from scratch. Repeatable. Exits
+    /// without crawling.
+    ///
+    /// The recovery path for a decision that was WRONG. Every verdict except a
+    /// transient failure is terminal: it lands in `crawler-seen.txt`, the capture
+    /// filter drops the locator before any re-crawl, and `run_recheck_pass` only
+    /// ever looks at subjects that made it into the live index, so a locator
+    /// refused before it became a subject is outside re-adjudication for good.
+    /// Until this flag existed the only remedy was hand-editing the seen file,
+    /// which is what was done for `Pyvdo1wU…` and for Freebird (issues #19, #43),
+    /// and it is documented nowhere.
+    ///
+    /// Re-adding the locator to `--sources` does NOT work and never did: the
+    /// curated branch is filtered by `capture_filter`, which is seen ∪ quarantine,
+    /// so an operator's explicit request is silently outranked by a stale
+    /// automatic decision.
+    ///
+    /// Accepts whatever spelling is to hand: a canonical locator, a line copied
+    /// out of `crawler-seen.txt`, or the gateway URL the link was posted as. Each
+    /// is matched both literally and through `normalize_href`, because the seen
+    /// file holds lines written by several code paths across several releases.
+    #[arg(long = "forget", value_name = "LOCATOR")]
+    forget: Vec<String>,
     /// File tracking the re-verification sweep's per-subject backoff schedule
     /// (default: <key_dir>/crawler-recheck.txt).
     ///
@@ -683,15 +707,32 @@ impl Assessment {
             }
             Redistribution::None => {}
         }
-        // A feed's description is a snapshot of whoever posted last, not a
-        // description of the resource. Minting an entry from it publishes
-        // "BaroShare is Kanye West Graduation Album FLAC Files" — which is how the
-        // wrong description got in even before the redistribution question. The
-        // resource may well deserve an entry; it needs one written about what it
-        // IS, which a page of its current contents cannot supply.
-        if self.volatility == Volatility::Feed {
-            return Admission::Refuse(Outcome::RefusedFeedSnapshot);
-        }
+        // Volatility does NOT refuse, deliberately. It used to, and it was wrong
+        // every single time: all 9 locators it ever refused were applications and
+        // directories, not feeds (issue #63, audited 2026-09-01). FerryBot and
+        // Freenet Directory are directories; FreePlace, FreeChess and Kairos are
+        // apps; freepic is one static image.
+        //
+        // Two separate causes produced those verdicts, and neither is the model
+        // being unreasonable. `text_for_classification` prepends the head signals
+        // but the result is truncated head-first to LLM_TEXT_CHARS, so for an app
+        // whose chrome carries no visible text (a canvas, a chat sidebar) the
+        // identity is a few characters against thousands of chat lines. And the
+        // prompt's "live feed of user-submitted content" reads as true of any
+        // directory that lists user-created things.
+        //
+        // The trade is wrong in principle too, even where the verdict is right. A
+        // description that goes stale is repairable: `run_recheck_pass`
+        // re-describes published entries on a cadence. A refusal is not
+        // repairable, because it lands in `crawler-seen.txt` and the re-check
+        // pass scopes to already-published subjects, so a locator refused before
+        // it became a subject is outside re-adjudication for good. That is the
+        // same argument the adult-landing decision below already makes; it
+        // applies here and more strongly, because the harm prevented is smaller.
+        //
+        // `volatility` stays PUBLISHED, so the UI can show it and recheck tiering
+        // can revisit feeds more often. Do not re-add a refusal here without
+        // evidence that the gate is right more often than it is wrong.
         // Adult LANDING pages are ADMITTED, deliberately, where they used to be
         // dropped. Involuntary exposure is prevented at presentation: the UI holds
         // them behind a safe-search toggle that is on by default, and a gated site
@@ -732,9 +773,6 @@ impl Outcome {
             }
             Self::SuspectedRedistribution => {
                 "NEEDS CURATOR REVIEW (possible redistribution, not indexed)"
-            }
-            Self::RefusedFeedSnapshot => {
-                "not indexed (live feed — a description of it would be a snapshot)"
             }
             Self::FlaggedOnRecheck => {
                 "NEEDS CURATOR REVIEW (recheck: would now be refused, left published)"
@@ -2507,7 +2545,9 @@ enum Outcome {
     /// Short of a refusal we would assert, and the one an operator most wants to
     /// find again: it is the queue of things a human should look at.
     SuspectedRedistribution,
-    RefusedFeedSnapshot,
+    /// An operator discarded a previous decision with `--forget`. Recorded so the
+    /// log explains why a locator that was refused shows up indexed later.
+    Forgotten,
     Gone,
     RetiredThin,
     RetiredExhausted,
@@ -2528,7 +2568,7 @@ impl Outcome {
             Self::RefusedIllegal => "refused-illegal",
             Self::RefusedRedistribution => "refused-redistribution",
             Self::SuspectedRedistribution => "suspected-redistribution",
-            Self::RefusedFeedSnapshot => "refused-feed-snapshot",
+            Self::Forgotten => "forgotten",
             Self::Gone => "gone",
             Self::RetiredThin => "retired-thin",
             Self::RetiredExhausted => "retired-exhausted",
@@ -2754,6 +2794,13 @@ fn main() -> Result<()> {
     // stood between that and the API. `--monthly-max` is supposed to be the
     // hard money ceiling; a path that ignores it is not a detail, it is the
     // one invariant this whole re-key exists to protect.
+    // Before anything else, and before any budget is touched: this is a repair,
+    // and it must work on an installation whose crawl is misconfigured or whose
+    // spend ledger is exhausted.
+    if !cli.forget.is_empty() {
+        return forget_locators(&cli.forget, &seen_path, &pending_path, &decisions_path);
+    }
+
     if cli.recheck {
         let prices = Prices::from_cli(cli.input_price, cli.output_price)?;
         let monthly_max = usd_to_micros(cli.monthly_max, "--monthly-max")?;
@@ -6601,9 +6648,12 @@ const DESCRIBE_SYSTEM_PROMPT: &str =
         explicit or pornographic material, otherwise \"general\". \
         has_adult_sections: true if adult material exists deeper in, behind navigation or an \
         age gate, whatever the landing page shows. \
-        volatility: \"feed\" if the page is a live feed of user-submitted content, so a \
-        description written today describes something else within hours; \"static\" if the \
-        description would keep describing this resource. \
+        volatility: would a description of the RESOURCE still be accurate after its \
+        contents change? Answer \"static\" unless the page is nothing but a stream of \
+        posts, where the current posts are the only describable thing about it. A \
+        directory, index, gallery, message board or application is \"static\" even when \
+        the items it lists change constantly, because what the resource IS does not \
+        change. Judge the resource, not the freshness of what it happens to show today. \
         illegal: true only for content illegal to host or distribute, such as child sexual \
         abuse material or content facilitating serious crimes. \
         distributes_complete_works: true if the page offers COMPLETE commercial albums, films, \
@@ -6980,6 +7030,140 @@ fn add_entry(cli: &Cli, loc: &str, kind: &str, d: &Described) -> Result<()> {
 /// before Atlas stopped indexing the web) returns `None` here and must still
 /// suppress rediscovery. Keeping the raw line means this can only ever match
 /// MORE than it did before, never less.
+/// Drop `targets` from the seen set and queue them for a fresh judgement.
+///
+/// The recovery path for a decision that was wrong. `crawler-seen.txt` is the one
+/// TERMINAL store: the capture filter consults it before any re-crawl, and
+/// `run_recheck_pass` only ever walks subjects that reached the live index, so a
+/// locator refused before it became a subject is never looked at again by
+/// anything. Removing its line is the whole recovery, and until this existed the
+/// only way to do it was to edit the file by hand.
+///
+/// Removal alone is not enough to get the locator re-judged, though, and that is
+/// the part an operator gets wrong. The link is usually rediscovered from a room
+/// message the mirror cursor has long since passed, so nothing would put it back
+/// in the queue. Each target is therefore also enqueued under `CURATED_AUTHOR`,
+/// which is what "the operator asked for this by name" means everywhere else in
+/// this file and is exempt from the per-author cap.
+///
+/// The quarantine is deliberately NOT touched. It is self-releasing, so a held
+/// locator is already going to be retried, and reaching it means calling
+/// `Quarantine::load`, which returns the entries it released on the way in. This
+/// function would have to requeue those to avoid dropping them, which is
+/// `run_once`'s job and not something a recovery flag should be duplicating.
+///
+/// Matching is exact against either spelling of a line, literal or normalized,
+/// because the seen file holds lines written by several code paths across several
+/// releases and `load_seen` reads it the same forgiving way. Nothing here matches
+/// on a prefix or a substring: the caller is naming one locator, and a loose
+/// match would silently forget its neighbours.
+fn forget_locators(
+    targets: &[String],
+    seen_path: &Path,
+    pending_path: &Path,
+    decisions_path: &Path,
+) -> Result<()> {
+    let mut wanted: HashSet<String> = HashSet::new();
+    // Kept alongside `wanted` so a target that normalizes can be enqueued in the
+    // spelling every other store uses, while still MATCHING the raw line an older
+    // release may have written.
+    let mut enqueue: Vec<(String, &'static str)> = Vec::new();
+    for t in targets {
+        let t = t.trim();
+        if t.is_empty() {
+            continue;
+        }
+        wanted.insert(t.to_string());
+        match normalize_href(t) {
+            Some((canon, kind)) => {
+                wanted.insert(canon.clone());
+                enqueue.push((canon, kind));
+            }
+            None => eprintln!(
+                "warn: {t} is not a locator this crawler can fetch, so it will be \
+                 removed from the seen set but not queued"
+            ),
+        }
+    }
+    if wanted.is_empty() {
+        bail!("--forget needs at least one locator");
+    }
+
+    let matches = |line: &str| -> bool {
+        let l = line.trim();
+        !l.is_empty()
+            && (wanted.contains(l) || normalize_href(l).is_some_and(|(c, _)| wanted.contains(&c)))
+    };
+
+    let before = fs::read_to_string(seen_path).unwrap_or_default();
+    let mut removed = 0usize;
+    let kept: Vec<&str> = before
+        .lines()
+        .filter(|l| {
+            let hit = matches(l);
+            if hit {
+                removed += 1;
+                eprintln!("  forgetting seen entry: {}", l.trim());
+            }
+            !hit
+        })
+        .collect();
+
+    // Full rewrite through the same tmp+rename every other store here uses. A
+    // partial write to this file does not lose one locator, it resurrects the
+    // whole backlog and re-bills every entry in it.
+    if removed > 0 {
+        let tmp = sibling_tmp(seen_path);
+        let mut body = kept.join("\n");
+        if !body.is_empty() {
+            body.push('\n');
+        }
+        fs::write(&tmp, body).with_context(|| format!("writing {}", tmp.display()))?;
+        fs::rename(&tmp, seen_path)
+            .with_context(|| format!("replacing {}", seen_path.display()))?;
+    }
+
+    let mut pending = Pending::load(pending_path);
+    let mut queued = 0usize;
+    for (loc, kind) in &enqueue {
+        if pending.contains(loc) {
+            eprintln!("  {loc} is already queued");
+        } else if pending.add(loc, kind, CURATED_AUTHOR) {
+            queued += 1;
+        } else {
+            eprintln!("warn: could not queue {loc} — the pending queue is full");
+        }
+    }
+    if !pending.save() {
+        bail!("could not write the pending queue; nothing was queued for re-judgement");
+    }
+
+    // An operator overriding an automatic decision is exactly the kind of event
+    // the decision log exists to preserve, and without it the record would show a
+    // refusal followed some days later by an unexplained index entry.
+    let mut decisions = DecisionLog::open(decisions_path);
+    for (loc, _) in &enqueue {
+        let _ = decisions.record(
+            loc,
+            Outcome::Forgotten,
+            "operator --forget: prior decision discarded, requeued for re-judgement",
+            now_secs(),
+        );
+    }
+
+    eprintln!(
+        "forgot {removed} seen entry/entries and queued {queued} locator(s) for \
+         re-judgement on the next run"
+    );
+    if removed == 0 {
+        eprintln!(
+            "note: nothing matched in {} — check the spelling against that file",
+            seen_path.display()
+        );
+    }
+    Ok(())
+}
+
 fn load_seen(path: &Path) -> HashSet<String> {
     fs::read_to_string(path)
         .map(|s| {
@@ -7218,6 +7402,130 @@ mod tests {
             }],
             all_named_containers: [DELTA.to_string()].into_iter().collect(),
         }
+    }
+
+    /// `--forget` is the only recovery from a terminal decision, so the thing it
+    /// must do is REMOVE the seen line and REQUEUE the locator. Removing without
+    /// requeueing looks like it worked and does nothing: the link was discovered
+    /// from a room message the mirror cursor has already passed, so no later run
+    /// would rediscover it.
+    #[test]
+    fn forget_clears_the_seen_line_and_queues_the_locator_again() {
+        let seen = TmpFile::new("forget-seen");
+        let pending = TmpFile::new("forget-pending");
+        let decisions = TmpFile::new("forget-decisions");
+        let ferrybot = "freenet:F86dYD2hJ8DLiiEDbuvPFGFBiE1JDevTZ8r3SnbCEg69/";
+        let neighbour = "freenet:8nXH9SDHE28yPVbudRJDnf3mJi1AFZeV9EYGsqeya1Nv/";
+        fs::write(seen.path(), format!("{neighbour}\n{ferrybot}\n")).unwrap();
+
+        forget_locators(
+            &[ferrybot.to_string()],
+            seen.path(),
+            pending.path(),
+            decisions.path(),
+        )
+        .expect("forget must succeed");
+
+        let after = load_seen(seen.path());
+        assert!(
+            !after.contains(ferrybot),
+            "the forgotten locator must be gone from the seen set, or the capture \
+             filter still suppresses it and nothing changed"
+        );
+        assert!(
+            after.contains(neighbour),
+            "forgetting one locator must not disturb any other line in the file"
+        );
+        assert!(
+            Pending::load(pending.path()).contains(ferrybot),
+            "removing the seen line alone never gets the locator re-judged"
+        );
+    }
+
+    /// The seen file holds lines written by several code paths across several
+    /// releases, and an operator recovering a link has whatever spelling was in
+    /// front of them, usually the gateway URL it was posted as in the room. If
+    /// only the canonical spelling matched, the flag would silently do nothing in
+    /// exactly the situation it exists for.
+    #[test]
+    fn forget_matches_the_stored_line_through_either_spelling() {
+        let seen = TmpFile::new("forget-spelling-seen");
+        let pending = TmpFile::new("forget-spelling-pending");
+        let decisions = TmpFile::new("forget-spelling-decisions");
+        let canonical = "freenet:F86dYD2hJ8DLiiEDbuvPFGFBiE1JDevTZ8r3SnbCEg69/";
+        fs::write(seen.path(), format!("{canonical}\n")).unwrap();
+
+        // What the link actually looked like in the River room.
+        let as_posted =
+            "http://127.0.0.1:7509/v1/contract/web/F86dYD2hJ8DLiiEDbuvPFGFBiE1JDevTZ8r3SnbCEg69/";
+        forget_locators(
+            &[as_posted.to_string()],
+            seen.path(),
+            pending.path(),
+            decisions.path(),
+        )
+        .expect("forget must succeed");
+
+        assert!(
+            !load_seen(seen.path()).contains(canonical),
+            "a gateway URL and its canonical locator name the same resource, so \
+             forgetting one must forget the other"
+        );
+    }
+
+    /// Matching is exact on either spelling, never a prefix or a substring. A
+    /// contract id is a prefix of every path under it, so a loose match would
+    /// forget a whole site when asked to forget one page of it, and the operator
+    /// would not find out until the re-crawl bill arrived.
+    #[test]
+    fn forget_never_matches_a_locator_by_prefix() {
+        let seen = TmpFile::new("forget-prefix-seen");
+        let pending = TmpFile::new("forget-prefix-pending");
+        let decisions = TmpFile::new("forget-prefix-decisions");
+        let root = "freenet:F86dYD2hJ8DLiiEDbuvPFGFBiE1JDevTZ8r3SnbCEg69/";
+        let deeper = "freenet:F86dYD2hJ8DLiiEDbuvPFGFBiE1JDevTZ8r3SnbCEg69/about";
+        fs::write(seen.path(), format!("{root}\n{deeper}\n")).unwrap();
+
+        forget_locators(
+            &[root.to_string()],
+            seen.path(),
+            pending.path(),
+            decisions.path(),
+        )
+        .expect("forget must succeed");
+
+        let after = load_seen(seen.path());
+        assert!(!after.contains(root));
+        assert!(
+            after.contains(deeper),
+            "a deeper path under the same contract is a DIFFERENT locator and must \
+             survive being asked to forget the root"
+        );
+    }
+
+    /// A typo must not read as success. The flag reports zero removals and leaves
+    /// every file alone rather than erroring, so an operator forgetting two
+    /// locators at once still gets the one that matched.
+    #[test]
+    fn forget_leaves_the_seen_file_intact_when_nothing_matches() {
+        let seen = TmpFile::new("forget-miss-seen");
+        let pending = TmpFile::new("forget-miss-pending");
+        let decisions = TmpFile::new("forget-miss-decisions");
+        let kept = "freenet:8nXH9SDHE28yPVbudRJDnf3mJi1AFZeV9EYGsqeya1Nv/";
+        fs::write(seen.path(), format!("{kept}\n")).unwrap();
+
+        forget_locators(
+            &["freenet:F86dYD2hJ8DLiiEDbuvPFGFBiE1JDevTZ8r3SnbCEg69/".to_string()],
+            seen.path(),
+            pending.path(),
+            decisions.path(),
+        )
+        .expect("a locator that is not present is not an error");
+
+        assert!(
+            load_seen(seen.path()).contains(kept),
+            "an unmatched target must not rewrite the file into something shorter"
+        );
     }
 
     /// The hub arrives UNMAPPED (a specific page of a specific site), so its subject
@@ -8590,14 +8898,19 @@ mod tests {
             "a suspicion must be recorded under its OWN outcome, or the curator's \
              review pile is indistinguishable from the confident refusals"
         );
+        // Volatility is classified and PUBLISHED, never refused. The gate refused
+        // on it until issue #63, where all 9 locators it had ever refused turned
+        // out to be apps and directories. A stale description is repairable by
+        // the recheck pass; an exclusion recorded in `crawler-seen.txt` is not.
         assert_eq!(
             Assessment {
                 volatility: Volatility::Feed,
                 ..clean_assessment()
             }
             .admit(),
-            Admission::Refuse(Outcome::RefusedFeedSnapshot),
-            "a live feed's description is a snapshot of whoever posted last"
+            Admission::Admit,
+            "a feed verdict must not refuse: it was wrong 9 times out of 9, and a \
+             refusal is permanent while a stale description is not"
         );
     }
 
@@ -8669,6 +8982,9 @@ mod tests {
             .admit(),
             Admission::Refuse(Outcome::RefusedRedistribution)
         );
+        // Nothing serious left. Adult landing and a feed verdict are both
+        // classified-and-published rather than refused, so the page is ADMITTED
+        // even though two of its five fields are the "worst" values they can take.
         assert_eq!(
             Assessment {
                 illegal: false,
@@ -8676,7 +8992,7 @@ mod tests {
                 ..everything
             }
             .admit(),
-            Admission::Refuse(Outcome::RefusedFeedSnapshot)
+            Admission::Admit
         );
     }
 
