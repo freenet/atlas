@@ -753,7 +753,8 @@ impl Assessment {
         // tiering cannot see it at all, because `RecheckTier::of` takes only the
         // locator and the two adult flags and `LiveEntry` carries no volatility
         // field. Revisiting feeds more often is a REASONABLE thing to build on
-        // this signal and is not built; see the follow-up issue.
+        // this signal and is not built; see #66. The classifier's own accuracy on
+        // this field is #65 (identity diluted by a volatile body).
         //
         // Do not re-add a refusal here without evidence that the gate is right
         // more often than it is wrong.
