@@ -319,8 +319,12 @@ struct Cli {
     #[arg(long)]
     renderer: Option<PathBuf>,
     /// File of candidate https URLs, one per line (# comments).
-    #[arg(long)]
-    sources: PathBuf,
+    ///
+    /// Not required by `--forget`, which is a repair and has to work on an
+    /// installation whose crawl configuration is broken or absent. Every other
+    /// mode needs it.
+    #[arg(long, required_unless_present = "forget")]
+    sources: Option<PathBuf>,
     /// File tracking already-added locators (default: <key_dir>/crawler-seen.txt).
     #[arg(long)]
     seen: Option<PathBuf>,
@@ -416,9 +420,15 @@ struct Cli {
     /// `run_recheck_pass`.
     #[arg(long)]
     recheck: bool,
-    /// Drop a locator from the seen set, the quarantine and the pending queue, so
-    /// the next run rediscovers and re-judges it from scratch. Repeatable. Exits
-    /// without crawling.
+    /// Discard the stored decision about a locator and queue it for a fresh
+    /// judgement on the next run. Repeatable. Exits without crawling.
+    ///
+    /// Clears the locator from the seen set and from the quarantine, then adds it
+    /// to the pending queue as a curated entry. A target that matches nothing is
+    /// reported and NOT queued, so a typo cannot spend a paid attempt.
+    ///
+    /// Stop `atlas-crawler.service` before using this: it rewrites files the
+    /// running daemon appends to, and there is no locking.
     ///
     /// The recovery path for a decision that was WRONG. Every verdict except a
     /// transient failure is terminal: it lands in `crawler-seen.txt`, the capture
@@ -438,7 +448,7 @@ struct Cli {
     /// out of `crawler-seen.txt`, or the gateway URL the link was posted as. Each
     /// is matched both literally and through `normalize_href`, because the seen
     /// file holds lines written by several code paths across several releases.
-    #[arg(long = "forget", value_name = "LOCATOR")]
+    #[arg(long = "forget", value_name = "LOCATOR", conflicts_with = "recheck")]
     forget: Vec<String>,
     /// File tracking the re-verification sweep's per-subject backoff schedule
     /// (default: <key_dir>/crawler-recheck.txt).
@@ -480,7 +490,12 @@ struct Described {
 /// any change to what is asked or what the answers mean. Entries carry it, so a
 /// later curator can tell which questions produced a judgement and re-run only
 /// the ones decided under a taxonomy that has since been superseded.
-const CLASSIFIER_ID: u16 = 2;
+/// Bumped 2 -> 3 on 2026-09-02: the `volatility` question changed materially. It
+/// used to ask whether the page is a live feed of user-submitted content; it now
+/// asks whether a description of the RESOURCE stays accurate as its contents
+/// change, and says a directory or index is static. Entries carrying 2 answered a
+/// different question and a curator selecting on this can now tell them apart.
+const CLASSIFIER_ID: u16 = 3;
 
 /// What a visitor sees IMMEDIATELY on arriving, before navigating anywhere.
 ///
@@ -730,9 +745,18 @@ impl Assessment {
         // same argument the adult-landing decision below already makes; it
         // applies here and more strongly, because the harm prevented is smaller.
         //
-        // `volatility` stays PUBLISHED, so the UI can show it and recheck tiering
-        // can revisit feeds more often. Do not re-add a refusal here without
-        // evidence that the gate is right more often than it is wrong.
+        // `volatility` stays PUBLISHED as CURATOR metadata: it reaches the signed
+        // entry and `atlasctl show`, and nothing else reads it today. Do NOT read
+        // the two obvious consumers into that. The UI is deliberately blind to it
+        // (`ui/src/main.rs` holds it constant in its fixtures precisely so a
+        // filter that started depending on it would be noticed), and recheck
+        // tiering cannot see it at all, because `RecheckTier::of` takes only the
+        // locator and the two adult flags and `LiveEntry` carries no volatility
+        // field. Revisiting feeds more often is a REASONABLE thing to build on
+        // this signal and is not built; see the follow-up issue.
+        //
+        // Do not re-add a refusal here without evidence that the gate is right
+        // more often than it is wrong.
         // Adult LANDING pages are ADMITTED, deliberately, where they used to be
         // dropped. Involuntary exposure is prevented at presentation: the UI holds
         // them behind a safe-search toggle that is on by default, and a gated site
@@ -2798,7 +2822,17 @@ fn main() -> Result<()> {
     // and it must work on an installation whose crawl is misconfigured or whose
     // spend ledger is exhausted.
     if !cli.forget.is_empty() {
-        return forget_locators(&cli.forget, &seen_path, &pending_path, &decisions_path);
+        // Loaded here rather than inside, so the repair is testable without a node
+        // and so the one network dependency is visible at the call site.
+        let registry = AppRegistryView::load(&cli);
+        return forget_locators(
+            &registry,
+            &cli.forget,
+            &seen_path,
+            &pending_path,
+            &quarantine_path,
+            &decisions_path,
+        );
     }
 
     if cli.recheck {
@@ -2924,8 +2958,12 @@ fn run_once(
     state: &mut CrawlState,
 ) -> Result<()> {
     let mut seen = load_seen(seen_path);
-    let sources = fs::read_to_string(&cli.sources)
-        .with_context(|| format!("reading sources {}", cli.sources.display()))?;
+    let sources_path = cli
+        .sources
+        .as_ref()
+        .context("--sources is required for a crawl run")?;
+    let sources = fs::read_to_string(sources_path)
+        .with_context(|| format!("reading sources {}", sources_path.display()))?;
     let key = std::env::var("OPENAI_API_KEY")
         .ok()
         .filter(|k| !k.is_empty());
@@ -7030,140 +7068,6 @@ fn add_entry(cli: &Cli, loc: &str, kind: &str, d: &Described) -> Result<()> {
 /// before Atlas stopped indexing the web) returns `None` here and must still
 /// suppress rediscovery. Keeping the raw line means this can only ever match
 /// MORE than it did before, never less.
-/// Drop `targets` from the seen set and queue them for a fresh judgement.
-///
-/// The recovery path for a decision that was wrong. `crawler-seen.txt` is the one
-/// TERMINAL store: the capture filter consults it before any re-crawl, and
-/// `run_recheck_pass` only ever walks subjects that reached the live index, so a
-/// locator refused before it became a subject is never looked at again by
-/// anything. Removing its line is the whole recovery, and until this existed the
-/// only way to do it was to edit the file by hand.
-///
-/// Removal alone is not enough to get the locator re-judged, though, and that is
-/// the part an operator gets wrong. The link is usually rediscovered from a room
-/// message the mirror cursor has long since passed, so nothing would put it back
-/// in the queue. Each target is therefore also enqueued under `CURATED_AUTHOR`,
-/// which is what "the operator asked for this by name" means everywhere else in
-/// this file and is exempt from the per-author cap.
-///
-/// The quarantine is deliberately NOT touched. It is self-releasing, so a held
-/// locator is already going to be retried, and reaching it means calling
-/// `Quarantine::load`, which returns the entries it released on the way in. This
-/// function would have to requeue those to avoid dropping them, which is
-/// `run_once`'s job and not something a recovery flag should be duplicating.
-///
-/// Matching is exact against either spelling of a line, literal or normalized,
-/// because the seen file holds lines written by several code paths across several
-/// releases and `load_seen` reads it the same forgiving way. Nothing here matches
-/// on a prefix or a substring: the caller is naming one locator, and a loose
-/// match would silently forget its neighbours.
-fn forget_locators(
-    targets: &[String],
-    seen_path: &Path,
-    pending_path: &Path,
-    decisions_path: &Path,
-) -> Result<()> {
-    let mut wanted: HashSet<String> = HashSet::new();
-    // Kept alongside `wanted` so a target that normalizes can be enqueued in the
-    // spelling every other store uses, while still MATCHING the raw line an older
-    // release may have written.
-    let mut enqueue: Vec<(String, &'static str)> = Vec::new();
-    for t in targets {
-        let t = t.trim();
-        if t.is_empty() {
-            continue;
-        }
-        wanted.insert(t.to_string());
-        match normalize_href(t) {
-            Some((canon, kind)) => {
-                wanted.insert(canon.clone());
-                enqueue.push((canon, kind));
-            }
-            None => eprintln!(
-                "warn: {t} is not a locator this crawler can fetch, so it will be \
-                 removed from the seen set but not queued"
-            ),
-        }
-    }
-    if wanted.is_empty() {
-        bail!("--forget needs at least one locator");
-    }
-
-    let matches = |line: &str| -> bool {
-        let l = line.trim();
-        !l.is_empty()
-            && (wanted.contains(l) || normalize_href(l).is_some_and(|(c, _)| wanted.contains(&c)))
-    };
-
-    let before = fs::read_to_string(seen_path).unwrap_or_default();
-    let mut removed = 0usize;
-    let kept: Vec<&str> = before
-        .lines()
-        .filter(|l| {
-            let hit = matches(l);
-            if hit {
-                removed += 1;
-                eprintln!("  forgetting seen entry: {}", l.trim());
-            }
-            !hit
-        })
-        .collect();
-
-    // Full rewrite through the same tmp+rename every other store here uses. A
-    // partial write to this file does not lose one locator, it resurrects the
-    // whole backlog and re-bills every entry in it.
-    if removed > 0 {
-        let tmp = sibling_tmp(seen_path);
-        let mut body = kept.join("\n");
-        if !body.is_empty() {
-            body.push('\n');
-        }
-        fs::write(&tmp, body).with_context(|| format!("writing {}", tmp.display()))?;
-        fs::rename(&tmp, seen_path)
-            .with_context(|| format!("replacing {}", seen_path.display()))?;
-    }
-
-    let mut pending = Pending::load(pending_path);
-    let mut queued = 0usize;
-    for (loc, kind) in &enqueue {
-        if pending.contains(loc) {
-            eprintln!("  {loc} is already queued");
-        } else if pending.add(loc, kind, CURATED_AUTHOR) {
-            queued += 1;
-        } else {
-            eprintln!("warn: could not queue {loc} — the pending queue is full");
-        }
-    }
-    if !pending.save() {
-        bail!("could not write the pending queue; nothing was queued for re-judgement");
-    }
-
-    // An operator overriding an automatic decision is exactly the kind of event
-    // the decision log exists to preserve, and without it the record would show a
-    // refusal followed some days later by an unexplained index entry.
-    let mut decisions = DecisionLog::open(decisions_path);
-    for (loc, _) in &enqueue {
-        let _ = decisions.record(
-            loc,
-            Outcome::Forgotten,
-            "operator --forget: prior decision discarded, requeued for re-judgement",
-            now_secs(),
-        );
-    }
-
-    eprintln!(
-        "forgot {removed} seen entry/entries and queued {queued} locator(s) for \
-         re-judgement on the next run"
-    );
-    if removed == 0 {
-        eprintln!(
-            "note: nothing matched in {} — check the spelling against that file",
-            seen_path.display()
-        );
-    }
-    Ok(())
-}
-
 fn load_seen(path: &Path) -> HashSet<String> {
     fs::read_to_string(path)
         .map(|s| {
@@ -7191,6 +7095,283 @@ fn append_seen(path: &Path, url: &str) {
     if let Err(e) = append_line(path, url) {
         eprintln!("error: could not record {url} as seen ({e:#}) — it may be described again");
     }
+}
+
+/// The locator field of a quarantine line, which is the LAST of six tab-separated
+/// columns (due, cycles, defers, kind, author, locator).
+fn quarantine_locator(line: &str) -> &str {
+    line.rsplit('\t').next().unwrap_or(line)
+}
+
+/// Drop `targets` from the durable stores and queue them for a fresh judgement.
+///
+/// The recovery path for a decision that was wrong. `crawler-seen.txt` is the
+/// TERMINAL store: the capture filter consults it before any re-crawl, and
+/// `run_recheck_pass` only ever walks subjects that reached the live index, so a
+/// locator refused before it became a subject is never looked at again by
+/// anything. Until this existed, the only way to undo one was to edit that file
+/// by hand.
+///
+/// Removal alone would not get the locator re-judged, and that is the half an
+/// operator gets wrong: the link usually arrived in a room message the mirror
+/// cursor has long since passed, so nothing would put it back in the queue. Each
+/// recovered target is therefore also enqueued under `CURATED_AUTHOR`, which is
+/// what "the operator asked for this by name" means everywhere else in this file
+/// and is exempt from the per-author cap.
+///
+/// The quarantine IS cleared, which an earlier version of this skipped on the
+/// reasoning that quarantine is self-releasing. That was wrong. An entry at
+/// `MAX_QUARANTINE_CYCLES` makes `Quarantine::load` emit `Decided::Exhausted`,
+/// and `run_once` responds by writing the locator straight back into the seen
+/// file — silently undoing the repair on the very next run.
+///
+/// # Spelling
+///
+/// Targets are canonicalised with `normalize_mapped`, which is `normalize_href`
+/// PLUS `map_or_collapse`, the pair every discovery path uses (curated sources,
+/// hub mining, room scanning). Using `normalize_href` alone was a real bug: 35 of
+/// the 184 lines in the live seen file are `app:<slug>/<resource>` spellings, so
+/// a gateway URL for a Delta site matched nothing, removed nothing, and still
+/// queued the unmapped `freenet:` spelling — which then published a SECOND index
+/// entry for a site already listed, because `dedup_key` does not collide across
+/// the two forms. That is the duplicate class `collapse_unmapped_fragment` exists
+/// to prevent, reintroduced through a new door.
+///
+/// # Ordering and failure
+///
+/// Everything is decided PER TARGET, and the queue is saved BEFORE any store is
+/// rewritten. Both matter:
+///
+/// - A target that matched nothing is NOT queued. Queueing a typo spends a paid
+///   attempt on a resource nobody asked about.
+/// - A target that could not be queued KEEPS its stored decision, so it is never
+///   left neither-refused-nor-queued.
+/// - Rewriting a store before the queue is durable is what creates that state,
+///   and nothing would rediscover the locator afterwards.
+///
+/// # Concurrency
+///
+/// There is no locking anywhere in this crate, and this read-modify-writes files
+/// the running daemon appends to. STOP `atlas-crawler.service` first: an append
+/// landing between the read and the rename is discarded, and every discarded line
+/// is a locator that gets rediscovered and re-billed against the LLM budget.
+fn forget_locators(
+    registry: &AppRegistryView,
+    targets: &[String],
+    seen_path: &Path,
+    pending_path: &Path,
+    quarantine_path: &Path,
+    decisions_path: &Path,
+) -> Result<()> {
+    /// One `--forget` argument, tracked on its own so that a target which cannot
+    /// be queued cannot cost a different target its stored decision.
+    struct Target {
+        raw: String,
+        /// Canonical spelling and kind. `None` for an argument this crawler could
+        /// not fetch (a raw line from an older seen file whose grammar no longer
+        /// parses): still removable, but there is nothing well-formed to queue.
+        canon: Option<(String, &'static str)>,
+        /// Every spelling naming this target. Matched exactly, never by prefix.
+        spellings: HashSet<String>,
+        found: usize,
+        queued: bool,
+    }
+
+    /// Which target owns a stored line, if any.
+    ///
+    /// Exact on either spelling, never a prefix or a substring: a contract id is a
+    /// prefix of every path beneath it, so a loose match would forget a whole site
+    /// when asked to forget one page of it.
+    fn owner(ts: &[Target], key: &str, registry: &AppRegistryView) -> Option<usize> {
+        let k = key.trim();
+        if k.is_empty() {
+            return None;
+        }
+        let mapped = normalize_mapped(k, registry).map(|(c, _)| c);
+        ts.iter().position(|t| {
+            t.spellings.contains(k) || mapped.as_deref().is_some_and(|m| t.spellings.contains(m))
+        })
+    }
+
+    if registry.apps.is_empty() {
+        // Not fatal, but it decides whether an `app:` spelling can be reached from
+        // a gateway URL at all, so say so rather than silently matching nothing.
+        eprintln!(
+            "warn: the app registry is empty (is the node reachable?), so a gateway \
+             URL cannot be resolved to its app:<slug>/<resource> spelling. If the \
+             target is an app-hosted page, pass that spelling directly."
+        );
+    }
+
+    let mut ts: Vec<Target> = Vec::new();
+    for raw in targets {
+        let raw = raw.trim();
+        if raw.is_empty() {
+            continue;
+        }
+        let canon = normalize_mapped(raw, registry);
+        let mut spellings = HashSet::from([raw.to_string()]);
+        match &canon {
+            Some((c, _)) => {
+                spellings.insert(c.clone());
+            }
+            None => eprintln!(
+                "warn: {raw} is not a locator this crawler can fetch — it can be \
+                 removed from the stores, but there is nothing well-formed to queue"
+            ),
+        }
+        ts.push(Target {
+            raw: raw.to_string(),
+            canon,
+            spellings,
+            found: 0,
+            queued: false,
+        });
+    }
+    if ts.is_empty() {
+        bail!("--forget needs at least one locator");
+    }
+
+    let seen_body = fs::read_to_string(seen_path).unwrap_or_default();
+    let quarantine_body = fs::read_to_string(quarantine_path).unwrap_or_default();
+
+    // Count hits BEFORE queueing, so "was this actually on record?" is known by
+    // the time the queueing decision is made.
+    for line in seen_body.lines() {
+        if let Some(i) = owner(&ts, line, registry) {
+            ts[i].found += 1;
+        }
+    }
+    for line in quarantine_body.lines() {
+        if let Some(i) = owner(&ts, quarantine_locator(line), registry) {
+            ts[i].found += 1;
+        }
+    }
+
+    let mut pending = Pending::load(pending_path);
+    for t in ts.iter_mut() {
+        let Some((canon, kind)) = t.canon.clone() else {
+            continue;
+        };
+        if t.found == 0 {
+            eprintln!("  {canon} is not on record as decided — not queued");
+            continue;
+        }
+        // Drop any existing entry first so the locator restarts CLEAN. A stale
+        // entry carries its attempt count and its thin-verdict streak, so a
+        // locator already holding two thin verdicts would be RETIRED on its very
+        // next run instead of getting the fresh judgement that was asked for.
+        pending.remove(&canon);
+        if pending.add(&canon, kind, CURATED_AUTHOR) {
+            t.queued = true;
+        } else {
+            eprintln!(
+                "warn: could not queue {canon} — the pending queue is at its global \
+                 limit, or @curated is at its own. Its stored decision has been LEFT \
+                 in place rather than removed, so nothing is lost."
+            );
+        }
+    }
+    // `add` can evict another author's queued link to make room. `run_once` reports
+    // that for itself; this path has to as well or the eviction is invisible.
+    pending.report_refusals();
+    if !pending.save() {
+        bail!(
+            "could not write the pending queue, so nothing was queued and no store \
+             has been modified — rerun once the queue is writable"
+        );
+    }
+
+    // A target's lines are cleared only if it was actually found AND either got
+    // queued or had nothing well-formed to queue in the first place.
+    let clear =
+        |i: usize, ts: &[Target]| ts[i].found > 0 && (ts[i].queued || ts[i].canon.is_none());
+
+    let rewrite = |path: &Path, body: &str, is_quarantine: bool| -> Result<usize> {
+        let mut dropped = 0usize;
+        let kept: Vec<&str> = body
+            .lines()
+            .filter(|line| {
+                let key = if is_quarantine {
+                    quarantine_locator(line)
+                } else {
+                    line
+                };
+                match owner(&ts, key, registry) {
+                    Some(i) if clear(i, &ts) => {
+                        dropped += 1;
+                        eprintln!("  forgetting: {}", line.trim());
+                        false
+                    }
+                    _ => true,
+                }
+            })
+            .collect();
+        if dropped == 0 {
+            return Ok(0);
+        }
+        // Full rewrite through the same tmp+rename every other store here uses. A
+        // partial write to the seen file does not lose one locator, it resurrects
+        // the whole backlog and re-bills every entry in it. The temp file is
+        // removed on failure, matching `Pending::save` and `Quarantine::save`:
+        // otherwise a failed repair leaves a truncated copy of the seen set lying
+        // next to the real one, which is the more dangerous artifact.
+        let tmp = sibling_tmp(path);
+        let mut out = kept.join("\n");
+        if !out.is_empty() {
+            out.push('\n');
+        }
+        if let Err(e) = fs::write(&tmp, out) {
+            let _ = fs::remove_file(&tmp);
+            return Err(e).with_context(|| format!("writing {}", tmp.display()));
+        }
+        if let Err(e) = fs::rename(&tmp, path) {
+            let _ = fs::remove_file(&tmp);
+            return Err(e).with_context(|| format!("replacing {}", path.display()));
+        }
+        Ok(dropped)
+    };
+
+    let seen_dropped = rewrite(seen_path, &seen_body, false)?;
+    let quarantine_dropped = rewrite(quarantine_path, &quarantine_body, true)?;
+
+    // Recorded from what actually HAPPENED, not from the input list: a typo that
+    // matched nothing changed nothing and must not show up as a decision, or the
+    // log stops being a record of the stores' history.
+    //
+    // The write result is deliberately ignored. `DecisionLog::record` returning
+    // false means "do not make this decision permanent", but by this point the
+    // repair is already committed to disk and there is nothing left to hold back;
+    // losing the audit line is the lesser harm, and `record` reports it itself.
+    let mut decisions = DecisionLog::open(decisions_path);
+    for (i, t) in ts.iter().enumerate() {
+        if !clear(i, &ts) {
+            continue;
+        }
+        let name = t.canon.as_ref().map_or(t.raw.as_str(), |(c, _)| c.as_str());
+        let why = if t.queued {
+            "operator --forget: prior decision discarded, requeued for re-judgement"
+        } else {
+            "operator --forget: prior decision discarded; not requeued (locator does \
+             not parse)"
+        };
+        let _ = decisions.record(name, Outcome::Forgotten, why, now_secs());
+    }
+
+    let queued = ts.iter().filter(|t| t.queued).count();
+    eprintln!(
+        "forgot {seen_dropped} seen line(s) and {quarantine_dropped} quarantine \
+         line(s); queued {queued} locator(s) for re-judgement on the next run"
+    );
+    if seen_dropped == 0 && quarantine_dropped == 0 {
+        eprintln!(
+            "note: nothing matched in {} or {} — check the spelling against those \
+             files. An app-hosted page is stored as app:<slug>/<resource>.",
+            seen_path.display(),
+            quarantine_path.display()
+        );
+    }
+    Ok(())
 }
 
 /// Append one line to a file, creating it (and its parent) if needed.
@@ -7404,24 +7585,77 @@ mod tests {
         }
     }
 
+    /// A locator that a forget must actually reach: `app:<slug>/<resource>` is how
+    /// 35 of the 184 lines in the live seen file are spelled, and an operator has
+    /// the gateway URL, not that spelling.
+    ///
+    /// This is the regression test for the bug that made the first version of
+    /// `--forget` worse than useless on exactly the class of site the change was
+    /// written for. Canonicalising with `normalize_href` alone, the target became
+    /// `freenet:<DELTA>/#<res>`, which matched no stored line (so nothing was
+    /// forgotten) and was still queued — publishing a SECOND index entry for a
+    /// site already listed, because `dedup_key` does not collide across the two
+    /// spellings.
+    #[test]
+    fn forget_reaches_an_app_hosted_page_from_its_gateway_url() {
+        let reg = delta_registry();
+        let seen = TmpFile::new("forget-app-seen");
+        let pending = TmpFile::new("forget-app-pending");
+        let quarantine = TmpFile::new("forget-app-quarantine");
+        let decisions = TmpFile::new("forget-app-decisions");
+        fs::write(seen.path(), "app:delta/DWn4bEFfoo\n").unwrap();
+
+        forget_locators(
+            &reg,
+            &[format!(
+                "http://127.0.0.1:7509/v1/contract/web/{DELTA}/#DWn4bEFfoo/"
+            )],
+            seen.path(),
+            pending.path(),
+            quarantine.path(),
+            decisions.path(),
+        )
+        .expect("forget must succeed");
+
+        assert!(
+            !load_seen(seen.path()).contains("app:delta/DWn4bEFfoo"),
+            "the app-spelled seen line must be forgotten; matching on normalize_href \
+             alone leaves it in place and the repair silently does nothing"
+        );
+        let queued = Pending::load(pending.path());
+        assert!(
+            queued.contains("app:delta/DWn4bEFfoo"),
+            "the locator must be requeued under the APP spelling every other \
+             discovery path uses"
+        );
+        assert!(
+            !queued.contains(&format!("freenet:{DELTA}/#DWn4bEFfoo/")),
+            "queueing the unmapped spelling is what mints a duplicate index entry \
+             for a site that is already listed"
+        );
+    }
+
     /// `--forget` is the only recovery from a terminal decision, so the thing it
-    /// must do is REMOVE the seen line and REQUEUE the locator. Removing without
-    /// requeueing looks like it worked and does nothing: the link was discovered
-    /// from a room message the mirror cursor has already passed, so no later run
-    /// would rediscover it.
+    /// must do is CLEAR the stored decision and REQUEUE the locator. Removing
+    /// without requeueing looks like it worked and does nothing: the link was
+    /// discovered from a room message the mirror cursor has already passed, so no
+    /// later run would rediscover it.
     #[test]
     fn forget_clears_the_seen_line_and_queues_the_locator_again() {
         let seen = TmpFile::new("forget-seen");
         let pending = TmpFile::new("forget-pending");
+        let quarantine = TmpFile::new("forget-quarantine");
         let decisions = TmpFile::new("forget-decisions");
         let ferrybot = "freenet:F86dYD2hJ8DLiiEDbuvPFGFBiE1JDevTZ8r3SnbCEg69/";
         let neighbour = "freenet:8nXH9SDHE28yPVbudRJDnf3mJi1AFZeV9EYGsqeya1Nv/";
         fs::write(seen.path(), format!("{neighbour}\n{ferrybot}\n")).unwrap();
 
         forget_locators(
+            &AppRegistryView::default(),
             &[ferrybot.to_string()],
             seen.path(),
             pending.path(),
+            quarantine.path(),
             decisions.path(),
         )
         .expect("forget must succeed");
@@ -7438,38 +7672,48 @@ mod tests {
         );
         assert!(
             Pending::load(pending.path()).contains(ferrybot),
-            "removing the seen line alone never gets the locator re-judged"
+            "clearing the seen line alone never gets the locator re-judged"
+        );
+        assert!(
+            fs::read_to_string(decisions.path())
+                .unwrap_or_default()
+                .contains("forgotten"),
+            "an operator overriding an automatic decision must leave an audit line, \
+             or the log shows a refusal followed by an unexplained index entry"
         );
     }
 
     /// The seen file holds lines written by several code paths across several
-    /// releases, and an operator recovering a link has whatever spelling was in
-    /// front of them, usually the gateway URL it was posted as in the room. If
-    /// only the canonical spelling matched, the flag would silently do nothing in
-    /// exactly the situation it exists for.
+    /// releases, so the STORED line is the side that may need normalising — not
+    /// just the operator's argument. An earlier version of this test had the
+    /// canonical form stored and passed the gateway URL, which is satisfied by the
+    /// literal-match arm alone and left the normalising arm unexercised.
     #[test]
-    fn forget_matches_the_stored_line_through_either_spelling() {
+    fn forget_normalises_the_stored_line_not_only_the_argument() {
         let seen = TmpFile::new("forget-spelling-seen");
         let pending = TmpFile::new("forget-spelling-pending");
+        let quarantine = TmpFile::new("forget-spelling-quarantine");
         let decisions = TmpFile::new("forget-spelling-decisions");
         let canonical = "freenet:F86dYD2hJ8DLiiEDbuvPFGFBiE1JDevTZ8r3SnbCEg69/";
-        fs::write(seen.path(), format!("{canonical}\n")).unwrap();
-
-        // What the link actually looked like in the River room.
+        // Stored in the denormalised form an older build wrote.
         let as_posted =
             "http://127.0.0.1:7509/v1/contract/web/F86dYD2hJ8DLiiEDbuvPFGFBiE1JDevTZ8r3SnbCEg69/";
+        fs::write(seen.path(), format!("{as_posted}\n")).unwrap();
+
         forget_locators(
-            &[as_posted.to_string()],
+            &AppRegistryView::default(),
+            &[canonical.to_string()],
             seen.path(),
             pending.path(),
+            quarantine.path(),
             decisions.path(),
         )
         .expect("forget must succeed");
 
         assert!(
-            !load_seen(seen.path()).contains(canonical),
-            "a gateway URL and its canonical locator name the same resource, so \
-             forgetting one must forget the other"
+            !fs::read_to_string(seen.path()).unwrap().contains(as_posted),
+            "a stored gateway URL names the same resource as the canonical locator, \
+             so forgetting the canonical form must drop that line too"
         );
     }
 
@@ -7481,15 +7725,18 @@ mod tests {
     fn forget_never_matches_a_locator_by_prefix() {
         let seen = TmpFile::new("forget-prefix-seen");
         let pending = TmpFile::new("forget-prefix-pending");
+        let quarantine = TmpFile::new("forget-prefix-quarantine");
         let decisions = TmpFile::new("forget-prefix-decisions");
         let root = "freenet:F86dYD2hJ8DLiiEDbuvPFGFBiE1JDevTZ8r3SnbCEg69/";
         let deeper = "freenet:F86dYD2hJ8DLiiEDbuvPFGFBiE1JDevTZ8r3SnbCEg69/about";
         fs::write(seen.path(), format!("{root}\n{deeper}\n")).unwrap();
 
         forget_locators(
+            &AppRegistryView::default(),
             &[root.to_string()],
             seen.path(),
             pending.path(),
+            quarantine.path(),
             decisions.path(),
         )
         .expect("forget must succeed");
@@ -7503,21 +7750,25 @@ mod tests {
         );
     }
 
-    /// A typo must not read as success. The flag reports zero removals and leaves
-    /// every file alone rather than erroring, so an operator forgetting two
-    /// locators at once still gets the one that matched.
+    /// A typo must not read as success, and must not cost anything. Queueing an
+    /// unmatched target spends a paid LLM attempt on a resource nobody asked
+    /// about, which is the opposite of what a repair should do.
     #[test]
-    fn forget_leaves_the_seen_file_intact_when_nothing_matches() {
+    fn forget_does_not_queue_a_target_that_matched_nothing() {
         let seen = TmpFile::new("forget-miss-seen");
         let pending = TmpFile::new("forget-miss-pending");
+        let quarantine = TmpFile::new("forget-miss-quarantine");
         let decisions = TmpFile::new("forget-miss-decisions");
         let kept = "freenet:8nXH9SDHE28yPVbudRJDnf3mJi1AFZeV9EYGsqeya1Nv/";
+        let typo = "freenet:F86dYD2hJ8DLiiEDbuvPFGFBiE1JDevTZ8r3SnbCEg69/";
         fs::write(seen.path(), format!("{kept}\n")).unwrap();
 
         forget_locators(
-            &["freenet:F86dYD2hJ8DLiiEDbuvPFGFBiE1JDevTZ8r3SnbCEg69/".to_string()],
+            &AppRegistryView::default(),
+            &[typo.to_string()],
             seen.path(),
             pending.path(),
+            quarantine.path(),
             decisions.path(),
         )
         .expect("a locator that is not present is not an error");
@@ -7525,6 +7776,170 @@ mod tests {
         assert!(
             load_seen(seen.path()).contains(kept),
             "an unmatched target must not rewrite the file into something shorter"
+        );
+        assert!(
+            !Pending::load(pending.path()).contains(typo),
+            "a target that was never on record must not be queued — that spends a \
+             billed attempt on a resource nobody asked about"
+        );
+        assert!(
+            !fs::read_to_string(decisions.path())
+                .unwrap_or_default()
+                .contains(typo),
+            "nothing happened to this locator, so nothing may be recorded about it"
+        );
+    }
+
+    /// The flag is repeatable, and one bad target must not abort the others. Every
+    /// test here passing a single-element slice would leave the accumulation logic
+    /// across targets completely unexercised.
+    #[test]
+    fn forget_handles_every_target_even_when_one_misses() {
+        let seen = TmpFile::new("forget-multi-seen");
+        let pending = TmpFile::new("forget-multi-pending");
+        let quarantine = TmpFile::new("forget-multi-quarantine");
+        let decisions = TmpFile::new("forget-multi-decisions");
+        let hit = "freenet:F86dYD2hJ8DLiiEDbuvPFGFBiE1JDevTZ8r3SnbCEg69/";
+        let miss = "freenet:8nXH9SDHE28yPVbudRJDnf3mJi1AFZeV9EYGsqeya1Nv/";
+        fs::write(seen.path(), format!("{hit}\n")).unwrap();
+
+        forget_locators(
+            &AppRegistryView::default(),
+            &[miss.to_string(), hit.to_string()],
+            seen.path(),
+            pending.path(),
+            quarantine.path(),
+            decisions.path(),
+        )
+        .expect("forget must succeed");
+
+        assert!(
+            !load_seen(seen.path()).contains(hit),
+            "a miss listed first must not stop a later target being processed"
+        );
+        let queued = Pending::load(pending.path());
+        assert!(queued.contains(hit));
+        assert!(!queued.contains(miss), "the miss must still not be queued");
+    }
+
+    /// The quarantine has to be cleared, not just the seen file. An entry that has
+    /// burned all its cycles makes `Quarantine::load` emit `Decided::Exhausted`,
+    /// and `run_once` answers that by writing the locator straight back into the
+    /// seen file — so leaving the entry in place silently undoes the repair on the
+    /// very next run.
+    #[test]
+    fn forget_clears_a_quarantine_entry_so_it_cannot_re_blacklist() {
+        let seen = TmpFile::new("forget-q-seen");
+        let pending = TmpFile::new("forget-q-pending");
+        let quarantine = TmpFile::new("forget-q-quarantine");
+        let decisions = TmpFile::new("forget-q-decisions");
+        let loc = "freenet:F86dYD2hJ8DLiiEDbuvPFGFBiE1JDevTZ8r3SnbCEg69/";
+        let other = "freenet:8nXH9SDHE28yPVbudRJDnf3mJi1AFZeV9EYGsqeya1Nv/";
+        fs::write(seen.path(), format!("{loc}\n")).unwrap();
+        // due, cycles, defers, kind, author, locator — cycles at the ceiling is the
+        // case that re-blacklists.
+        fs::write(
+            quarantine.path(),
+            format!("1788361034\t8\t0\tsite\tS3P5L26E\t{loc}\n1788361034\t1\t0\tsite\tS3P5L26E\t{other}\n"),
+        )
+        .unwrap();
+
+        forget_locators(
+            &AppRegistryView::default(),
+            &[loc.to_string()],
+            seen.path(),
+            pending.path(),
+            quarantine.path(),
+            decisions.path(),
+        )
+        .expect("forget must succeed");
+
+        let q = fs::read_to_string(quarantine.path()).unwrap();
+        assert!(
+            !q.contains(loc),
+            "an exhausted quarantine entry survives the forget and puts the locator \
+             straight back into the seen file on the next run"
+        );
+        assert!(
+            q.contains(other),
+            "another locator's quarantine entry must be left exactly as it was"
+        );
+    }
+
+    /// A locator that is still queued must restart CLEAN. The stored entry carries
+    /// an attempt count and a thin-verdict streak, so a locator already holding two
+    /// thin verdicts would be RETIRED on its very next run rather than getting the
+    /// fresh judgement the operator asked for.
+    #[test]
+    fn forget_resets_an_entry_that_is_still_queued() {
+        let seen = TmpFile::new("forget-reset-seen");
+        let pending = TmpFile::new("forget-reset-pending");
+        let quarantine = TmpFile::new("forget-reset-quarantine");
+        let decisions = TmpFile::new("forget-reset-decisions");
+        let loc = "freenet:F86dYD2hJ8DLiiEDbuvPFGFBiE1JDevTZ8r3SnbCEg69/";
+        fs::write(seen.path(), format!("{loc}\n")).unwrap();
+        // attempts, thin streak, kind, author, locator — two attempts already spent
+        // and two thin verdicts already recorded.
+        fs::write(
+            pending.path(),
+            format!("#cursor\t0\n2\tTT\tsite\t@hub\t{loc}\n"),
+        )
+        .unwrap();
+
+        forget_locators(
+            &AppRegistryView::default(),
+            &[loc.to_string()],
+            seen.path(),
+            pending.path(),
+            quarantine.path(),
+            decisions.path(),
+        )
+        .expect("forget must succeed");
+
+        let body = fs::read_to_string(pending.path()).unwrap();
+        let entry = body
+            .lines()
+            .find(|l| l.ends_with(loc))
+            .expect("the locator must still be queued");
+        let fields: Vec<&str> = entry.split('\t').collect();
+        assert_eq!(
+            fields[0], "0",
+            "the attempt count must restart at zero, or the forgotten locator \
+             inherits a budget it already spent"
+        );
+        assert_eq!(
+            fields[3], CURATED_AUTHOR,
+            "a forgotten locator is queued as the operator's own request"
+        );
+    }
+
+    /// `admit()` is a function for exactly this reason and `--forget` needs the
+    /// same protection: every test above calls `forget_locators` directly, so
+    /// deleting the dispatch in `main` would make the flag a silent no-op while
+    /// leaving the function referenced (no dead-code warning) and every test green.
+    ///
+    /// Also pins the ORDER. The dispatch has to run before `--recheck` and before
+    /// the budget is built, because a repair must work on an installation whose
+    /// spend ledger is exhausted.
+    #[test]
+    fn the_forget_flag_is_dispatched_from_main_before_any_budget_setup() {
+        let src = strip_comments(include_str!("main.rs"));
+        let main_body = &src[src
+            .find("fn main() -> Result<()> {")
+            .expect("main must exist")..];
+        let dispatch = main_body
+            .find("if !cli.forget.is_empty() {")
+            .expect("--forget must be dispatched from main, or the flag does nothing");
+        assert!(
+            main_body[dispatch..].contains("return forget_locators("),
+            "the forget branch must actually call forget_locators"
+        );
+        let recheck = main_body
+            .find("if cli.recheck {")
+            .expect("the recheck branch must exist");
+        assert!(
+            dispatch < recheck,
+            "--forget must be handled BEFORE --recheck and the budget setup"
         );
     }
 
