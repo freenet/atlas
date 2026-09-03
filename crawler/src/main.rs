@@ -2841,7 +2841,7 @@ fn main() -> Result<()> {
         let published: HashSet<String> = match fetch_live_index(&cli) {
             Ok(entries) => entries
                 .iter()
-                .filter_map(|e| normalize_mapped(&e.locator, &registry).map(|(c, _)| c))
+                .filter_map(|e| published_identity(&e.locator, &registry))
                 .collect(),
             Err(e) => {
                 eprintln!(
@@ -7150,6 +7150,27 @@ fn stored_locator(line: &str) -> &str {
     line.trim_end().rsplit('\t').next().unwrap_or(line)
 }
 
+/// The identity `atlasctl add` will deduplicate a locator against.
+///
+/// Must agree with `Locator::dedup_key` in atlas-common, which drops an app
+/// locator's PATH because two pages of one Delta site are one subject.
+///
+/// `normalize_mapped` alone is wrong here and the difference is not cosmetic: its
+/// `app:` parser requires the whole suffix after the slug to be base58, so a
+/// stored deep link like `app:delta/<res>/about` is REJECTED and silently omitted
+/// from the set. The published-locator guard would then miss exactly the
+/// duplicate it exists to catch, and the forgotten locator would burn its retry
+/// budget on an `atlasctl add` that can never succeed.
+fn published_identity(loc: &str, registry: &AppRegistryView) -> Option<String> {
+    if let Some(rest) = loc.strip_prefix("app:") {
+        let mut parts = rest.splitn(3, '/');
+        let slug = parts.next().filter(|s| !s.is_empty())?;
+        let resource = parts.next().filter(|s| !s.is_empty())?;
+        return Some(format!("app:{slug}/{resource}"));
+    }
+    normalize_mapped(loc, registry).map(|(c, _)| c)
+}
+
 /// Read a store, treating ONLY "does not exist" as empty.
 ///
 /// `unwrap_or_default` here was a real defect: a store that exists but cannot be
@@ -7455,8 +7476,16 @@ fn forget_locators(
         Ok(dropped)
     };
 
-    let seen_dropped = rewrite(paths.seen, &seen_body, false)?;
+    // Quarantine FIRST, then seen. If the seen rewrite fails after this, the
+    // locator simply stays suppressed and the operator reruns — recoverable. The
+    // other order is not: a seen removal that lands before a FAILING quarantine
+    // rewrite leaves an exhausted quarantine entry behind, and `run_once` answers
+    // that by writing the locator straight back into the seen file, discarding the
+    // queued repair. Same asymmetry as the queue-before-stores ordering above:
+    // when the operation cannot be atomic, order it so a partial failure is the
+    // recoverable one.
     let quarantine_dropped = rewrite(paths.quarantine, &quarantine_body, true)?;
+    let seen_dropped = rewrite(paths.seen, &seen_body, false)?;
 
     // Recorded from what actually HAPPENED, not from the input list: a typo that
     // matched nothing changed nothing and must not show up as a decision, or the
@@ -8099,6 +8128,29 @@ mod tests {
             dispatch < recheck,
             "--forget must be handled BEFORE --recheck and the budget setup"
         );
+
+        // The published-locator guard is MONEY safety and it is wired at the call
+        // site: every unit test hand-constructs the `published` set, so a `main()`
+        // that quietly stopped building it from the live index would leave the
+        // whole suite green while re-arming the billed retry loop the guard exists
+        // to stop. Bounded to the forget branch so a match cannot drift in from
+        // elsewhere.
+        let branch = &main_body[dispatch..recheck];
+        assert!(
+            branch.contains("fetch_live_index("),
+            "main must build the published set from the LIVE INDEX, or --forget \
+             will happily requeue an already-indexed locator and burn billed \
+             attempts on an atlasctl add that can never succeed"
+        );
+        assert!(
+            branch.contains("published_identity("),
+            "the set must be built with dedup-key semantics, not normalize_mapped: \
+             a stored app deep link is rejected by the latter and silently omitted"
+        );
+        assert!(
+            branch.contains("&published,"),
+            "the published set must actually be PASSED to forget_locators"
+        );
     }
 
     /// The queue is loaded with `normalize_href` only, so it can still hold an
@@ -8162,6 +8214,16 @@ mod tests {
         // Invalid UTF-8: portable, unlike relying on chmod, which does nothing
         // when the test runs as root.
         fs::write(seen.path(), [0xff, 0xfe, 0xfd]).unwrap();
+        // The target must be findable in the OTHER store, or the second assertion
+        // below proves nothing: with nothing to find, a "treat unreadable as
+        // empty" mutant would leave `found == 0`, never reach `pending.add`, and
+        // never write the queue anyway. Present here, that mutant DOES queue and
+        // rewrite, which is exactly the half-applied repair being guarded against.
+        fs::write(
+            quarantine.path(),
+            "1788361034\t8\t0\tsite\tS3P5L26E\tfreenet:F86dYD2hJ8DLiiEDbuvPFGFBiE1JDevTZ8r3SnbCEg69/\n",
+        )
+        .unwrap();
 
         let err = forget_locators(
             &AppRegistryView::default(),
@@ -8306,6 +8368,47 @@ mod tests {
             "recheck_update publishes a re-derived volatility, so it must stamp the \
              classifier that produced it — otherwise the id says 2 while the answer \
              came from prompt 3"
+        );
+    }
+
+    /// A stored line with a TRAILING TAB still parses in `Quarantine::load`, which
+    /// trims its locator field. Without the matching trim here, `rsplit('\t')`
+    /// yields an empty string, the line matches no target, and it survives the
+    /// forget — leaving an exhausted quarantine entry that `run_once` answers by
+    /// writing the locator straight back into the seen file, silently undoing the
+    /// repair. The two parsers have to agree, and a hand-edited store is exactly
+    /// where they would not.
+    #[test]
+    fn forget_clears_a_quarantine_line_that_has_a_trailing_tab() {
+        let seen = TmpFile::new("forget-tab-seen");
+        let pending = TmpFile::new("forget-tab-pending");
+        let quarantine = TmpFile::new("forget-tab-quarantine");
+        let decisions = TmpFile::new("forget-tab-decisions");
+        let loc = "freenet:F86dYD2hJ8DLiiEDbuvPFGFBiE1JDevTZ8r3SnbCEg69/";
+        fs::write(seen.path(), format!("{loc}\n")).unwrap();
+        fs::write(
+            quarantine.path(),
+            format!("1788361034\t8\t0\tsite\tS3P5L26E\t{loc}\t\n"),
+        )
+        .unwrap();
+
+        forget_locators(
+            &AppRegistryView::default(),
+            &HashSet::new(),
+            &[loc.to_string()],
+            &ForgetPaths {
+                seen: seen.path(),
+                pending: pending.path(),
+                quarantine: quarantine.path(),
+                decisions: decisions.path(),
+            },
+        )
+        .expect("forget must succeed");
+
+        assert!(
+            !fs::read_to_string(quarantine.path()).unwrap().contains(loc),
+            "a trailing tab must not hide the locator from the forget, or the entry \
+             survives and re-blacklists the target on the next run"
         );
     }
 
