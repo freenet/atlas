@@ -2839,10 +2839,24 @@ fn main() -> Result<()> {
         // silently queues a re-describe that `atlasctl add` will refuse as a
         // duplicate for as long as the retry budget lasts.
         let published: HashSet<String> = match fetch_live_index(&cli) {
-            Ok(entries) => entries
-                .iter()
-                .filter_map(|e| published_identity(&e.locator, &registry))
-                .collect(),
+            Ok(entries) => {
+                // `atlasctl show --json` prints `[]` and exits 0 when the index
+                // reads back empty, so the SUCCESS path can disable this guard as
+                // completely as an error does, and without the error's warning. A
+                // live installation's index is never legitimately empty at the
+                // moment someone is running a repair.
+                if entries.is_empty() {
+                    eprintln!(
+                        "warn: the live index read back EMPTY, so an \
+                         already-published locator cannot be detected and refused. \
+                         If that is not expected, check the node before forgetting."
+                    );
+                }
+                entries
+                    .iter()
+                    .filter_map(|e| published_identity(&e.locator, &registry))
+                    .collect()
+            }
             Err(e) => {
                 eprintln!(
                     "warn: could not read the live index ({e:#}), so an \
@@ -7395,13 +7409,24 @@ fn forget_locators(
         pending.remove(&canon);
         for line in pending_body.lines() {
             let stored = stored_locator(line);
-            if stored != canon
+            // Remove by the key `Pending` ACTUALLY uses. `Pending::load` indexes
+            // every entry under `normalize_href(loc)`, not under the raw file
+            // text, so removing by the raw spelling silently misses each entry
+            // whose stored form normalize_href rewrites — a gateway URL, or a
+            // pre-`canonical_contract_path` fragment spelling. Those are exactly
+            // the shapes a legacy or hand-edited queue holds, which is the case
+            // this loop exists for, so keying it wrong made it a no-op precisely
+            // where it was needed.
+            let Some((key, _)) = normalize_href(stored) else {
+                continue;
+            };
+            if key != canon
                 && normalize_mapped(stored, registry)
                     .map(|(c, _)| c)
                     .as_deref()
                     == Some(canon.as_str())
             {
-                pending.remove(stored);
+                pending.remove(&key);
             }
         }
         if pending.add(&canon, kind, CURATED_AUTHOR) {
@@ -8166,7 +8191,12 @@ mod tests {
         let pending = TmpFile::new("forget-dup-pending");
         let quarantine = TmpFile::new("forget-dup-quarantine");
         let decisions = TmpFile::new("forget-dup-decisions");
-        let unmapped = format!("freenet:{DELTA}/#DWn4bEFfoo/");
+        // The GATEWAY spelling, deliberately. A `freenet:{DELTA}/#res/` fixture is
+        // already `normalize_href`-canonical, so it passes whether removal keys on
+        // the raw text or on the index key — it cannot tell the two apart. This
+        // one can: `normalize_href` rewrites it to the `freenet:` form, which is
+        // what `Pending::load` indexes it under, so removing by raw text misses.
+        let unmapped = format!("http://127.0.0.1:7509/v1/contract/web/{DELTA}/#DWn4bEFfoo/");
         fs::write(seen.path(), "app:delta/DWn4bEFfoo\n").unwrap();
         fs::write(
             pending.path(),
@@ -10612,6 +10642,12 @@ mod tests {
         for banned in [
             "read_to_string(decisions_path",
             "read_to_string(&decisions_path",
+            // `forget_locators` reaches the path through `ForgetPaths`, so the
+            // two needles above stopped covering it the moment that struct
+            // landed. A guard that silently stops covering the code it was
+            // written for is worse than no guard.
+            "read_to_string(paths.decisions",
+            "read_to_string(&paths.decisions",
             "load_seen(decisions_path",
         ] {
             assert!(
