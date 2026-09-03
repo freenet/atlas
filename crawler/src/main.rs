@@ -7177,9 +7177,25 @@ fn stored_locator(line: &str) -> &str {
 /// budget on an `atlasctl add` that can never succeed.
 fn published_identity(loc: &str, registry: &AppRegistryView) -> Option<String> {
     if let Some(rest) = loc.strip_prefix("app:") {
-        let mut parts = rest.splitn(3, '/');
-        let slug = parts.next().filter(|s| !s.is_empty())?;
-        let resource = parts.next().filter(|s| !s.is_empty())?;
+        let (slug, after) = rest.split_once('/')?;
+        if slug.is_empty() {
+            return None;
+        }
+        // The resource ends at the first `/`, `#` OR `?`. `to_uri` appends the
+        // PATH directly onto the resource with no separator, and `check_path`
+        // bans control characters, dot segments and absolute escapes but NOT `#`
+        // or `?` — so a published deep link legitimately reads
+        // `app:delta/<res>#frag`, and terminating on `/` alone would carry the
+        // fragment into the resource and miss the subject entirely, which is the
+        // hole this whole helper exists to close.
+        //
+        // The resource itself can contain none of the three: `Locator::check`
+        // requires it to be base58, and says so for exactly this reason.
+        let end = after.find(['/', '#', '?']).unwrap_or(after.len());
+        let resource = &after[..end];
+        if resource.is_empty() {
+            return None;
+        }
         return Some(format!("app:{slug}/{resource}"));
     }
     normalize_mapped(loc, registry).map(|(c, _)| c)
@@ -8440,6 +8456,44 @@ mod tests {
             "a trailing tab must not hide the locator from the forget, or the entry \
              survives and re-blacklists the target on the next run"
         );
+    }
+
+    /// `published_identity` must agree with `Locator::dedup_key`, which is what
+    /// `atlasctl add` actually refuses duplicates on. Disagreement is not
+    /// cosmetic: a published entry that does not land in the set lets `--forget`
+    /// requeue it, and every resulting attempt is billed and refused.
+    ///
+    /// `to_uri` appends an app locator's PATH straight onto its resource, and
+    /// `check_path` permits `#` and `?`, so a deep link can read
+    /// `app:delta/<res>#frag`. The resource itself is base58 and can hold none of
+    /// `/`, `#`, `?`, so terminating at the first of the three is exact.
+    #[test]
+    fn published_identity_matches_the_dedup_key_for_every_app_deep_link() {
+        let reg = delta_registry();
+        let expect = "app:delta/AmcVD92D3U";
+        for stored in [
+            "app:delta/AmcVD92D3U",
+            "app:delta/AmcVD92D3U/1/home",
+            "app:delta/AmcVD92D3U#frag",
+            "app:delta/AmcVD92D3U?q=1",
+            "app:delta/AmcVD92D3U#/deep/frag",
+        ] {
+            assert_eq!(
+                published_identity(stored, &reg).as_deref(),
+                Some(expect),
+                "{stored} is the same subject as {expect}; missing it lets --forget \
+                 requeue an already-published entry and burn billed attempts"
+            );
+        }
+        // A different resource under the same app stays a different subject.
+        assert_ne!(
+            published_identity("app:delta/Fe5jaFmRnp", &reg).as_deref(),
+            Some(expect)
+        );
+        // Malformed shapes yield nothing rather than a bogus identity.
+        assert_eq!(published_identity("app:delta/", &reg), None);
+        assert_eq!(published_identity("app:/AmcVD92D3U", &reg), None);
+        assert_eq!(published_identity("app:delta", &reg), None);
     }
 
     /// The hub arrives UNMAPPED (a specific page of a specific site), so its subject
