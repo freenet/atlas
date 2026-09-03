@@ -8234,10 +8234,16 @@ mod tests {
         .expect("forget must succeed");
 
         let body = fs::read_to_string(pending.path()).unwrap();
+        // The NORMALIZED form, not the raw fixture text. `Pending::load` stores the
+        // normalized key and `Pending::save` writes that back, so the raw gateway
+        // URL can never appear in the saved file whether or not the fix is present
+        // — asserting on it would pass unconditionally and be the first message an
+        // engineer reads on a regression.
+        let stale_key = format!("freenet:{DELTA}/#DWn4bEFfoo/");
         assert!(
-            !body.contains(&unmapped),
-            "the stale unmapped spelling must be dropped, or the next crawl \
-             publishes this site twice"
+            !body.contains(&stale_key),
+            "the stale spelling must be dropped, or the next crawl publishes this \
+             site twice"
         );
         assert_eq!(
             body.lines().filter(|l| l.contains("DWn4bEFfoo")).count(),
@@ -8463,32 +8469,40 @@ mod tests {
     /// cosmetic: a published entry that does not land in the set lets `--forget`
     /// requeue it, and every resulting attempt is billed and refused.
     ///
-    /// `to_uri` appends an app locator's PATH straight onto its resource, and
-    /// `check_path` permits `#` and `?`, so a deep link can read
-    /// `app:delta/<res>#frag`. The resource itself is base58 and can hold none of
-    /// `/`, `#`, `?`, so terminating at the first of the three is exact.
+    /// DIFFERENTIAL against `atlas_common` rather than against hand-written
+    /// expectations, using the same dev-dependency idiom as the path-guard test
+    /// below. Hardcoding the answers is what let the `#`/`?` case through in the
+    /// first place: the helper was written from a `/about` example instead of from
+    /// `parse_locator`, and a test written the same way agrees with the same
+    /// mistake. This one cannot, because the oracle is the real `dedup_key`.
     #[test]
-    fn published_identity_matches_the_dedup_key_for_every_app_deep_link() {
+    fn published_identity_matches_the_dedup_key_for_every_app_path_shape() {
         let reg = delta_registry();
-        let expect = "app:delta/AmcVD92D3U";
-        for stored in [
-            "app:delta/AmcVD92D3U",
-            "app:delta/AmcVD92D3U/1/home",
-            "app:delta/AmcVD92D3U#frag",
-            "app:delta/AmcVD92D3U?q=1",
-            "app:delta/AmcVD92D3U#/deep/frag",
-        ] {
+        // `to_uri` appends the PATH straight onto the resource, and `check_path`
+        // permits `#` and `?`, so all of these are structurally valid published
+        // locators for ONE subject.
+        for path in ["", "/", "/3/x", "/about", "#x", "#3/x", "?q=1", "?a=1#b"] {
+            let loc = atlas_common::Locator::AppResource {
+                app: "delta".to_string(),
+                resource: "AmcVD92D3U".to_string(),
+                path: path.to_string(),
+            };
+            assert!(
+                loc.check().is_ok(),
+                "fixture must be a structurally valid locator: path {path:?}"
+            );
             assert_eq!(
-                published_identity(stored, &reg).as_deref(),
-                Some(expect),
-                "{stored} is the same subject as {expect}; missing it lets --forget \
-                 requeue an already-published entry and burn billed attempts"
+                published_identity(&loc.to_uri(), &reg).as_deref(),
+                Some(loc.dedup_key().as_str()),
+                "published_identity disagrees with dedup_key for path {path:?}; \
+                 atlasctl would refuse the add as a duplicate while --forget \
+                 happily requeues it and burns billed attempts"
             );
         }
         // A different resource under the same app stays a different subject.
         assert_ne!(
             published_identity("app:delta/Fe5jaFmRnp", &reg).as_deref(),
-            Some(expect)
+            Some("app:delta/AmcVD92D3U")
         );
         // Malformed shapes yield nothing rather than a bogus identity.
         assert_eq!(published_identity("app:delta/", &reg), None);
@@ -10702,6 +10716,12 @@ mod tests {
             // written for is worse than no guard.
             "read_to_string(paths.decisions",
             "read_to_string(&paths.decisions",
+            // `forget_locators` reads its stores through the `read_store` wrapper,
+            // not `read_to_string`, so that is the form an editor working in that
+            // function would reach for and the needles above would miss it.
+            "read_store(paths.decisions",
+            "read_store(&paths.decisions",
+            "load_seen(paths.decisions",
             "load_seen(decisions_path",
         ] {
             assert!(
