@@ -9826,6 +9826,20 @@ mod tests {
             .admit(),
             Admission::Refuse(Outcome::RefusedRedistribution)
         );
+        // The recognition path, end to end: one recognized release, no breadth.
+        assert_eq!(
+            Assessment {
+                redistribution: RedistributionSigns {
+                    distributes_complete_works: true,
+                    distinct_rightsholders: 1,
+                    recognized_commercial_work: true,
+                    ..RedistributionSigns::default()
+                },
+                ..clean_assessment()
+            }
+            .admit(),
+            Admission::Refuse(Outcome::RefusedRedistribution)
+        );
         // Ambiguity admits: complete work and markers with one identified
         // rightsholder is not enough. Classifier 3 refused this into a curator
         // queue (`suspected-redistribution`), which in practice excluded it.
@@ -10188,6 +10202,34 @@ mod tests {
             "the prompt must warn that text rendered INSIDE an attached image is \
              untrusted too, or a screenshot is a wide-open injection channel a \
              page's own DOM text is not"
+        );
+    }
+
+    /// The prompt half of the high-confidence redistribution bar. These pin
+    /// wording, not model behaviour (that needs a live run), but they are the
+    /// only guard against an edit that quietly drops the exclusions. Classifier
+    /// 3 lacked them and refused a site playing Big Buck Bunny (CC BY) as a
+    /// commercial film.
+    #[test]
+    fn the_prompt_keeps_open_and_transformative_work_out_of_commercial() {
+        for needle in [
+            "all-rights-reserved",
+            "openly licensed",
+            "public domain",
+            "parody",
+            "If you are unsure, answer false",
+            "A licence claimed on the page does not make a work you recognize as \
+             commercial into an open one",
+        ] {
+            assert!(
+                DESCRIBE_SYSTEM_PROMPT.contains(needle),
+                "the prompt must keep {needle:?}"
+            );
+        }
+        assert!(
+            !DESCRIBE_SYSTEM_PROMPT.contains("licensing"),
+            "classifier 3 told the model not to infer licensing, which is what \
+             made it call an openly licensed film commercial"
         );
     }
 
