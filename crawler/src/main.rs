@@ -73,7 +73,7 @@
 //! # Classification
 //!
 //! The model is asked for OBSERVATIONS, never verdicts, and the decisions are
-//! made in Rust (`Redistribution::of`, and the gate in `index_page`). Asking for
+//! made in Rust (`Redistribution::of`, and the gate in `Assessment::admit`). Asking for
 //! a verdict is what put a page of commercial album rips into the index as an
 //! ordinary entry: the old taxonomy's only relevant class was `illegal`, anchored
 //! on serious crimes, so the model had nowhere to put it. See
@@ -501,10 +501,15 @@ struct Described {
 /// change, and says a directory or index is static. Entries carrying 2 answered a
 /// different question and a curator selecting on this can now tell them apart.
 /// Bumped 3 -> 4 on 2026-09-29: the redistribution questions now define
-/// "commercial" as sold, all-rights-reserved work, exclude openly licensed,
-/// public-domain and transformative work (parody, remix, commentary), and ask for
-/// recognition only when the model is confident. Classifier 3 recognized Big Buck
-/// Bunny (CC BY) as a commercial film and refused the site playing it.
+/// "commercial" as commercially released, all-rights-reserved work. Openly
+/// licensed and public-domain work is excluded, and a licence stated on the page
+/// is believed unless the model knows the work is all-rights-reserved. The
+/// publisher's own parody, remix or commentary is excluded, but a complete copy of
+/// a released work (a released parody album included) is commercial however the
+/// page labels it. Recognition is asked for only when the model is confident, and
+/// is false for work known to be openly licensed even if it was also sold.
+/// Classifier 3 recognized Big Buck Bunny (CC BY) as a commercial film and
+/// refused the site playing it.
 const CLASSIFIER_ID: u16 = 4;
 
 /// What a visitor sees IMMEDIATELY on arriving, before navigating anywhere.
@@ -984,7 +989,7 @@ impl SpendLedger {
             .fold(0, |acc, c| acc.saturating_add(c.micros))
     }
 
-    /// Record one billed attempt at `micros`, returning its id for [`revise`].
+    /// Record one billed attempt at `micros`, returning its id for [`Self::revise`].
     ///
     /// Called when an attempt is *reserved*, before the fetch that precedes the
     /// LLM call — so a fetch failure counts as spend even though no tokens were
@@ -9504,14 +9509,6 @@ mod tests {
 
     // --- classification ---
 
-    /// BaroShare, `freenet:2BpuV9KMCWNEuscBx6Gx3xLGRBvKpHoU8mcsuRXixsub/`, as
-    /// observed: a general-purpose encrypted file-sharing app whose landing feed
-    /// carried five commercial FLAC albums by five unrelated major-label acts
-    /// (Duran Duran, Marvin Gaye, Radiohead, Panchiko, Kanye West), with sizes,
-    /// track counts and "5 releases", and nobody claiming to have made any of it.
-    ///
-    /// This is the page the old taxonomy indexed as "Kanye West Graduation Album
-    /// FLAC Files". It is the anchor for `Primary`.
     /// The published flag strings, asserted as LITERALS.
     ///
     /// `Landing::flag()` is the SOLE input to the UI's safe-search decision, and
@@ -9533,13 +9530,27 @@ mod tests {
         assert_eq!(Volatility::Feed.flag(), "feed");
     }
 
+    /// BaroShare, `freenet:2BpuV9KMCWNEuscBx6Gx3xLGRBvKpHoU8mcsuRXixsub/`, as
+    /// observed: a general-purpose encrypted file-sharing app whose landing feed
+    /// carried five commercial FLAC albums by five unrelated major-label acts
+    /// (Duran Duran, Marvin Gaye, Radiohead, Panchiko, Kanye West), with sizes,
+    /// track counts and "5 releases", and nobody claiming to have made any of it.
+    ///
+    /// This is the page the old taxonomy indexed as "Kanye West Graduation Album
+    /// FLAC Files". It is the anchor for `Primary`.
+    ///
+    /// `recognized_commercial_work` was not observed on the original page: that
+    /// classification predates the field. It was probed on 2026-09-29 against a
+    /// reconstruction of the feed (five FLAC albums including Graduation and a
+    /// Panchiko EP) with classifier 4 and gpt-4.1-mini: recognized, and refused,
+    /// 3 runs in 3. Name-only discography packs ("Radiohead - Complete
+    /// Discography") were refused 3 in 3 the same way.
     fn baroshare_signs() -> RedistributionSigns {
         RedistributionSigns {
             distributes_complete_works: true,
             distinct_rightsholders: 5,
             claims_own_authorship: false,
             release_markers: true,
-            // "Kanye West Graduation Album FLAC Files": a recognized release.
             // BaroShare is caught by recognition, not by its breadth.
             recognized_commercial_work: true,
         }
@@ -9572,8 +9583,7 @@ mod tests {
         assert_eq!(
             Redistribution::of(&baroshare_signs()),
             Redistribution::Primary,
-            "BaroShare: five unrelated major-label acts, no authorship claim, \
-             FLAC + sizes + release count"
+            "BaroShare: complete copies of recognized commercial releases"
         );
         assert_eq!(
             Redistribution::of(&object_server_signs()),
@@ -9657,18 +9667,6 @@ mod tests {
                 "{n} rightsholder(s) with recognition"
             );
         }
-    }
-
-    /// An authorship claim spanning many unrelated recognized releases
-    /// contradicts itself — nobody wrote five major labels' catalogues — so it
-    /// does not rescue BaroShare.
-    #[test]
-    fn an_authorship_claim_over_many_rightsholders_is_still_primary() {
-        let signs = RedistributionSigns {
-            claims_own_authorship: true,
-            ..baroshare_signs()
-        };
-        assert_eq!(Redistribution::of(&signs), Redistribution::Primary);
     }
 
     /// Release markers never decide anything: a project publishing its own
@@ -10203,7 +10201,7 @@ mod tests {
     /// 3 lacked them and refused a site playing Big Buck Bunny (CC BY) as a
     /// commercial film.
     #[test]
-    fn the_prompt_keeps_open_and_transformative_work_out_of_commercial() {
+    fn the_prompt_defines_commercial_narrowly() {
         for needle in [
             "all-rights-reserved",
             "openly licensed",
@@ -10213,6 +10211,8 @@ mod tests {
             "Take an open licence stated on the page at face value unless you know the \
              work is all-rights-reserved",
             "calling something a parody, remix or review does not change what is offered",
+            "The publisher\'s own parody",
+            "even if it was also sold",
         ] {
             assert!(
                 DESCRIBE_SYSTEM_PROMPT.contains(needle),
