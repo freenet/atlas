@@ -8409,23 +8409,29 @@ fn visible_text(html: &str) -> String {
     // slices inside a multibyte UTF-8 char, and preserves non-ASCII text.
     let mut out = String::with_capacity(html.len() / 2);
     let mut depth: i32 = 0;
-    let mut in_script = false;
+    // The end tag that closes the script or style body being skipped, if any.
+    let mut skipping: Option<&str> = None;
     for (i, c) in html.char_indices() {
         // `html.get` returns None on a non-boundary or out-of-range, so no panic.
         let starts = |needle: &str| {
             html.get(i..i + needle.len())
                 .is_some_and(|s| s.eq_ignore_ascii_case(needle))
         };
-        if starts("<script") || starts("<style") {
-            in_script = true;
-        } else if starts("</script") || starts("</style") {
-            in_script = false;
+        match skipping {
+            // Only the MATCHING end tag closes the body, as in a browser: a script
+            // that injects CSS contains `</style>` inside a string, and ending the
+            // skip there leaked the rest of the script into the text.
+            Some(end) if starts(end) => skipping = None,
+            Some(_) => {}
+            None if starts("<script") => skipping = Some("</script"),
+            None if starts("<style") => skipping = Some("</style"),
+            None => {}
         }
         // Inside a script or style body nothing is a tag: a `<` there (`a<b`) used
         // to raise the depth with no `>` to lower it, and every word on the rest of
         // the page was lost. The opening tag is skipped with its body; the closing
-        // tag, seen with `in_script` already false, is counted as a tag.
-        if in_script {
+        // tag, seen with the skip already ended, is counted as a tag.
+        if skipping.is_some() {
             continue;
         }
         if c == '<' {
@@ -8437,7 +8443,7 @@ fn visible_text(html: &str) -> String {
             depth += 1;
         } else if c == '>' {
             depth = (depth - 1).max(0);
-        } else if depth == 0 && !in_script {
+        } else if depth == 0 {
             out.push(c);
         }
     }
@@ -11817,8 +11823,13 @@ mod tests {
                     <style>p > a { color: red }</style></head>\
                     <body><p>Hello <b>there</b> world</p>\
                     <script type=\"module\">for(let i=0;i<9;i++){}</script>\
-                    <p>after the script</p></body></html>";
-        assert_eq!(visible_text(html), "Hello there world after the script");
+                    <p>after the script</p>\
+                    <SCRIPT>el.innerHTML='<style>p{}</style>'; if(a<b){}</SCRIPT>\
+                    <p>and after the injector</p></body></html>";
+        assert_eq!(
+            visible_text(html),
+            "Hello there world after the script and after the injector"
+        );
     }
 
     #[test]

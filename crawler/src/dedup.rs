@@ -705,11 +705,12 @@ fn read_state(path: &Path) -> Result<String> {
 
 const SALT_HEADER: &str = "#salt\t";
 
-/// Version of the text pipeline (`words`, `shingle_hash`) the stored sketches
+/// Version of the text pipeline (`words`, `shingle_hash`, and `visible_text` in
+/// `main.rs`, which makes the whole-page text) the stored sketches
 /// were made with, written into the header next to the salt. A sketch made by a
 /// different pipeline loads cleanly and never matches anything, so a store from
 /// another version is refused, loudly, rather than silently switching detection
-/// off. BUMP THIS whenever `words` or `shingle_hash` changes.
+/// off. BUMP THIS whenever any of the three changes.
 const PIPELINE: u32 = 1;
 
 fn header(salt: u64) -> String {
