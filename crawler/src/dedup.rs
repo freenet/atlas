@@ -357,6 +357,15 @@ pub struct Fingerprint {
 }
 
 impl Fingerprint {
+    /// Whether this fingerprint was made this run (has the full hash lists), so
+    /// containment of another page in it is exact rather than estimated.
+    fn fresh(&self) -> bool {
+        [&self.sketch, &self.page_sketch]
+            .into_iter()
+            .flatten()
+            .any(|s| s.all.is_some())
+    }
+
     /// This fingerprint as it is stored: without the run-time full hash lists.
     pub fn stored(self) -> Self {
         Self {
@@ -637,15 +646,21 @@ pub fn report(entries: &[Stored]) -> String {
     let mut out = format!(
         "{compared} comparable pairs; {} would be duplicates (near-text jaccard >= \
          {NEAR_DUP_JACCARD}, or containment >= {CONTAINED} with jaccard >= \
-         {CONTAINED_MIN_JACCARD}; owner/archive unless jaccard < {OWNER_TEXT_FLOOR})\n",
+         {CONTAINED_MIN_JACCARD}; owner/archive unless jaccard < {OWNER_TEXT_FLOOR})\n\
+         A line marked ~ compares two STORED sketches, so its containment (c=) is an \
+         estimate that is poor for a short page inside a long one, and a containment \
+         verdict the crawler would reach live can be missing from it.\n",
         dups.len()
     );
+    // The later entry plays the candidate, so it decides whether `c` is exact.
+    let mark = |second: &Stored| if second.print.fresh() { " " } else { "~" };
     for (first, second, sig, text) in &dups {
         let t = text
             .map(|(j, c)| format!(" text j={j:.3} c={c:.3}"))
             .unwrap_or_default();
         out.push_str(&format!(
-            "  DUPLICATE {} of {} ({}){t}\n",
+            "{} DUPLICATE {} of {} ({}){t}\n",
+            mark(second),
             second.locator,
             first.locator,
             sig.reason()
@@ -658,16 +673,20 @@ pub fn report(entries: &[Stored]) -> String {
     ));
     for (j, c, a, b) in near.iter().take(REPORT_NEAREST) {
         out.push_str(&format!(
-            "  j={j:.3} c={c:.3}  {}  {}\n",
-            a.locator, b.locator
+            "{} j={j:.3} c={c:.3}  {}  {}\n",
+            mark(b),
+            a.locator,
+            b.locator
         ));
     }
     near.sort_by(|x, y| y.1.total_cmp(&x.1));
     out.push_str("closest 10 by containment:\n");
     for (j, c, a, b) in near.iter().take(10) {
         out.push_str(&format!(
-            "  c={c:.3} j={j:.3}  {}  {}\n",
-            a.locator, b.locator
+            "{} c={c:.3} j={j:.3}  {}  {}\n",
+            mark(b),
+            a.locator,
+            b.locator
         ));
     }
     out
