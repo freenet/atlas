@@ -24,7 +24,9 @@ use api::NodeClient;
 use freenet_migrate::{
     migrate_contract, FoldAllAck, Outcome, ProbeAnswer, ProbeIo, ProbeStateOps, SelectionPolicy,
 };
-use freenet_stdlib::prelude::{ContractCode, ContractInstanceId, ContractKey, Parameters};
+use freenet_stdlib::prelude::{
+    ContractCode, ContractContainer, ContractInstanceId, ContractKey, Parameters,
+};
 
 const CONTRACT_WASM: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/atlas_index_contract.wasm"));
 const DEFAULT_URL: &str = "ws://127.0.0.1:7509/v1/contract/command?encodingProtocol=native";
@@ -1104,29 +1106,38 @@ async fn contract_info(cli: &Cli, instance: &str) -> Result<()> {
         .map_err(|e| anyhow!("bad instance id: {e}"))?;
     let mut client = NodeClient::connect(&cli.node).await?;
     let (state, contract) = client.get_with_contract(id).await?;
-    // The container's key is deserialized separately from its params and code,
-    // so a matching id on the response says nothing about whether THESE params
-    // belong to it. Recompute the id from them, and report none of them unless
-    // it is the contract asked for: the crawler reads the params as the owner.
-    let contract = contract.filter(|c| {
-        let code = ContractCode::from(c.data().to_vec());
-        let ok = *ContractKey::from_params_and_code(c.params(), &code).id() == id;
-        if !ok {
+    let verified = contract.and_then(|c| {
+        let v = verified_params(&c, &id);
+        if v.is_none() {
             eprintln!("warn: the code and params returned do not hash to {id}; ignoring them");
         }
-        ok
+        v
     });
     let archive = web_container_archive(&state);
     let info = serde_json::json!({
         "instance": id.to_string(),
-        "code_hash": contract.as_ref().map(|c| c.key().code_hash().to_string()),
-        "params_hex": contract.as_ref().map(|c| hex_lower(c.params().as_ref())),
+        "code_hash": verified.as_ref().map(|(code_hash, _)| code_hash.clone()),
+        "params_hex": verified.as_ref().map(|(_, params)| hex_lower(params)),
         "state_len": state.len(),
         "archive_len": archive.map(<[u8]>::len),
         "archive_blake3": archive.map(|a| blake3::hash(a).to_hex().to_string()),
     });
     println!("{info}");
     Ok(())
+}
+
+/// The code hash and params of `c`, but only if they hash to `id`.
+///
+/// The container's key is deserialized separately from its params and code, so
+/// a matching id on the response says nothing about whether THESE params belong
+/// to it. The crawler reads the params as the site's owner, so they are
+/// recomputed into an id and reported only if it is the contract asked for. The
+/// code hash reported is the recomputed one too, never the one that came with
+/// the response.
+fn verified_params(c: &ContractContainer, id: &ContractInstanceId) -> Option<(String, Vec<u8>)> {
+    let code = ContractCode::from(c.data().to_vec());
+    let key = ContractKey::from_params_and_code(c.params(), &code);
+    (key.id() == id).then(|| (key.code_hash().to_string(), c.params().as_ref().to_vec()))
 }
 
 /// The web archive inside a web-container state, or `None` if `state` does not
@@ -2241,6 +2252,29 @@ mod tests {
         s.extend_from_slice(&(web.len() as u64).to_be_bytes());
         s.extend_from_slice(web);
         s
+    }
+
+    /// Params are reported as the owner only when they, with the code, hash to
+    /// the id asked for.
+    #[test]
+    fn contract_params_are_only_reported_when_they_hash_to_the_id() {
+        use freenet_stdlib::prelude::{ContractWasmAPIVersion, WrappedContract};
+        let code = b"\0asm some contract code".to_vec();
+        let container = |params: &[u8]| {
+            ContractContainer::from(ContractWasmAPIVersion::V1(WrappedContract::new(
+                std::sync::Arc::new(ContractCode::from(code.clone())),
+                Parameters::from(params.to_vec()),
+            )))
+        };
+        let (a, b) = ([1u8; 32], [2u8; 32]);
+        let id_a = *NodeClient::contract_key(&code, &a).id();
+        let (hash, params) = verified_params(&container(&a), &id_a).expect("matches");
+        assert_eq!(params, a.to_vec());
+        assert_eq!(
+            hash,
+            NodeClient::contract_key(&code, &a).code_hash().to_string()
+        );
+        assert_eq!(verified_params(&container(&b), &id_a), None);
     }
 
     /// The archive hash is the "same bytes as another site" signal, so the parse

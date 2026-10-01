@@ -14,12 +14,11 @@
 //!   duplicate, and so is a candidate that contains nearly all of an earlier
 //!   page plus some padding.
 //!
-//! Owner and archive are not trusted on their own when the TEXT says otherwise.
-//! If both pages have enough text to compare and it is clearly different (below
-//! [`OWNER_TEXT_FLOOR`]), they are not merged. That keeps two distinct sites one
-//! author publishes under one key apart, and it means a contract that merely
-//! names somebody else's public key as its parameters cannot get that person's
-//! real sites refused.
+//! Owner and archive are corroboration, not proof (see [`signal`]). A same-owner
+//! match also needs both pages' text to be comparable and not clearly different
+//! (at least [`OWNER_TEXT_FLOOR`]), because a contract can name anybody's public
+//! key as its parameters, and a key alone would let such a contract get its real
+//! owner's sites held. A same-archive match stops only at clearly different text.
 //!
 //! When a candidate matches an entry already in the live index, that entry is
 //! CANONICAL (first seen wins) and the candidate is held, not listed. This is
@@ -30,8 +29,19 @@
 //! with its canonical, so such a claim has both sides to work with.
 //!
 //! A held duplicate is not final. When its canonical leaves the live index (a
-//! curator removed a clone, a dead original was purged), it is queued again and
-//! judged afresh. See `HeldStore`.
+//! curator removed a clone, a dead original was purged), or after
+//! [`HELD_RECHECK_SECS`] in any case, it is queued again and judged afresh. See
+//! `HeldStore`.
+//!
+//! What a text comparison does NOT catch, stated so nobody reads more into it:
+//!
+//! - A change made in the DOM rather than the text: a letter hidden with CSS
+//!   inside every word, or a long hidden block, still reaches the text compared.
+//! - A clone padded to more than about twice the original (see
+//!   [`CONTAINED_MIN_JACCARD`]), which looks the same as an aggregator quoting it.
+//! - A clone that was indexed first. First seen is canonical.
+//!
+//! Those are what a publisher identity the site declares (step 2 of #68) is for.
 //!
 //! What is NEVER compared:
 //!
@@ -44,8 +54,7 @@
 //!   the app's and say nothing, but a copied Delta seller page is the cheapest
 //!   scam clone there is. Their text is the content region, without the app's
 //!   chrome (see `render.js`), so distinct sites on one host app do not look
-//!   alike. The false-positive margin for this was measured on the live index
-//!   (PR for #68).
+//!   alike. The PR for #68 reports the measured margin between them.
 //!
 //! This module is pure apart from its two small state files: no network, no
 //! subprocess. `main.rs` fetches the owner key and archive hash
@@ -84,9 +93,9 @@ pub const MIN_SHINGLES: usize = 30;
 
 /// Estimated Jaccard similarity at or above which two pages are the same content.
 ///
-/// Set from a measurement against the live index (see the PR for #68), which
-/// reports the closest pair of DISTINCT live entries. A scam clone that swaps one
-/// address in a few hundred words stays far above it.
+/// Checked against the live index with `--dedup-backfill`, whose report lists
+/// the closest pairs of DISTINCT live entries; the PR for #68 has the numbers. A
+/// scam clone that swaps one address in a few hundred words stays far above it.
 pub const NEAR_DUP_JACCARD: f64 = 0.80;
 
 /// A candidate that contains at least this fraction of an earlier page's
@@ -100,7 +109,8 @@ pub const CONTAINED: f64 = 0.90;
 
 /// The Jaccard floor for a containment match. 0.5 means the candidate is at most
 /// about twice the size of the page it contains, which keeps a directory or an
-/// aggregator that quotes a small site in full from being merged into it.
+/// aggregator that quotes a small site in full from being merged into it. The
+/// price, accepted: a clone padded beyond that is not caught.
 pub const CONTAINED_MIN_JACCARD: f64 = 0.50;
 
 /// Below this Jaccard, two pages with enough text to compare are different sites,
@@ -132,15 +142,27 @@ fn is_invisible(c: char) -> bool {
         | '\u{1D173}'..='\u{1D17A}' | '\u{E0000}'..='\u{E0FFF}')
 }
 
-/// The words a page says, as compared: invisible characters dropped, then folded
-/// to ASCII (`deunicode`), lowercased, split on anything not alphanumeric.
+/// The words a page says, as compared: invisible characters dropped, each
+/// character replaced by its Unicode confusable prototype (the UTS #39
+/// skeleton), what remains folded to ASCII (`deunicode`), lowercased, and split
+/// on anything not alphanumeric.
 ///
-/// Folding to ASCII is what makes a homoglyph swap useless: a Cyrillic `а`
-/// substituted for a Latin `a` folds back to `a`. Digits are kept, because an
+/// The skeleton is what makes a homoglyph swap useless: a Cyrillic `с`, `р` or
+/// `у` in place of a Latin `c`, `p` or `y` maps to the Latin letter. `deunicode`
+/// alone transliterates instead (Cyrillic `с` becomes `s`), which is why the
+/// skeleton comes first. Both sides of every comparison go through the same
+/// pipeline, so it does not matter that the skeleton also merges some genuinely
+/// different characters (`0` and `O`, `1` and `l`). Digits are kept, because an
 /// address or a price is part of what a page says.
+///
+/// What this cannot see is a change made in the DOM rather than the text: a
+/// letter inserted inside a word but hidden with CSS still reaches the rendered
+/// text. That residual is for step 2 of #68 (a publisher identity), not for a
+/// text comparison.
 fn words(text: &str) -> Vec<String> {
     let visible: String = text.chars().filter(|c| !is_invisible(*c)).collect();
-    deunicode::deunicode(&visible)
+    let skeleton: String = unicode_security::confusable_detection::skeleton(&visible).collect();
+    deunicode::deunicode(&skeleton)
         .split(|c: char| !c.is_ascii_alphanumeric())
         .filter(|w| !w.is_empty())
         .map(str::to_ascii_lowercase)
@@ -304,18 +326,45 @@ impl Fingerprint {
         }
     }
 
-    /// Best text similarity between two fingerprints: the highest Jaccard over
-    /// the comparable sketch pairs, and the highest containment of `canon` in
-    /// `self`. `None` if no pair has a sketch on both sides.
-    fn text_vs(&self, canon: &Self) -> Option<(f64, f64)> {
+    /// `(jaccard, containment of the canonical side in the candidate side)` for
+    /// each sketch pair that has a sketch on both sides, evaluated per pair so a
+    /// verdict never mixes one pair's Jaccard with another's containment.
+    ///
+    /// Three pairs: content with content, whole page with whole page, and the
+    /// candidate's whole page against the canonical's CONTENT. The last is the
+    /// clone shape when the canonical has no page sketch (an `app:` resource) and
+    /// the candidate hides the copy outside its own content region.
+    fn pairs(&self, canon: &Self) -> Vec<(f64, f64)> {
         [
             (&self.sketch, &canon.sketch),
             (&self.page_sketch, &canon.page_sketch),
+            (&self.page_sketch, &canon.sketch),
         ]
         .into_iter()
         .filter_map(|(a, b)| Some((a.as_ref()?, b.as_ref()?)))
         .map(|(cand, canon)| (cand.jaccard(canon), canon.contained_in(cand)))
-        .reduce(|x, y| (x.0.max(y.0), x.1.max(y.1)))
+        .collect()
+    }
+
+    /// The Jaccard that decides whether two pages are "clearly different": the
+    /// CONTENT pair when both have one, else the whole-page pair. Never the
+    /// maximum over pairs, because the whole page includes chrome, and two
+    /// distinct sites on one engine share their chrome.
+    fn content_jaccard(&self, canon: &Self) -> Option<f64> {
+        match (&self.sketch, &canon.sketch) {
+            (Some(a), Some(b)) => Some(a.jaccard(b)),
+            _ => match (&self.page_sketch, &canon.page_sketch) {
+                (Some(a), Some(b)) => Some(a.jaccard(b)),
+                _ => None,
+            },
+        }
+    }
+
+    /// Highest Jaccard and highest containment over the pairs, for the report.
+    fn best_text(&self, canon: &Self) -> Option<(f64, f64)> {
+        self.pairs(canon)
+            .into_iter()
+            .reduce(|x, y| (x.0.max(y.0), x.1.max(y.1)))
     }
 }
 
@@ -390,27 +439,62 @@ pub fn comparable(a: &str, b: &str) -> bool {
     true
 }
 
-/// The strongest signal on which candidate `cand` duplicates `canon`, if any.
-/// Assumes [`comparable`] has already said yes.
-pub fn signal(cand: &Fingerprint, canon: &Fingerprint) -> Option<Signal> {
-    let text = cand.text_vs(canon);
-    let clearly_different = matches!(text, Some((j, _)) if j < OWNER_TEXT_FLOOR);
-    if !clearly_different {
-        if cand.owner.is_some() && cand.owner == canon.owner {
+/// Whether two locators are served by one shared container (two resources of one
+/// app), so that owner and archive describe the app, not either site.
+fn share_container(a: &str, b: &str) -> bool {
+    matches!((app_resource_of(a), app_resource_of(b)), (Some((x, _)), Some((y, _))) if x == y)
+}
+
+/// The strongest signal on which candidate `cand` (at `cand_loc`) duplicates
+/// `canon` (at `canon_loc`), if any. Assumes [`comparable`] has already said yes.
+///
+/// Owner and archive are corroborating signals, not proofs:
+///
+/// - SAME OWNER also needs the text to agree: both pages have text, and it is
+///   not clearly different. A contract can name anyone's public key as its
+///   params, so a key alone would let an impostor with no text get every later
+///   site of that key's real owner held.
+/// - SAME ARCHIVE only needs the text not to disagree, because identical bytes
+///   cannot be produced without copying them. It still stops at clearly
+///   different text, which is what a generic shell container loading per-site
+///   content looks like.
+/// - Neither applies between resources of one app: their container is shared.
+pub fn signal(
+    cand_loc: &str,
+    cand: &Fingerprint,
+    canon_loc: &str,
+    canon: &Fingerprint,
+) -> Option<Signal> {
+    if !share_container(cand_loc, canon_loc) {
+        let cj = cand.content_jaccard(canon);
+        if cand.owner.is_some()
+            && cand.owner == canon.owner
+            && cj.is_some_and(|j| j >= OWNER_TEXT_FLOOR)
+        {
             return Some(Signal::SameOwner);
         }
-        if cand.archive.is_some() && cand.archive == canon.archive {
+        if cand.archive.is_some()
+            && cand.archive == canon.archive
+            && !cj.is_some_and(|j| j < OWNER_TEXT_FLOOR)
+        {
             return Some(Signal::SameArchive);
         }
     }
-    let (j, c) = text?;
-    if j >= NEAR_DUP_JACCARD {
+    let pairs = cand.pairs(canon);
+    let near = pairs
+        .iter()
+        .map(|&(j, _)| j)
+        .filter(|&j| j >= NEAR_DUP_JACCARD)
+        .reduce(f64::max);
+    if let Some(j) = near {
         return Some(Signal::NearText(j));
     }
-    if c >= CONTAINED && j >= CONTAINED_MIN_JACCARD {
-        return Some(Signal::Contains(c));
-    }
-    None
+    pairs
+        .iter()
+        .filter(|&&(j, c)| c >= CONTAINED && j >= CONTAINED_MIN_JACCARD)
+        .map(|&(_, c)| c)
+        .reduce(f64::max)
+        .map(Signal::Contains)
 }
 
 /// The live entry `candidate` duplicates, if any: the EARLIEST-indexed stored
@@ -429,7 +513,7 @@ pub fn find_canonical(
     store
         .iter()
         .filter(|s| live.contains(&s.locator) && comparable(loc, &s.locator))
-        .filter_map(|s| signal(candidate, &s.print).map(|sig| (s, sig)))
+        .filter_map(|s| signal(loc, candidate, &s.locator, &s.print).map(|sig| (s, sig)))
         .min_by(|(a, _), (b, _)| (a.first_seen, &a.locator).cmp(&(b.first_seen, &b.locator)))
         .map(|(s, sig)| Match {
             canonical: s.locator.clone(),
@@ -459,8 +543,8 @@ pub fn report(entries: &[Stored]) -> String {
             } else {
                 (b, a)
             };
-            let text = second.print.text_vs(&first.print);
-            match signal(&second.print, &first.print) {
+            let text = second.print.best_text(&first.print);
+            match signal(&second.locator, &second.print, &first.locator, &first.print) {
                 Some(sig) => dups.push((first, second, sig, text)),
                 None => {
                     if let Some((j, c)) = text {
@@ -591,10 +675,24 @@ impl Store {
     ///
     /// One `write_all` per call, so a crash cannot leave a line without its
     /// newline for the next append to run into.
+    ///
+    /// Refuses to append under a DIFFERENT salt's header (another process created
+    /// the file meanwhile): those lines would load cleanly and never match.
     pub fn record(&mut self, path: &Path, s: Stored) -> Result<()> {
         let mut out = String::new();
-        if read_state(path)?.trim().is_empty() {
-            out.push_str(&format!("{SALT_HEADER}{:016x}\n", self.salt));
+        match read_state(path)?.lines().find(|l| !l.trim().is_empty()) {
+            None => out.push_str(&format!("{SALT_HEADER}{:016x}\n", self.salt)),
+            Some(first) => {
+                let theirs = first
+                    .strip_prefix(SALT_HEADER)
+                    .and_then(|h| u64::from_str_radix(h.trim(), 16).ok());
+                if theirs != Some(self.salt) {
+                    bail!(
+                        "{} was written under a different salt; not appending",
+                        path.display()
+                    );
+                }
+            }
         }
         out.push_str(&format_line(&s));
         out.push('\n');
@@ -666,24 +764,44 @@ fn parse_line(line: &str) -> Option<Stored> {
     })
 }
 
+/// How long a duplicate stays held before it is judged again even though its
+/// canonical is still live.
+///
+/// A verdict about a page's TEXT goes stale when the page changes. A site held
+/// while it was still an unedited template, or the placeholder copy an author
+/// put up before writing their own, must not stay held for as long as the page
+/// it matched lives. Re-judging costs a render and a contract GET, never tokens
+/// (a duplicate is decided before the describer), so a month is cheap.
+pub const HELD_RECHECK_SECS: u64 = 30 * 86_400;
+
+/// Upper bound on the held list. One clone contract can be posted under any
+/// number of paths, each of which is held separately, and an unbounded list is
+/// a disk- and time-filling bug. Over the bound the OLDEST entry is dropped,
+/// which only means it can be discovered and judged again.
+pub const MAX_HELD: usize = 5_000;
+
 /// A candidate refused as a duplicate, held until its canonical leaves the live
-/// index.
+/// index or [`HELD_RECHECK_SECS`] pass.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Held {
     pub canonical: String,
     /// Who posted it, so it rejoins the queue under its original author's share.
     pub author: String,
+    /// When it was held (unix seconds).
+    pub at: u64,
     pub locator: String,
 }
 
 /// The held duplicates: `crawler-duplicates.txt`, one
-/// `canonical \t author \t locator` line each.
+/// `canonical \t author \t held_at \t locator` line each.
 ///
 /// Why a duplicate is HELD rather than marked seen: `crawler-seen.txt` is
-/// terminal, and a duplicate verdict is only as good as its canonical. If a clone
-/// was indexed first and the real site was refused against it, removing the
-/// clone must let the real site back in, and nothing re-reads the seen file for
-/// that. Each run re-queues every held locator whose canonical is no longer live.
+/// terminal, and a duplicate verdict is only as good as its canonical and as
+/// current as the text it compared. If a clone was indexed first and the real
+/// site was refused against it, removing the clone must let the real site back
+/// in, and nothing re-reads the seen file for that. So every run re-queues each
+/// held locator whose canonical is no longer live, or that has been held for
+/// [`HELD_RECHECK_SECS`].
 pub struct HeldStore {
     pub entries: Vec<Held>,
 }
@@ -691,19 +809,31 @@ pub struct HeldStore {
 impl HeldStore {
     pub fn load(path: &Path) -> Result<Self> {
         let body = read_state(path)?;
+        let mut at: HashMap<String, usize> = HashMap::new();
         let mut entries: Vec<Held> = Vec::new();
         for line in body.lines().filter(|l| !l.trim().is_empty()) {
             let f: Vec<&str> = line.split('\t').collect();
-            let [canonical, author, locator] = f[..] else {
+            let [canonical, author, held_at, locator] = f[..] else {
                 eprintln!("warn: skipping malformed line in {}", path.display());
                 continue;
             };
-            entries.retain(|h| h.locator != locator);
-            entries.push(Held {
+            let Ok(held_at) = held_at.parse() else {
+                eprintln!("warn: skipping malformed line in {}", path.display());
+                continue;
+            };
+            let h = Held {
                 canonical: canonical.to_string(),
                 author: author.to_string(),
+                at: held_at,
                 locator: locator.to_string(),
-            });
+            };
+            match at.get(locator) {
+                Some(&i) => entries[i] = h,
+                None => {
+                    at.insert(locator.to_string(), entries.len());
+                    entries.push(h);
+                }
+            }
         }
         Ok(Self { entries })
     }
@@ -716,7 +846,7 @@ impl HeldStore {
                 // An author id is taken from room data: strip what would forge a
                 // column or a line.
                 let author = h.author.replace(['\t', '\n', '\r'], " ");
-                format!("{}\t{author}\t{}\n", h.canonical, h.locator)
+                format!("{}\t{author}\t{}\t{}\n", h.canonical, h.at, h.locator)
             })
             .collect();
         fs::write(tmp, body).with_context(|| format!("writing {}", tmp.display()))?;
@@ -724,16 +854,27 @@ impl HeldStore {
     }
 
     /// Hold (or re-hold) `h`, replacing any earlier entry for its locator.
-    pub fn hold(&mut self, h: Held) {
+    /// Returns the entries dropped to stay within [`MAX_HELD`], oldest first.
+    pub fn hold(&mut self, h: Held) -> Vec<Held> {
         self.entries.retain(|e| e.locator != h.locator);
         self.entries.push(h);
+        let mut dropped = Vec::new();
+        if self.entries.len() > MAX_HELD {
+            self.entries.sort_by_key(|e| e.at);
+            let excess = self.entries.len() - MAX_HELD;
+            dropped = self.entries.drain(..excess).collect();
+        }
+        dropped
     }
 
-    /// Remove and return every entry whose canonical is not in `live`.
-    pub fn release(&mut self, live: &HashSet<String>) -> Vec<Held> {
+    /// Remove and return every entry whose canonical is not in `live`, or that
+    /// has been held for [`HELD_RECHECK_SECS`].
+    pub fn release(&mut self, live: &HashSet<String>, now: u64) -> Vec<Held> {
         let (gone, kept) = std::mem::take(&mut self.entries)
             .into_iter()
-            .partition(|h| !live.contains(&h.canonical));
+            .partition(|h| {
+                !live.contains(&h.canonical) || now.saturating_sub(h.at) >= HELD_RECHECK_SECS
+            });
         self.entries = kept;
         gone
     }
@@ -750,6 +891,7 @@ mod tests {
     use super::*;
 
     const SALT: u64 = 0x5eed;
+    const GOLDEN_SALTED: u64 = 0xe814_5495_2b96_7bf4;
 
     /// A few hundred words of prose, standing in for a seller page.
     fn seller_page(address: &str) -> String {
@@ -891,6 +1033,47 @@ mod tests {
         assert_eq!(sk(&disguised).jaccard(&sk(&orig)), 1.0);
     }
 
+    /// The lookalikes `deunicode` alone transliterates to a DIFFERENT letter.
+    #[test]
+    fn confusables_fold_to_the_letter_they_imitate() {
+        let orig = seller_page("addr");
+        let disguised: String = orig
+            .chars()
+            .map(|c| match c {
+                'c' => 'с', // Cyrillic es
+                'p' => 'р', // Cyrillic er
+                'y' => 'у', // Cyrillic u
+                'x' => 'х', // Cyrillic ha
+                c => c,
+            })
+            .collect();
+        assert_ne!(disguised, orig);
+        assert_eq!(sk(&disguised).jaccard(&sk(&orig)), 1.0);
+    }
+
+    /// Invisible characters that `deunicode` would turn into a space or a
+    /// placeholder rather than drop, inside every word.
+    #[test]
+    fn invisible_characters_inside_words_are_dropped() {
+        let orig = seller_page("addr");
+        let disguised: String = orig
+            .split(' ')
+            .map(|w| {
+                let mut s = String::new();
+                for (i, c) in w.chars().enumerate() {
+                    if i == 1 {
+                        s.push('\u{200B}');
+                        s.push('\u{E0041}');
+                    }
+                    s.push(c);
+                }
+                s
+            })
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert_eq!(sk(&disguised).jaccard(&sk(&orig)), 1.0);
+    }
+
     #[test]
     fn the_threshold_is_inclusive_and_exact_below_k() {
         // 94 words = 90 shingles each. Offset 10 shares 80 of a 100-shingle union:
@@ -930,29 +1113,70 @@ mod tests {
              troubleshooting section covers NAT, clock skew and running out of \
              file descriptors."
         );
-        assert_eq!(signal(&fp_text(&a), &fp_text(&b)), None);
+        assert_eq!(signal(B, &fp_text(&a), A, &fp_text(&b)), None);
     }
 
     #[test]
-    fn same_owner_merges_unless_the_text_is_clearly_different() {
-        let owner = Some("ab".repeat(32));
-        let with = |t: Option<&str>| Fingerprint {
-            owner: owner.clone(),
+    fn same_owner_needs_the_text_to_agree() {
+        let with = |owner: &str, t: Option<&str>| Fingerprint {
+            owner: Some(owner.repeat(32)),
             sketch: t.and_then(|t| Sketch::of(t, SALT)),
             ..Default::default()
         };
         let page = seller_page("x");
-        // A republish of the same site, and one where the text is unknown.
+        // A republish of the same site.
         assert_eq!(
-            signal(&with(Some(&page)), &with(Some(&page))),
+            signal(B, &with("ab", Some(&page)), A, &with("ab", Some(&page))),
             Some(Signal::SameOwner)
         );
+        // An impostor that names the owner's key but has no text to compare
+        // cannot get the owner's real site held.
         assert_eq!(
-            signal(&with(None), &with(Some(&page))),
-            Some(Signal::SameOwner)
+            signal(B, &with("ab", Some(&page)), A, &with("ab", None)),
+            None
+        );
+        assert_eq!(
+            signal(B, &with("ab", None), A, &with("ab", Some(&page))),
+            None
         );
         // A different site under the same key is not merged.
-        assert_eq!(signal(&with(Some(&run(0, 300))), &with(Some(&page))), None);
+        assert_eq!(
+            signal(
+                B,
+                &with("ab", Some(&run(0, 300))),
+                A,
+                &with("ab", Some(&page))
+            ),
+            None
+        );
+        // What the owner signal adds over text alone: J about 0.5 is not a text
+        // match, but with the same owner it is the same publisher's site.
+        let (x, y) = (run(0, 104), run(33, 104));
+        assert_eq!(
+            signal(B, &with("ab", Some(&x)), A, &with("ab", Some(&y))),
+            Some(Signal::SameOwner)
+        );
+        assert_eq!(
+            signal(B, &with("ab", Some(&x)), A, &with("cd", Some(&y))),
+            None
+        );
+    }
+
+    #[test]
+    fn owner_and_archive_say_nothing_between_resources_of_one_app() {
+        let shared = Fingerprint {
+            owner: Some("ab".repeat(32)),
+            archive: Some("11".repeat(32)),
+            sketch: Some(sk(&run(0, 104))),
+            page_sketch: None,
+        };
+        let other = Fingerprint {
+            sketch: Some(sk(&run(33, 104))),
+            ..shared.clone()
+        };
+        let (d1, d2) = ("app:delta/AWPjDQdKey", "app:delta/9CiJipmep5");
+        assert_eq!(signal(d2, &other, d1, &shared), None);
+        assert_eq!(signal(B, &other, A, &shared), Some(Signal::SameOwner));
     }
 
     #[test]
@@ -965,11 +1189,14 @@ mod tests {
         };
         let page = seller_page("x");
         assert_eq!(
-            signal(&with("bb", &page), &with("aa", &page)),
+            signal(B, &with("bb", &page), A, &with("aa", &page)),
             Some(Signal::SameArchive)
         );
         // A generic container shell that loads different content per site.
-        assert_eq!(signal(&with("bb", &run(0, 300)), &with("aa", &page)), None);
+        assert_eq!(
+            signal(B, &with("bb", &run(0, 300)), A, &with("aa", &page)),
+            None
+        );
     }
 
     #[test]
@@ -989,10 +1216,40 @@ mod tests {
         assert!(find_canonical(B, &clone, &[stored(A, 1, orig)], &live(&[A])).is_some());
     }
 
+    /// The canonical is an app resource, which has a content sketch only, and the
+    /// clone is a contract of its own that hides the copy outside its content
+    /// region. Only the cross pair sees it.
+    #[test]
+    fn a_decoy_clone_of_an_app_resource_is_caught_by_the_cross_pair() {
+        let orig = fp_text(&seller_page("bc1qreal"));
+        let clone = Fingerprint {
+            sketch: Sketch::of(&run(0, 60), SALT),
+            page_sketch: Sketch::of(&format!("{} {}", run(0, 60), seller_page("bc1qscam")), SALT),
+            ..Default::default()
+        };
+        let canon = "app:delta/AWPjDQdKey";
+        assert!(find_canonical(B, &clone, &[stored(canon, 1, orig)], &live(&[canon])).is_some());
+    }
+
+    #[test]
+    fn containment_needs_jaccard_one_half_and_is_exact_below_k() {
+        // 90 canonical shingles, all inside the candidate.
+        let canon = fp_text(&run(0, 94));
+        let store = [stored(A, 1, canon)];
+        // 180 shingles: J = 90/180 = 0.5 exactly.
+        let m = find_canonical(B, &fp_text(&run(0, 184)), &store, &live(&[A]));
+        assert_eq!(m.map(|m| m.signal), Some(Signal::Contains(1.0)));
+        // 181 shingles: J just under 0.5.
+        assert_eq!(
+            find_canonical(B, &fp_text(&run(0, 185)), &store, &live(&[A])),
+            None
+        );
+    }
+
     #[test]
     fn unknown_fields_never_match() {
         let empty = Fingerprint::default();
-        assert_eq!(signal(&empty, &empty), None);
+        assert_eq!(signal(B, &empty, A, &empty), None);
     }
 
     #[test]
@@ -1090,6 +1347,8 @@ mod tests {
         // Pinned values: these are persisted, so a change to the tokenizer or
         // the hash silently breaks every stored sketch.
         assert_eq!(shingle_hash("a b c d e", 0), 0x2d79_2dac_f53d_be19);
+        // And at a nonzero salt, which pins WHERE the salt enters the hash.
+        assert_eq!(shingle_hash("a b c d e", 0x5eed), GOLDEN_SALTED);
         assert_ne!(shingle_hash("a b c d e", 0), shingle_hash("a b c d e", 1));
         assert_eq!(words("Ｈéllo,\u{200B}Wörld"), vec!["hello", "world"]);
     }
@@ -1201,19 +1460,22 @@ mod tests {
         held.hold(Held {
             canonical: A.into(),
             author: "bob\tforged".into(),
+            at: 100,
             locator: B.into(),
         });
         held.hold(Held {
             canonical: B.into(),
             author: "carol".into(),
+            at: 100,
             locator: C.into(),
         });
         held.save(&path, &tmp).unwrap();
         let mut held = HeldStore::load(&path).unwrap();
         assert_eq!(held.entries.len(), 2);
         assert_eq!(held.entries[0].author, "bob forged");
+        assert_eq!(held.entries[0].at, 100);
         assert!(held.entries.iter().any(|h| h.locator == B));
-        let gone = held.release(&live(&[B]));
+        let gone = held.release(&live(&[B]), 101);
         assert_eq!(
             gone.iter().map(|h| h.locator.as_str()).collect::<Vec<_>>(),
             vec![B]
@@ -1221,6 +1483,64 @@ mod tests {
         assert_eq!(held.entries.len(), 1);
         assert!(held.remove(C));
         assert!(!held.remove(C));
+    }
+
+    #[test]
+    fn a_held_duplicate_is_judged_again_after_the_recheck_period() {
+        let mut held = HeldStore {
+            entries: Vec::new(),
+        };
+        held.hold(Held {
+            canonical: A.into(),
+            author: "x".into(),
+            at: 1_000,
+            locator: B.into(),
+        });
+        let l = live(&[A]);
+        assert!(held.release(&l, 1_000 + HELD_RECHECK_SECS - 1).is_empty());
+        assert_eq!(held.release(&l, 1_000 + HELD_RECHECK_SECS).len(), 1);
+    }
+
+    #[test]
+    fn the_held_list_is_bounded_dropping_the_oldest() {
+        let mut held = HeldStore {
+            entries: Vec::new(),
+        };
+        for i in 0..MAX_HELD {
+            assert!(held
+                .hold(Held {
+                    canonical: A.into(),
+                    author: "x".into(),
+                    at: 10 + i as u64,
+                    locator: format!("{B}{i}"),
+                })
+                .is_empty());
+        }
+        let dropped = held.hold(Held {
+            canonical: A.into(),
+            author: "x".into(),
+            at: 5,
+            locator: C.into(),
+        });
+        // The new entry is the oldest by `at`, so it is the one dropped.
+        assert_eq!(dropped.iter().map(|h| h.at).collect::<Vec<_>>(), vec![5]);
+        assert_eq!(held.entries.len(), MAX_HELD);
+    }
+
+    #[test]
+    fn record_refuses_to_append_under_another_salt() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("fp.txt");
+        let mut mine = Store::fresh();
+        let mut theirs = Store::fresh();
+        theirs.salt = mine.salt ^ 1;
+        theirs
+            .record(&path, stored(A, 1, Fingerprint::default()))
+            .unwrap();
+        assert!(mine
+            .record(&path, stored(B, 1, Fingerprint::default()))
+            .is_err());
+        assert_eq!(Store::load(&path).unwrap().entries.len(), 1);
     }
 
     #[test]

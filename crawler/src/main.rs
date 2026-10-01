@@ -92,10 +92,16 @@
 //!
 //! Before describing a candidate, `index_locator` compares it with the live
 //! index: same owner key, same archive bytes, or near-identical text (see
-//! `dedup.rs`). A duplicate is held in `crawler-duplicates.txt`, not listed and
-//! not marked seen, and costs no tokens. It is re-queued if the entry it
-//! duplicates leaves the index. To override a wrong merge, add the held locator
-//! to `--sources`.
+//! `dedup.rs`). A duplicate is held in `crawler-duplicates.txt` (which is where
+//! to look for what was held and against what), not listed and not marked seen,
+//! and costs no tokens. It is re-queued if the entry it duplicates leaves the
+//! index, and judged afresh after 30 days held in any case. To override a wrong
+//! merge, add the held locator to `--sources`; `--forget` does not apply to a
+//! held locator, because it is not a stored decision.
+//!
+//! The first entry INDEXED is canonical, which is first described, not first
+//! posted. What a text comparison cannot catch is listed in `dedup.rs`; those
+//! residuals are what a publisher identity (#68, step 2) is for.
 //!
 //! Deploying it needs three things, in this order, or it silently does less:
 //!
@@ -109,7 +115,9 @@
 //!      adding entries by hand, and now and then to refresh fingerprints of
 //!      sites whose content changed.
 //!   3. Read its report: it lists any pairs ALREADY in the index that the check
-//!      would call duplicates. It removes nothing.
+//!      would call duplicates. It removes nothing. Check its first line says a
+//!      non-zero number of entries have an owner key; zero means step 1 did not
+//!      take.
 
 use std::collections::{HashMap, HashSet};
 use std::fs;
@@ -2903,6 +2911,28 @@ fn main() -> Result<()> {
                 HashSet::new()
             }
         };
+        // A held duplicate is not a stored DECISION (it is not in the seen file),
+        // so forgetting it would only re-queue it to be held again. Say what does
+        // work instead of letting it read as a typo.
+        if let Ok(held) = dedup::HeldStore::load(&duplicates_path) {
+            for t in &cli.forget {
+                let canon = normalize_mapped(t.trim(), &registry).map(|(c, _)| c);
+                if let Some(h) = held
+                    .entries
+                    .iter()
+                    .find(|h| h.locator == t.trim() || Some(&h.locator) == canon.as_ref())
+                {
+                    eprintln!(
+                        "  {} is HELD as a duplicate of {} (see {}). --forget does not \
+                         override that; add the locator to --sources instead, or \
+                         `atlasctl remove` the entry it duplicates.",
+                        h.locator,
+                        h.canonical,
+                        duplicates_path.display()
+                    );
+                }
+            }
+        }
         return forget_locators(
             &registry,
             &published,
@@ -3148,7 +3178,7 @@ fn run_once(
     }
     // Held duplicates whose canonical has left the index get a fresh judgement.
     let mut dedup = DedupState::new(fingerprints_path, duplicates_path);
-    let released_dups = dedup.release(cli, |h| {
+    let released_dups = dedup.release(cli, now_secs(), |h| {
         normalize_href(&h.locator).is_some_and(|(canon, kind)| pending.add(&canon, kind, &h.author))
     });
     if released_dups > 0 {
@@ -3255,6 +3285,8 @@ fn run_once(
     if !pending.save() {
         anyhow::bail!("pending queue could not be persisted; quarantine left untouched");
     }
+    // Only now, with the released locators safely in the queue file.
+    dedup.save_held();
 
     // ---- Phase 2: description. Billed, rationed, and fair. ----
     let mut added = 0usize;
@@ -3264,6 +3296,7 @@ fn run_once(
     let mut retired_thin = 0usize;
     let mut baselines = AppBaselines::default();
     let mut duplicates = 0usize;
+    let mut same_owner = 0usize;
     let mut dedup_deferred = 0usize;
     let mut author_used: HashMap<String, usize> = HashMap::new();
     let mut authors_served: HashSet<String> = HashSet::new();
@@ -3327,14 +3360,19 @@ fn run_once(
             // A duplicate of a live entry: HELD, not seen, so it is judged
             // again if its canonical ever leaves the index. If the hold cannot be
             // written it stays queued and is simply re-checked next run.
-            Ok(Verdict::Duplicate(m)) => match dedup.hold(&loc, &author, &m.canonical) {
-                Ok(()) => {
-                    duplicates += 1;
-                    pending.remove(&loc);
-                    quarantine.forget(&loc);
+            Ok(Verdict::Duplicate(m)) => {
+                match dedup.hold(&loc, &author, &m.canonical, now_secs()) {
+                    Ok(()) => {
+                        duplicates += 1;
+                        if m.signal == dedup::Signal::SameOwner {
+                            same_owner += 1;
+                        }
+                        pending.remove(&loc);
+                        quarantine.forget(&loc);
+                    }
+                    Err(e) => eprintln!("  warn: could not hold {loc} ({e:#}); left queued"),
                 }
-                Err(e) => eprintln!("  warn: could not hold {loc} ({e:#}); left queued"),
-            },
+            }
             // Indexed, or deliberately refused by the content-safety gate.
             // Both are final: mark seen and stop tracking it.
             Ok(verdict) => {
@@ -3363,12 +3401,11 @@ fn run_once(
             // Duplicate detection that could not run this run (an unreadable live
             // index or state file) is the same kind of state and is deferred the
             // same way, counted apart so the summary names the right cause.
-            Err(e) if is_unresolvable_app(&e) || is_dedup_unavailable(&e) => {
+            Err(e) if defer_cause(&e).is_some() => {
                 eprintln!("  deferring {loc}: {e}");
-                if is_dedup_unavailable(&e) {
-                    dedup_deferred += 1;
-                } else {
-                    unresolvable += 1;
+                match defer_cause(&e) {
+                    Some(DeferCause::DedupUnavailable) => dedup_deferred += 1,
+                    _ => unresolvable += 1,
                 }
             }
             // A DETERMINISTIC refusal — too little text to describe or to rate,
@@ -3540,6 +3577,13 @@ fn run_once(
         eprintln!(
             "{duplicates} locator(s) held as duplicates of live entries (no tokens spent; \
              named individually above)"
+        );
+    }
+    if same_owner > 0 {
+        eprintln!(
+            "{same_owner} of them have the SAME OWNER as the listed entry: often the author \
+             republishing, in which case the listed copy may be the stale one. A curator \
+             can `atlasctl remove` it; the held one is then re-queued."
         );
     }
     if dedup_deferred > 0 {
@@ -3758,35 +3802,44 @@ fn contract_fingerprint(cli: &Cli, id: &str) -> Result<dedup::Fingerprint> {
     Ok(dedup::Fingerprint::from_contract_info(&json))
 }
 
+/// The two text sketches of a fetched page (#68): its CONTENT text (what the
+/// describer reads) and, for a contract of its own, its whole entry page.
+///
+/// An `app:` resource gets the content sketch only: its page chrome is the
+/// app's, shared by every other resource of that app, and would make distinct
+/// sites look alike.
+fn text_sketches(
+    loc: &str,
+    page: &Page,
+    salt: u64,
+) -> (Option<dedup::Sketch>, Option<dedup::Sketch>) {
+    let content = dedup::Sketch::of(&page.describable_text(), salt);
+    let whole = freenet_id(loc).and_then(|_| dedup::Sketch::of(&visible_text(&page.html), salt));
+    (content, whole)
+}
+
 /// A locator's duplicate-detection fingerprint (#68): owner key and archive hash
-/// for a contract of its own, and text sketches of what the describer reads and
-/// of the whole entry page.
+/// for a contract of its own (`atlasctl contract-info`), plus `text_sketches`.
 ///
-/// An `app:` resource gets the content sketch only. Its container is the app's,
-/// shared by every other resource of that app, so its owner, archive and page
-/// chrome say nothing about it.
-///
-/// A failed `contract-info` costs the fingerprint its owner and archive and is a
-/// warning, not an error. The text signals still run, and they are the ones that
-/// catch the scam clone; refusing to decide instead would leave a contract the
-/// node cannot re-GET (a large container that times out, a near-miss NotFound)
-/// cycling through quarantine for ever, where before this change it was indexed.
-fn site_fingerprint(cli: &Cli, loc: &str, page: &Page, salt: u64) -> dedup::Fingerprint {
-    let mut fp = match freenet_id(loc) {
-        Some(id) => {
-            let fp = contract_fingerprint(cli, id).unwrap_or_else(|e| {
+/// Also returns whether `contract-info` answered. When it does not, the
+/// fingerprint has no owner or archive and a warning is printed, but nothing
+/// fails: the text signals still run, and they are the ones that catch the scam
+/// clone. Refusing to decide would leave a contract the node cannot re-GET (a
+/// large container that times out, a near-miss NotFound) cycling through
+/// quarantine for ever, where before this change it was indexed.
+fn site_fingerprint(cli: &Cli, loc: &str, page: &Page, salt: u64) -> (dedup::Fingerprint, bool) {
+    let (mut fp, answered) = match freenet_id(loc) {
+        Some(id) => match contract_fingerprint(cli, id) {
+            Ok(fp) => (fp, true),
+            Err(e) => {
                 eprintln!("  warn: no owner/archive fingerprint for {loc}, text only: {e:#}");
-                dedup::Fingerprint::default()
-            });
-            dedup::Fingerprint {
-                page_sketch: dedup::Sketch::of(&visible_text(&page.html), salt),
-                ..fp
+                (dedup::Fingerprint::default(), false)
             }
-        }
-        None => dedup::Fingerprint::default(),
+        },
+        None => (dedup::Fingerprint::default(), true),
     };
-    fp.sketch = dedup::Sketch::of(&page.describable_text(), salt);
-    fp
+    (fp.sketch, fp.page_sketch) = text_sketches(loc, page, salt);
+    (fp, answered)
 }
 
 /// Whether a candidate is checked for duplicates at all.
@@ -3816,9 +3869,25 @@ impl std::fmt::Display for DedupUnavailable {
 
 impl std::error::Error for DedupUnavailable {}
 
-fn is_dedup_unavailable(e: &anyhow::Error) -> bool {
-    e.chain()
-        .any(|c| c.downcast_ref::<DedupUnavailable>().is_some())
+/// Why a failed attempt is deferred without charging a retry, if it is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DeferCause {
+    /// The locator's app is not in the registry yet.
+    UnresolvableApp,
+    /// Duplicate detection could not run this run.
+    DedupUnavailable,
+}
+
+fn defer_cause(e: &anyhow::Error) -> Option<DeferCause> {
+    e.chain().find_map(|c| {
+        if c.downcast_ref::<UnresolvableApp>().is_some() {
+            Some(DeferCause::UnresolvableApp)
+        } else if c.downcast_ref::<DedupUnavailable>().is_some() {
+            Some(DeferCause::DedupUnavailable)
+        } else {
+            None
+        }
+    })
 }
 
 /// What `index_locator` decided.
@@ -3829,6 +3898,26 @@ enum Verdict {
     Refused,
     /// Duplicates a live entry. Held, NOT final: see `dedup::HeldStore`.
     Duplicate(dedup::Match),
+}
+
+/// Read the live index's locators once per run, through `load`.
+///
+/// An EMPTY read is a failure, not an empty index: `atlasctl show --json`
+/// prints `[]` and exits 0 when the node reads the index back empty, and a live
+/// installation's index is never empty. A failure is remembered for the rest of
+/// the run, so one node blip costs one subprocess, not one per candidate.
+fn live_once(
+    cache: &mut Option<Result<HashSet<String>, String>>,
+    load: impl FnOnce() -> Result<Vec<String>>,
+) -> Result<&HashSet<String>, DedupUnavailable> {
+    cache
+        .get_or_insert_with(|| match load() {
+            Ok(v) if v.is_empty() => Err("the live index read back EMPTY".to_string()),
+            Ok(v) => Ok(v.into_iter().collect()),
+            Err(e) => Err(format!("could not read the live index: {e:#}")),
+        })
+        .as_ref()
+        .map_err(|e| DedupUnavailable(e.clone()))
 }
 
 /// Duplicate detection's per-run state: the fingerprint store, the held
@@ -3843,6 +3932,8 @@ struct DedupState {
     held_path: PathBuf,
     store: Result<dedup::Store, String>,
     held: Result<dedup::HeldStore, String>,
+    /// The held list changed and has not been written yet. See `save_held`.
+    held_dirty: bool,
     live: Option<Result<HashSet<String>, String>>,
     warned_unfingerprinted: bool,
 }
@@ -3854,6 +3945,7 @@ impl DedupState {
             held_path: held_path.to_path_buf(),
             store: dedup::Store::load(path).map_err(|e| format!("{e:#}")),
             held: dedup::HeldStore::load(held_path).map_err(|e| format!("{e:#}")),
+            held_dirty: false,
             live: None,
             warned_unfingerprinted: false,
         }
@@ -3864,23 +3956,20 @@ impl DedupState {
         self.store.as_ref().ok().map(|s| s.salt)
     }
 
-    /// The live index's locators, loaded once per run by `load`.
-    ///
-    /// An EMPTY read is a failure, not an empty index: `atlasctl show --json`
-    /// prints `[]` and exits 0 when the node reads the index back empty, and
-    /// a live installation's index is never empty. A failure is remembered for
-    /// the rest of the run, so one node blip costs one subprocess, not one per
-    /// candidate.
-    fn live_with(
-        &mut self,
-        load: impl FnOnce() -> Result<Vec<String>>,
-    ) -> Result<&HashSet<String>, DedupUnavailable> {
-        let live = self.live.get_or_insert_with(|| match load() {
-            Ok(v) if v.is_empty() => Err("the live index read back EMPTY".to_string()),
-            Ok(v) => Ok(v.into_iter().collect()),
-            Err(e) => Err(format!("could not read the live index: {e:#}")),
-        });
-        live.as_ref().map_err(|e| DedupUnavailable(e.clone()))
+    /// Fail fast, BEFORE a candidate is rendered, when this run already knows the
+    /// check cannot run: an unreadable state file, or a live-index read that
+    /// already failed. Saves a render and a contract GET per deferred candidate.
+    fn ready(&self) -> Result<(), DedupUnavailable> {
+        if let Err(e) = &self.store {
+            return Err(DedupUnavailable(format!("fingerprint store: {e}")));
+        }
+        if let Err(e) = &self.held {
+            return Err(DedupUnavailable(format!("held duplicates: {e}")));
+        }
+        if let Some(Err(e)) = &self.live {
+            return Err(DedupUnavailable(e.clone()));
+        }
+        Ok(())
     }
 
     fn check(
@@ -3905,14 +3994,12 @@ impl DedupState {
         fp: Option<&dedup::Fingerprint>,
         load: impl FnOnce() -> Result<Vec<String>>,
     ) -> Result<Option<dedup::Match>> {
-        if let Err(e) = &self.store {
-            return Err(DedupUnavailable(format!("fingerprint store: {e}")).into());
-        }
+        self.ready()?;
         let Some(fp) = fp else {
             return Err(DedupUnavailable("no fingerprint".into()).into());
         };
-        let live = self.live_with(load)?.clone();
-        let store = self.store.as_ref().expect("checked above");
+        let live = live_once(&mut self.live, load)?;
+        let store = self.store.as_ref().expect("checked by ready()");
         if !self.warned_unfingerprinted {
             self.warned_unfingerprinted = true;
             let known: HashSet<&str> = store.entries.iter().map(|s| s.locator.as_str()).collect();
@@ -3926,27 +4013,31 @@ impl DedupState {
                 );
             }
         }
-        Ok(dedup::find_canonical(loc, fp, &store.entries, &live))
+        Ok(dedup::find_canonical(loc, fp, &store.entries, live))
     }
 
-    /// Remember a locator that was just indexed, so a later copy of it (in this
-    /// run or any other) is caught, and drop it from the held list if the
-    /// operator overrode a duplicate verdict on it.
-    ///
-    /// A failed write is a warning, not an error: the entry is already published,
-    /// and the cost is that copies of it are not caught until the next
-    /// `--dedup-backfill`.
-    fn record(&mut self, loc: &str, print: dedup::Fingerprint, now: u64) {
+    /// `loc` was just indexed: it is live now, and if it was held as a duplicate
+    /// (the operator overrode the verdict by listing it in `--sources`) it is no
+    /// longer held. Called whether or not there is a fingerprint to record.
+    fn indexed(&mut self, loc: &str) {
         if let Some(Ok(live)) = &mut self.live {
             live.insert(loc.to_string());
         }
         if let Ok(held) = &mut self.held {
             if held.remove(loc) {
-                if let Err(e) = held.save(&self.held_path, &sibling_tmp(&self.held_path)) {
-                    eprintln!("warn: could not drop {loc} from the held duplicates ({e:#})");
-                }
+                self.held_dirty = true;
+                self.save_held();
             }
         }
+    }
+
+    /// Remember the fingerprint of a locator that was just indexed, so a later
+    /// copy of it (in this run or any other) is caught.
+    ///
+    /// A failed write is a warning, not an error: the entry is already published,
+    /// and the cost is that copies of it are not caught until the next
+    /// `--dedup-backfill`.
+    fn record(&mut self, loc: &str, print: dedup::Fingerprint, now: u64) {
         let stored = dedup::Stored {
             locator: loc.to_string(),
             first_seen: now,
@@ -3965,16 +4056,24 @@ impl DedupState {
     }
 
     /// Hold `loc` as a duplicate of `canonical`, persistently.
-    fn hold(&mut self, loc: &str, author: &str, canonical: &str) -> Result<()> {
+    fn hold(&mut self, loc: &str, author: &str, canonical: &str, now: u64) -> Result<()> {
         let held = self
             .held
             .as_mut()
             .map_err(|e| anyhow!("held duplicates unreadable: {e}"))?;
-        held.hold(dedup::Held {
+        for d in held.hold(dedup::Held {
             canonical: canonical.to_string(),
             author: author.to_string(),
+            at: now,
             locator: loc.to_string(),
-        });
+        }) {
+            eprintln!(
+                "  dropping the oldest held duplicate {} (over {} held); it can be \
+                 discovered and judged again",
+                d.locator,
+                dedup::MAX_HELD
+            );
+        }
         held.save(&self.held_path, &sibling_tmp(&self.held_path))
     }
 
@@ -3986,10 +4085,16 @@ impl DedupState {
         }
     }
 
-    /// Hand back every held duplicate whose canonical has left the live index,
-    /// for `requeue` to put back in the queue. One that `requeue` refuses (a full
-    /// queue) stays held and is offered again next run.
-    fn release(&mut self, cli: &Cli, requeue: impl FnMut(&dedup::Held) -> bool) -> usize {
+    /// Hand back every held duplicate that is due a fresh judgement (its
+    /// canonical has left the live index, or it has been held for
+    /// `dedup::HELD_RECHECK_SECS`) for `requeue` to put back in the queue. One
+    /// that `requeue` refuses (a full queue) stays held and is offered again
+    /// next run.
+    ///
+    /// Does NOT write the held list: the caller must call `save_held` only once
+    /// the pending queue holding the released locators is saved, or a failed
+    /// queue save would leave them in neither file.
+    fn release(&mut self, cli: &Cli, now: u64, requeue: impl FnMut(&dedup::Held) -> bool) -> usize {
         self.release_with(
             || {
                 Ok(fetch_live_index(cli)?
@@ -3997,6 +4102,7 @@ impl DedupState {
                     .map(|e| e.locator)
                     .collect())
             },
+            now,
             requeue,
         )
     }
@@ -4004,38 +4110,55 @@ impl DedupState {
     fn release_with(
         &mut self,
         load: impl FnOnce() -> Result<Vec<String>>,
+        now: u64,
         mut requeue: impl FnMut(&dedup::Held) -> bool,
     ) -> usize {
         if !matches!(&self.held, Ok(h) if !h.entries.is_empty()) {
             return 0;
         }
-        let live = match self.live_with(load) {
-            Ok(l) => l.clone(),
+        let live = match live_once(&mut self.live, load) {
+            Ok(l) => l,
             Err(e) => {
                 eprintln!("warn: held duplicates not re-checked: {e}");
                 return 0;
             }
         };
         let held = self.held.as_mut().expect("checked above");
-        let gone = held.release(&live);
         let mut released = 0;
-        for h in gone {
+        for h in held.release(live, now) {
+            let why = if live.contains(&h.canonical) {
+                "held for long enough to be judged again"
+            } else {
+                "the entry it duplicated has left the index"
+            };
             if requeue(&h) {
-                eprintln!(
-                    "re-queueing {}: the entry it duplicated ({}) has left the index",
-                    h.locator, h.canonical
-                );
+                eprintln!("re-queueing {}: {why} ({})", h.locator, h.canonical);
                 released += 1;
             } else {
+                eprintln!(
+                    "  {} is due a re-check but the queue refused it; still held",
+                    h.locator
+                );
                 held.hold(h);
             }
         }
         if released > 0 {
-            if let Err(e) = held.save(&self.held_path, &sibling_tmp(&self.held_path)) {
-                eprintln!("warn: could not save the held duplicates ({e:#})");
-            }
+            self.held_dirty = true;
         }
         released
+    }
+
+    /// Write the held list if it changed since it was last written.
+    fn save_held(&mut self) {
+        if !self.held_dirty {
+            return;
+        }
+        if let Ok(held) = &self.held {
+            match held.save(&self.held_path, &sibling_tmp(&self.held_path)) {
+                Ok(()) => self.held_dirty = false,
+                Err(e) => eprintln!("warn: could not save the held duplicates ({e:#})"),
+            }
+        }
     }
 }
 
@@ -4083,7 +4206,15 @@ fn run_dedup_backfill(cli: &Cli, path: &Path) -> Result<()> {
         live_locs.push(e.locator.clone());
         match fetch_site(cli, &client, &gw, &e.locator, &registry, &mut baselines) {
             Ok(page) => {
-                let print = site_fingerprint(cli, &e.locator, &page, salt);
+                let (mut print, answered) = site_fingerprint(cli, &e.locator, &page, salt);
+                // A transient contract-info failure must not erase an owner and
+                // archive an earlier backfill learned.
+                if !answered {
+                    if let Some(prev) = by_loc.get(&e.locator) {
+                        print.owner = prev.print.owner.clone();
+                        print.archive = prev.print.archive.clone();
+                    }
+                }
                 by_loc.insert(
                     e.locator.clone(),
                     dedup::Stored {
@@ -4130,16 +4261,22 @@ fn run_dedup_backfill(cli: &Cli, path: &Path) -> Result<()> {
         .collect();
     let count =
         |f: fn(&dedup::Fingerprint) -> bool| live_entries.iter().filter(|s| f(&s.print)).count();
+    let owners = count(|p| p.owner.is_some());
     println!(
         "fingerprinted {fresh} of {} live entries ({kept_old} kept from before, {missing} \
-         missing, {no_date} undated): {} with an owner key, {} with an archive hash, {} \
-         with a content sketch, {} with a page sketch",
+         missing, {no_date} undated): {owners} with an owner key, {} with an archive hash, \
+         {} with a content sketch, {} with a page sketch",
         live.len(),
-        count(|p| p.owner.is_some()),
         count(|p| p.archive.is_some()),
         count(|p| p.sketch.is_some()),
         count(|p| p.page_sketch.is_some()),
     );
+    if owners == 0 && live_locs.iter().any(|l| l.starts_with("freenet:")) {
+        println!(
+            "WARNING: no entry has an owner key. Is the installed atlasctl the one from \
+             this build (it needs `contract-info`)? Its warnings are printed above."
+        );
+    }
     print!("{}", dedup::report(&live_entries));
     Ok(())
 }
@@ -4955,11 +5092,14 @@ fn index_locator(
     dedup: &mut DedupState,
     now: u64,
 ) -> Result<Verdict> {
+    if !trusted {
+        dedup.ready()?;
+    }
     let page = fetch_site(cli, client, gw, loc, registry, baselines)?;
     let describable =
         page.text_for_classification().trim().chars().count() >= MIN_DESCRIBABLE_CHARS;
     let print = match (describable, dedup.salt()) {
-        (true, Some(salt)) => Some(site_fingerprint(cli, loc, &page, salt)),
+        (true, Some(salt)) => Some(site_fingerprint(cli, loc, &page, salt).0),
         _ => None,
     };
     if duplicate_check_applies(describable, trusted) {
@@ -4984,6 +5124,7 @@ fn index_locator(
     if !indexed {
         return Ok(Verdict::Refused);
     }
+    dedup.indexed(loc);
     if let Some(fp) = print {
         dedup.record(loc, fp, now);
     }
@@ -5707,12 +5848,6 @@ impl std::fmt::Display for UnresolvableApp {
 }
 
 impl std::error::Error for UnresolvableApp {}
-
-/// True if this error means "not resolvable yet", so the caller must not charge it.
-fn is_unresolvable_app(e: &anyhow::Error) -> bool {
-    e.chain()
-        .any(|c| c.downcast_ref::<UnresolvableApp>().is_some())
-}
 
 /// True if this error is a DETERMINISTIC refusal, so retrying it cannot help and
 /// charging it an attempt would eventually blacklist a page for good.
@@ -11674,6 +11809,7 @@ mod tests {
         };
         let orig = print_of(&d, &seller("bc1qreal"));
         assert_eq!(d.check_with(DA, Some(&orig), load).unwrap(), None);
+        d.indexed(DA);
         d.record(DA, orig, 10);
         let clone = print_of(&d, &seller("bc1qscam"));
         let m = d
@@ -11691,6 +11827,21 @@ mod tests {
         assert_eq!(m.map(|m| m.canonical), Some(DA.to_string()));
     }
 
+    fn is_dedup_deferral(e: &anyhow::Error) -> bool {
+        defer_cause(e) == Some(DeferCause::DedupUnavailable)
+    }
+
+    #[test]
+    fn deferral_causes_are_recognised_through_context_and_nothing_else_is() {
+        let bare: anyhow::Error = DedupUnavailable("x".into()).into();
+        assert_eq!(defer_cause(&bare), Some(DeferCause::DedupUnavailable));
+        let wrapped = Err::<(), _>(bare).context("outer").unwrap_err();
+        assert_eq!(defer_cause(&wrapped), Some(DeferCause::DedupUnavailable));
+        let app: anyhow::Error = UnresolvableApp.into();
+        assert_eq!(defer_cause(&app), Some(DeferCause::UnresolvableApp));
+        assert_eq!(defer_cause(&anyhow!("timeout")), None);
+    }
+
     /// Every way the check cannot run DEFERS (an error the caller does not charge
     /// a retry for). None of them may quietly pass the candidate.
     #[test]
@@ -11698,42 +11849,59 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut d = dedup_state(&dir);
         let p = print_of(&d, &seller("x"));
+        assert!(d.ready().is_ok());
         let e = d
             .check_with(DA, Some(&p), || Err(anyhow!("node down")))
             .unwrap_err();
-        assert!(is_dedup_unavailable(&e), "{e:#}");
-        // Cached: no second subprocess this run, same answer.
+        assert!(is_dedup_deferral(&e), "{e:#}");
+        // Cached: no second subprocess this run, same answer, and the next
+        // candidate is refused BEFORE it is rendered.
         let e = d
             .check_with(DA, Some(&p), || panic!("must not reload"))
             .unwrap_err();
-        assert!(is_dedup_unavailable(&e));
+        assert!(is_dedup_deferral(&e));
+        assert!(d.ready().is_err());
 
         let mut d = dedup_state(&dir);
         let e = d.check_with(DA, Some(&p), || Ok(vec![])).unwrap_err();
         assert!(
-            is_dedup_unavailable(&e),
+            is_dedup_deferral(&e),
             "an empty live index is not an answer"
         );
 
         std::fs::write(dir.path().join("fp.txt"), "no salt header\n").unwrap();
         let mut d = dedup_state(&dir);
         assert_eq!(d.salt(), None);
+        assert!(d.ready().is_err());
         let e = d.check_with(DA, None, || Ok(vec![DA.into()])).unwrap_err();
-        assert!(is_dedup_unavailable(&e), "unreadable store");
+        assert!(is_dedup_deferral(&e), "unreadable store");
+        std::fs::remove_file(dir.path().join("fp.txt")).unwrap();
+
+        // An unreadable HELD list defers too: otherwise every duplicate is
+        // detected, cannot be held, and is re-rendered on every run.
+        std::fs::create_dir(dir.path().join("held.txt")).unwrap();
+        let mut d = dedup_state(&dir);
+        assert!(d.ready().is_err());
+        let p = print_of(&d, &seller("x"));
+        let e = d
+            .check_with(DA, Some(&p), || Ok(vec![DA.into()]))
+            .unwrap_err();
+        assert!(is_dedup_deferral(&e), "unreadable held list");
     }
 
     #[test]
     fn a_held_duplicate_is_requeued_when_its_canonical_leaves_the_index() {
         let dir = tempfile::tempdir().unwrap();
         let mut d = dedup_state(&dir);
-        d.hold(DB, "alice", DA).unwrap();
-        d.hold(DC, "bob", DB).unwrap();
+        d.hold(DB, "alice", DA, 100).unwrap();
+        d.hold(DC, "bob", DB, 100).unwrap();
         assert_eq!(d.held_locators().len(), 2);
         // Next run: DA is gone, DB is live. The queue refuses nothing.
         let mut next = dedup_state(&dir);
         let mut got = Vec::new();
         let n = next.release_with(
             || Ok(vec![DB.to_string()]),
+            101,
             |h| {
                 got.push((h.locator.clone(), h.author.clone()));
                 true
@@ -11741,15 +11909,59 @@ mod tests {
         );
         assert_eq!(n, 1);
         assert_eq!(got, vec![(DB.to_string(), "alice".to_string())]);
+        // Not written until the caller has saved the queue holding DB.
+        assert_eq!(dedup_state(&dir).held_locators().len(), 2);
+        next.save_held();
         assert_eq!(dedup_state(&dir).held_locators(), vec![DC.to_string()]);
-        // A full queue keeps it held for next time.
+
+        // A full queue keeps it held, in memory too, so a later write this run
+        // does not lose it.
         let mut full = dedup_state(&dir);
-        assert_eq!(full.release_with(|| Ok(vec![DA.to_string()]), |_| false), 0);
-        assert_eq!(dedup_state(&dir).held_locators(), vec![DC.to_string()]);
-        // Indexing a held locator (the curated override) drops it.
+        assert_eq!(
+            full.release_with(|| Ok(vec![DA.to_string()]), 101, |_| false),
+            0
+        );
+        assert_eq!(full.held_locators(), vec![DC.to_string()]);
+        full.hold(DA, "x", DB, 102).unwrap();
+        assert_eq!(dedup_state(&dir).held_locators().len(), 2);
+
+        // A failed or empty live read releases NOTHING.
+        let mut down = dedup_state(&dir);
+        assert_eq!(
+            down.release_with(|| Err(anyhow!("down")), 101, |_| panic!()),
+            0
+        );
+        let mut empty = dedup_state(&dir);
+        assert_eq!(empty.release_with(|| Ok(vec![]), 101, |_| panic!()), 0);
+        assert_eq!(dedup_state(&dir).held_locators().len(), 2);
+
+        // Indexing a held locator (the curated override) drops it, whether or not
+        // a fingerprint could be recorded.
         let mut over = dedup_state(&dir);
-        over.record(DC, dedup::Fingerprint::default(), 1);
-        assert!(dedup_state(&dir).held_locators().is_empty());
+        over.indexed(DC);
+        assert_eq!(dedup_state(&dir).held_locators(), vec![DA.to_string()]);
+    }
+
+    #[test]
+    fn only_a_contract_of_its_own_gets_a_whole_page_sketch() {
+        let words: String = (0..80).map(|i| format!("word{i} ")).collect();
+        let page = Page {
+            html: format!("<html><body><nav>menu</nav><p>{words}</p></body></html>"),
+            text: words.clone(),
+            extra_pages: Vec::new(),
+            extra_texts: Vec::new(),
+            truncated: false,
+            rendered: true,
+            screenshot: None,
+        };
+        let (content, whole) = text_sketches(DA, &page, 7);
+        assert!(content.is_some() && whole.is_some());
+        let (content, whole) = text_sketches("app:delta/AWPjDQdKey", &page, 7);
+        assert!(content.is_some());
+        assert_eq!(
+            whole, None,
+            "an app's chrome is shared by all its resources"
+        );
     }
 
     /// The duplicate check (#68) must sit on the path that INDEXES a locator,
@@ -11760,8 +11972,9 @@ mod tests {
     /// `dedup.rs`. Each assertion names a mutation that otherwise passes the
     /// whole suite: deleting the check, moving it after `index_page` (which
     /// spends LLM tokens on a duplicate and has already published it), dropping
-    /// the decision-log record, or never recording a fingerprint (so nothing
-    /// indexed by the crawler is ever canonical).
+    /// the decision-log record, inverting the describable gate, or never
+    /// recording a fingerprint (so nothing indexed by the crawler is ever
+    /// canonical).
     #[test]
     fn the_indexing_path_checks_for_duplicates_before_describing() {
         let src = include_str!("main.rs");
@@ -11792,6 +12005,10 @@ mod tests {
             "a duplicate must be recorded in the decision log with its own token"
         );
         assert!(
+            body[check..describe].contains("bail!("),
+            "an unwritable decision log must leave the duplicate queued, not held unrecorded"
+        );
+        assert!(
             body[check..describe].contains("return Ok(Verdict::Duplicate(m));"),
             "a duplicate must not fall through to index_page"
         );
@@ -11800,18 +12017,85 @@ mod tests {
             .filter(|c| !c.is_whitespace())
             .collect();
         assert!(
+            flat.contains(
+                "letdescribable=page.text_for_classification().trim().chars().count()>=MIN_DESCRIBABLE_CHARS;"
+            ),
+            "describable must be the same floor index_page applies"
+        );
+        assert!(
             flat.contains("ifduplicate_check_applies(describable,trusted){"),
             "the check must be gated by duplicate_check_applies on the real \
              describable and trusted values, which is tested on its own"
         );
+        assert!(
+            flat.contains("if!trusted{dedup.ready()?;}letpage=fetch_site("),
+            "a run that already knows the check cannot run must defer BEFORE \
+             rendering, or every untrusted candidate costs a render for nothing"
+        );
         let refused = body[describe..]
             .find("return Ok(Verdict::Refused);")
             .expect("a refused page must return before being recorded");
+        let after = &body[describe + refused..];
         assert!(
-            body[describe + refused..].contains("dedup.record("),
-            "an INDEXED locator must be fingerprinted, or it can never be canonical, \
-             and a refused one must not be"
+            after.contains("dedup.indexed(loc);") && after.contains("dedup.record("),
+            "an INDEXED locator must be marked live and fingerprinted, or it can never \
+             be canonical, and a refused one must not be"
         );
+    }
+
+    /// The held-duplicate lifecycle in `run_once`, which needs a node to drive.
+    /// Each assertion is a mutation that passes every behavioural test: a
+    /// duplicate marked seen (never reconsidered), discovery re-queueing held
+    /// locators (a render per hub crawl), the operator's sources NOT exempt (no
+    /// override), or the held list written before the queue holding what it
+    /// released (a failed queue save loses them).
+    #[test]
+    fn run_once_holds_duplicates_and_releases_them_safely() {
+        let src = strip_comments(include_str!("main.rs"));
+        let at = src.find("fn run_once(").expect("run_once exists");
+        let end = src[at..].find("\nfn ").map(|e| at + e).unwrap_or(src.len());
+        let body = &src[at..end];
+        let dup = body
+            .find("Ok(Verdict::Duplicate(m)) => {")
+            .expect("a duplicate must have its own arm");
+        let flat: String = body[dup..].chars().filter(|c| !c.is_whitespace()).collect();
+        assert!(
+            flat.starts_with("Ok(Verdict::Duplicate(m))=>{matchdedup.hold("),
+            "a duplicate must be held"
+        );
+        let ok = body.find("Ok(verdict) => {").expect("the indexed arm");
+        assert!(
+            dup < ok,
+            "the duplicate arm must come first, or it is unreachable"
+        );
+        let arm = &body[dup..ok];
+        assert!(arm.contains("pending.remove(&loc)"));
+        assert!(
+            !arm.contains("seen.insert") && !arm.contains("append_seen"),
+            "a held duplicate must NOT be marked seen"
+        );
+        assert_eq!(
+            body.matches("&suppressed_discovered").count(),
+            2,
+            "hub and room discovery must both skip held duplicates"
+        );
+        assert!(
+            body.contains(
+                "if !suppressed.contains(&loc) && pending.add(&loc, kind, CURATED_AUTHOR)"
+            ),
+            "the operator's own sources must NOT be filtered by the held list"
+        );
+        let saved = body
+            .find("if !pending.save() {")
+            .expect("phase 1 saves the queue");
+        let held = body
+            .find("dedup.save_held();")
+            .expect("the held list is saved");
+        assert!(
+            saved < held,
+            "the held list must be written after the queue"
+        );
+        assert!(body.contains("Err(e) if defer_cause(&e).is_some() =>"));
     }
 
     #[test]
