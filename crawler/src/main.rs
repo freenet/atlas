@@ -8421,7 +8421,19 @@ fn visible_text(html: &str) -> String {
         } else if starts("</script") || starts("</style") {
             in_script = false;
         }
+        // Inside a script or style body nothing is a tag: a `<` there (`a<b`) used
+        // to raise the depth with no `>` to lower it, and every word on the rest of
+        // the page was lost. The opening tag is skipped with its body; the closing
+        // tag, seen with `in_script` already false, is counted as a tag.
+        if in_script {
+            continue;
+        }
         if c == '<' {
+            // A tag separates words: `</p><p>` between two paragraphs must not
+            // glue the last word of one to the first of the next.
+            if depth == 0 {
+                out.push(' ');
+            }
             depth += 1;
         } else if c == '>' {
             depth = (depth - 1).max(0);
@@ -11793,6 +11805,20 @@ mod tests {
             s.entries.contains_key("sub2"),
             "a well-formed line must still load"
         );
+    }
+
+    /// A `<` inside an inline script is not a tag. Counting it as one left the
+    /// stripper inside a "tag" for the rest of the page, so every word after the
+    /// first minified script vanished: on the live index only 8 of ~70 contract
+    /// pages kept enough text for a whole-page sketch.
+    #[test]
+    fn visible_text_survives_angle_brackets_inside_scripts() {
+        let html = "<html><head><script>if (a<b && c<d) { x = '<div>'; }</script>\
+                    <style>p > a { color: red }</style></head>\
+                    <body><p>Hello <b>there</b> world</p>\
+                    <script type=\"module\">for(let i=0;i<9;i++){}</script>\
+                    <p>after the script</p></body></html>";
+        assert_eq!(visible_text(html), "Hello there world after the script");
     }
 
     #[test]
