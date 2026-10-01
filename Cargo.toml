@@ -19,4 +19,4 @@ ed25519-dalek = { version = "2.1.1", default-features = false, features = ["allo
 blake3 = { version = "1.5.3", features = ["serde"] }
 bs58 = "0.5"
 freenet-stdlib = "0.8.3"
-rand = "0.8"
+rand = "0.9"
