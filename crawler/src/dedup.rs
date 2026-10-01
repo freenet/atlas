@@ -37,6 +37,8 @@
 //!
 //! - A change made in the DOM rather than the text: a letter hidden with CSS
 //!   inside every word, or a long hidden block, still reaches the text compared.
+//!   Hidden blocks can be closed in the renderer (issue #70); hidden letters
+//!   cannot.
 //! - A clone padded to more than about twice the original (see
 //!   [`CONTAINED_MIN_JACCARD`]), which looks the same as an aggregator quoting it.
 //! - A clone that was indexed first. First seen is canonical.
@@ -121,12 +123,35 @@ pub const CONTAINED_MIN_JACCARD: f64 = 0.50;
 pub const OWNER_TEXT_FLOOR: f64 = 0.30;
 
 /// A bottom-k sketch of a page's word-shingle set.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone)]
 pub struct Sketch {
     /// How many distinct shingles the page had, which containment needs.
     n: u64,
     /// The `SKETCH_K` smallest salted shingle hashes, ascending and distinct.
     mins: Vec<u64>,
+    /// EVERY shingle hash, ascending, for a sketch made this run from a page we
+    /// just fetched. Never stored (`decode` leaves it `None`).
+    ///
+    /// It makes containment of a stored canonical in a fresh candidate exact,
+    /// where the bottom-k estimate is worst: a short text inside a long page
+    /// shares almost none of the long page's smallest hashes, so the estimate is
+    /// usually 0 and occasionally far too high, by chance of the salt.
+    all: Option<Vec<u64>>,
+}
+
+/// Equality is the stored identity: `all` is a run-time cache of the same set.
+impl PartialEq for Sketch {
+    fn eq(&self, other: &Self) -> bool {
+        self.n == other.n && self.mins == other.mins
+    }
+}
+
+impl Eq for Sketch {}
+
+impl std::fmt::Debug for Sketch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Sketch(n={}, kept={})", self.n, self.mins.len())
+    }
 }
 
 /// Characters a reader cannot see. Stripped before splitting into words, or a
@@ -186,8 +211,18 @@ impl Sketch {
         hashes.sort_unstable();
         hashes.dedup();
         let n = hashes.len() as u64;
-        hashes.truncate(SKETCH_K);
-        Some(Self { n, mins: hashes })
+        let mins = hashes[..hashes.len().min(SKETCH_K)].to_vec();
+        Some(Self {
+            n,
+            mins,
+            all: Some(hashes),
+        })
+    }
+
+    /// Drop the full hash list, keeping what is stored.
+    pub fn without_full(mut self) -> Self {
+        self.all = None;
+        self
     }
 
     /// Whether this sketch has enough text ([`MIN_SHINGLES`]) to take part in a
@@ -229,10 +264,26 @@ impl Sketch {
         }
     }
 
-    /// Estimated fraction of `self`'s shingles that also appear in `other`.
+    /// Fraction of `self`'s shingles that also appear in `other`.
     ///
-    /// From the Jaccard estimate and the two set sizes: `|A∩B| = J(|A|+|B|)/(1+J)`.
+    /// When `other` was made this run (it has `all`): the fraction of `self`'s
+    /// kept hashes found among ALL of `other`'s. That is exact when `self` has at
+    /// most `SKETCH_K` shingles (it keeps them all), and otherwise an unbiased
+    /// estimate from a uniform sample of `SKETCH_K` of them. This is the case
+    /// that matters, a stored canonical against a fresh candidate.
+    ///
+    /// Between two stored sketches (the report), it falls back to the Jaccard
+    /// estimate and the set sizes, `|A∩B| = J(|A|+|B|)/(1+J)`, which is poor when
+    /// the sizes differ a lot.
     pub fn contained_in(&self, other: &Self) -> f64 {
+        if let Some(all) = &other.all {
+            let found = self
+                .mins
+                .iter()
+                .filter(|h| all.binary_search(h).is_ok())
+                .count();
+            return found as f64 / self.mins.len() as f64;
+        }
         let j = self.jaccard(other);
         let inter = j * (self.n + other.n) as f64 / (1.0 + j);
         (inter / self.n as f64).min(1.0)
@@ -261,7 +312,7 @@ impl Sketch {
             && mins.windows(2).all(|w| w[0] < w[1])
             && n >= mins.len() as u64
             && (mins.len() == SKETCH_K || n == mins.len() as u64);
-        ok.then_some(Self { n, mins })
+        ok.then_some(Self { n, mins, all: None })
     }
 }
 
@@ -306,6 +357,15 @@ pub struct Fingerprint {
 }
 
 impl Fingerprint {
+    /// This fingerprint as it is stored: without the run-time full hash lists.
+    pub fn stored(self) -> Self {
+        Self {
+            sketch: self.sketch.map(Sketch::without_full),
+            page_sketch: self.page_sketch.map(Sketch::without_full),
+            ..self
+        }
+    }
+
     /// Parse `atlasctl contract-info` output into the owner and archive fields.
     ///
     /// The owner is set only when the parameters are exactly 32 bytes AND the
@@ -716,7 +776,8 @@ impl Store {
     ///
     /// Refuses to append under a DIFFERENT salt's header (another process created
     /// the file meanwhile): those lines would load cleanly and never match.
-    pub fn record(&mut self, path: &Path, s: Stored) -> Result<()> {
+    pub fn record(&mut self, path: &Path, mut s: Stored) -> Result<()> {
+        s.print = s.print.stored();
         let mut out = String::new();
         match read_state(path)?.lines().find(|l| !l.trim().is_empty()) {
             None => out.push_str(&header(self.salt)),
@@ -1367,6 +1428,62 @@ mod tests {
         // Two short pages that happen to be identical are not a verdict.
         let short = fp_text("Enter your password to continue to the site");
         assert_eq!(signal(B, &short, A, &short), None);
+    }
+
+    /// The clone shapes that rest on containment must be caught under EVERY salt,
+    /// not under the one a test happens to pin: the salt is random per
+    /// installation, and an estimate that depends on it is a coin toss.
+    #[test]
+    fn containment_verdicts_do_not_depend_on_the_salt() {
+        let blurb = "Meadowbrook Farm heirloom seeds, shipped anywhere.";
+        let page = |addr: &str| format!("{blurb} {} {}", seller_page(addr), run(0, 2000));
+        for salt in 0..200u64 {
+            let s = |t: &str| Sketch::of(t, salt);
+            // Thin content region, whole-page copy.
+            let orig = Fingerprint {
+                sketch: s(blurb).map(Sketch::without_full),
+                page_sketch: s(&page("bc1qreal")).map(Sketch::without_full),
+                ..Default::default()
+            };
+            let clone = Fingerprint {
+                sketch: s(blurb),
+                page_sketch: s(&page("bc1qscam")),
+                ..Default::default()
+            };
+            assert!(
+                signal(B, &clone, A, &orig).is_some(),
+                "thin-content copy, salt {salt}"
+            );
+            // Decoy content region in front of a copy of an app resource.
+            let app = fp_text(&seller_page("bc1qreal"));
+            let app = Fingerprint {
+                sketch: app
+                    .sketch
+                    .map(|_| s(&seller_page("bc1qreal")).unwrap().without_full()),
+                ..app
+            };
+            let decoy = Fingerprint {
+                sketch: s(&run(5000, 60)),
+                page_sketch: s(&format!("{} {}", run(5000, 60), seller_page("bc1qscam"))),
+                ..Default::default()
+            };
+            assert!(
+                signal(B, &decoy, "app:delta/AWPjDQdKey", &app).is_some(),
+                "decoy clone, salt {salt}"
+            );
+            // Theme siblings sharing chrome, distinct thin content.
+            let sib = |start: usize| Fingerprint {
+                sketch: s(&run(start, 8)),
+                page_sketch: s(&format!("{} {}", run(0, 1500), run(start, 8))),
+                ..Default::default()
+            };
+            let stored_sib = sib(10_000).stored();
+            assert_eq!(
+                signal(B, &sib(20_000), A, &stored_sib),
+                None,
+                "theme, salt {salt}"
+            );
+        }
     }
 
     /// The canonical's content region is a short blurb (too short to decide on)
