@@ -24,7 +24,7 @@ use api::NodeClient;
 use freenet_migrate::{
     migrate_contract, FoldAllAck, Outcome, ProbeAnswer, ProbeIo, ProbeStateOps, SelectionPolicy,
 };
-use freenet_stdlib::prelude::{ContractInstanceId, Parameters};
+use freenet_stdlib::prelude::{ContractCode, ContractInstanceId, ContractKey, Parameters};
 
 const CONTRACT_WASM: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/atlas_index_contract.wasm"));
 const DEFAULT_URL: &str = "ws://127.0.0.1:7509/v1/contract/command?encodingProtocol=native";
@@ -1104,6 +1104,18 @@ async fn contract_info(cli: &Cli, instance: &str) -> Result<()> {
         .map_err(|e| anyhow!("bad instance id: {e}"))?;
     let mut client = NodeClient::connect(&cli.node).await?;
     let (state, contract) = client.get_with_contract(id).await?;
+    // The container's key is deserialized separately from its params and code,
+    // so a matching id on the response says nothing about whether THESE params
+    // belong to it. Recompute the id from them, and report none of them unless
+    // it is the contract asked for: the crawler reads the params as the owner.
+    let contract = contract.filter(|c| {
+        let code = ContractCode::from(c.data().to_vec());
+        let ok = *ContractKey::from_params_and_code(c.params(), &code).id() == id;
+        if !ok {
+            eprintln!("warn: the code and params returned do not hash to {id}; ignoring them");
+        }
+        ok
+    });
     let archive = web_container_archive(&state);
     let info = serde_json::json!({
         "instance": id.to_string(),

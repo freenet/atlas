@@ -122,6 +122,9 @@ impl NodeClient {
                 Ok((state.as_ref().to_vec(), contract))
             }
             HostResponse::ContractResponse(ContractResponse::NotFound { instance_id }) => {
+                if instance_id != want {
+                    bail!("NotFound response was for contract {instance_id}, not {want}");
+                }
                 bail!("contract {instance_id} not found")
             }
             other => Err(anyhow!("unexpected GET response: {other:?}")),
