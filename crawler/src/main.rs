@@ -2958,6 +2958,9 @@ fn main() -> Result<()> {
             .into_iter()
             .map(|e| e.locator)
             .collect();
+        if live.is_empty() {
+            bail!("the live index read back EMPTY; a report against it would read as clean");
+        }
         let entries: Vec<dedup::Stored> = store
             .entries
             .into_iter()
@@ -4245,11 +4248,12 @@ fn run_dedup_backfill(cli: &Cli, path: &Path) -> Result<()> {
                 // without the code, must not erase an owner and archive an
                 // earlier backfill learned.
                 if let Some(prev) = by_loc.get(&e.locator) {
-                    if !answered || print.owner.is_none() {
-                        print.owner = print.owner.or_else(|| prev.print.owner.clone());
-                    }
-                    if !answered || print.archive.is_none() {
-                        print.archive = print.archive.or_else(|| prev.print.archive.clone());
+                    // The owner cannot change for a fixed contract id.
+                    print.owner = print.owner.or_else(|| prev.print.owner.clone());
+                    // The archive can change with the state, so it is carried
+                    // forward only when this lookup did not answer at all.
+                    if !answered {
+                        print.archive = prev.print.archive.clone();
                     }
                 }
                 by_loc.insert(
@@ -4302,11 +4306,11 @@ fn run_dedup_backfill(cli: &Cli, path: &Path) -> Result<()> {
     println!(
         "fingerprinted {fresh} of {} live entries ({kept_old} kept from before, {missing} \
          missing, {no_date} undated): {owners} with an owner key, {} with an archive hash, \
-         {} with a content sketch, {} with a page sketch",
+         {} with a usable content sketch, {} with a usable page sketch",
         live.len(),
         count(|p| p.archive.is_some()),
-        count(|p| p.sketch.is_some()),
-        count(|p| p.page_sketch.is_some()),
+        count(|p| p.sketch.as_ref().is_some_and(dedup::Sketch::usable)),
+        count(|p| p.page_sketch.as_ref().is_some_and(dedup::Sketch::usable)),
     );
     if owners == 0 && live_locs.iter().any(|l| l.starts_with("freenet:")) {
         println!(

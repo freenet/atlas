@@ -84,11 +84,14 @@ pub const SHINGLE_WORDS: usize = 5;
 /// J = 0.8.
 pub const SKETCH_K: usize = 256;
 
-/// Fewer distinct shingles than this and the page carries no text signal at all.
+/// Fewer distinct shingles than this and a sketch cannot support a verdict on
+/// its own (see [`Sketch::usable`]).
 ///
 /// Below it, two unrelated pages that share a boilerplate sentence or two (a
 /// login prompt, a "loading" notice) could clear the threshold on that alone.
-/// The owner and archive signals still apply to such a page.
+/// A smaller sketch is still kept, because "is this short text contained in that
+/// page" stays meaningful and gates the whole-page pair (see
+/// `Fingerprint::pairs`). The owner and archive signals still apply.
 pub const MIN_SHINGLES: usize = 30;
 
 /// Estimated Jaccard similarity at or above which two pages are the same content.
@@ -170,8 +173,7 @@ fn words(text: &str) -> Vec<String> {
 }
 
 impl Sketch {
-    /// Sketch `text` under `salt`, or `None` if it has fewer than
-    /// [`MIN_SHINGLES`] distinct shingles and so cannot support a verdict.
+    /// Sketch `text` under `salt`, or `None` if it has no shingle at all.
     pub fn of(text: &str, salt: u64) -> Option<Self> {
         let words = words(text);
         if words.len() < SHINGLE_WORDS {
@@ -183,12 +185,15 @@ impl Sketch {
             .collect();
         hashes.sort_unstable();
         hashes.dedup();
-        if hashes.len() < MIN_SHINGLES {
-            return None;
-        }
         let n = hashes.len() as u64;
         hashes.truncate(SKETCH_K);
         Some(Self { n, mins: hashes })
+    }
+
+    /// Whether this sketch has enough text ([`MIN_SHINGLES`]) to take part in a
+    /// verdict, rather than only gate one.
+    pub fn usable(&self) -> bool {
+        self.n >= MIN_SHINGLES as u64
     }
 
     /// Estimated Jaccard similarity of the two underlying shingle sets.
@@ -340,17 +345,27 @@ impl Fingerprint {
     /// share a large nav and footer, so their whole pages can look alike while
     /// neither contains the other's content; a clone always contains it.
     fn pairs(&self, canon: &Self) -> Vec<(f64, f64)> {
-        let sim = |a: &Option<Sketch>, b: &Option<Sketch>| {
-            let (cand, canon) = (a.as_ref()?, b.as_ref()?);
+        let sim = |a: Option<&Sketch>, b: Option<&Sketch>| {
+            let (cand, canon) = (a?, b?);
             Some((cand.jaccard(canon), canon.contained_in(cand)))
         };
-        let cross = sim(&self.page_sketch, &canon.sketch);
-        let page = sim(&self.page_sketch, &canon.page_sketch)
-            .filter(|_| cross.is_some_and(|(_, c)| c >= CONTAINED));
-        [sim(&self.sketch, &canon.sketch), page, cross]
-            .into_iter()
-            .flatten()
-            .collect()
+        fn usable(x: &Option<Sketch>) -> Option<&Sketch> {
+            x.as_ref().filter(|s| s.usable())
+        }
+        // The gate reads the canonical's content however SHORT it is: a seller
+        // page whose `<main>` is a one-line blurb, with everything else beside
+        // it, still has that blurb inside any whole-page copy.
+        let gate = sim(self.page_sketch.as_ref(), canon.sketch.as_ref())
+            .is_some_and(|(_, c)| c >= CONTAINED);
+        let page = sim(usable(&self.page_sketch), usable(&canon.page_sketch)).filter(|_| gate);
+        [
+            sim(usable(&self.sketch), usable(&canon.sketch)),
+            page,
+            sim(usable(&self.page_sketch), usable(&canon.sketch)),
+        ]
+        .into_iter()
+        .flatten()
+        .collect()
     }
 
     /// The Jaccard that decides whether two pages are "clearly different": the
@@ -358,13 +373,11 @@ impl Fingerprint {
     /// maximum over pairs, because the whole page includes chrome, and two
     /// distinct sites on one engine share their chrome.
     fn content_jaccard(&self, canon: &Self) -> Option<f64> {
-        match (&self.sketch, &canon.sketch) {
-            (Some(a), Some(b)) => Some(a.jaccard(b)),
-            _ => match (&self.page_sketch, &canon.page_sketch) {
-                (Some(a), Some(b)) => Some(a.jaccard(b)),
-                _ => None,
-            },
-        }
+        let both = |a: &Option<Sketch>, b: &Option<Sketch>| {
+            let (a, b) = (a.as_ref()?, b.as_ref()?);
+            (a.usable() && b.usable()).then(|| a.jaccard(b))
+        };
+        both(&self.sketch, &canon.sketch).or_else(|| both(&self.page_sketch, &canon.page_sketch))
     }
 
     /// Highest Jaccard and highest containment over the pairs, for the report.
@@ -1345,11 +1358,39 @@ mod tests {
     }
 
     #[test]
-    fn too_little_text_has_no_sketch() {
-        assert_eq!(Sketch::of("Enter your password to continue", SALT), None);
+    fn too_little_text_cannot_decide_on_its_own() {
+        assert!(!sk("Enter your password to continue").usable());
         assert_eq!(Sketch::of("", SALT), None);
-        assert_eq!(Sketch::of(&run(0, 33), SALT), None, "29 shingles");
-        assert!(Sketch::of(&run(0, 34), SALT).is_some(), "30 shingles");
+        assert_eq!(Sketch::of("four words only here", SALT), None);
+        assert!(!sk(&run(0, 33)).usable(), "29 shingles");
+        assert!(sk(&run(0, 34)).usable(), "30 shingles");
+        // Two short pages that happen to be identical are not a verdict.
+        let short = fp_text("Enter your password to continue to the site");
+        assert_eq!(signal(B, &short, A, &short), None);
+    }
+
+    /// The canonical's content region is a short blurb (too short to decide on)
+    /// and everything else is beside it. A whole-page copy still contains the
+    /// blurb, which lets the whole-page pair decide.
+    #[test]
+    fn a_whole_page_copy_of_a_site_with_a_thin_content_region_is_caught() {
+        let blurb = "Meadowbrook Farm heirloom seeds, shipped anywhere.";
+        let page = |addr: &str| format!("{blurb} {}", seller_page(addr));
+        let orig = Fingerprint {
+            sketch: Sketch::of(blurb, SALT),
+            page_sketch: Sketch::of(&page("bc1qreal"), SALT),
+            ..Default::default()
+        };
+        assert!(!orig.sketch.as_ref().unwrap().usable());
+        let clone = Fingerprint {
+            sketch: Sketch::of(blurb, SALT),
+            page_sketch: Sketch::of(&page("bc1qscam"), SALT),
+            ..Default::default()
+        };
+        assert!(matches!(
+            signal(B, &clone, A, &orig),
+            Some(Signal::NearText(_))
+        ));
     }
 
     #[test]
