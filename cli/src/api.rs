@@ -91,6 +91,43 @@ impl NodeClient {
         }
     }
 
+    /// GET that also asks for the contract code, so the caller learns the
+    /// instance's PARAMETERS and code hash, which a plain GET does not return.
+    ///
+    /// For a web container the parameters are the owner's verifying key, so this
+    /// is how the crawler tells which publisher controls a site (see
+    /// `contract-info`). `None` for the container means the node answered but did
+    /// not include the code, which the caller must treat as "owner unknown", never
+    /// as "no owner".
+    pub async fn get_with_contract(
+        &mut self,
+        want: ContractInstanceId,
+    ) -> Result<(Vec<u8>, Option<ContractContainer>)> {
+        let req = ContractRequest::Get {
+            key: want,
+            return_contract_code: true,
+            subscribe: false,
+            blocking_subscribe: false,
+        };
+        match self.roundtrip(ClientRequest::ContractOp(req)).await? {
+            HostResponse::ContractResponse(ContractResponse::GetResponse {
+                key: got,
+                contract,
+                state,
+                ..
+            }) => {
+                if *got.id() != want {
+                    bail!("GET response was for contract {got}, not {want}");
+                }
+                Ok((state.as_ref().to_vec(), contract))
+            }
+            HostResponse::ContractResponse(ContractResponse::NotFound { instance_id }) => {
+                bail!("contract {instance_id} not found")
+            }
+            other => Err(anyhow!("unexpected GET response: {other:?}")),
+        }
+    }
+
     pub async fn get(&mut self, key: &ContractKey, subscribe: bool) -> Result<Vec<u8>> {
         match self.get_optional(key, subscribe).await? {
             Some(state) => Ok(state),

@@ -21,6 +21,7 @@ anyhow = "1"
 serde.workspace = true
 clap = { version = "4", features = ["derive"] }
 bs58.workspace = true
+blake3.workspace = true
 rand.workspace = true
 # Shared contract upgrade-migration machinery (registry shape, key derivation,
 # backward-probe decision driver). Contract half only: Atlas has no delegate.

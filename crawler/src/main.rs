@@ -95,6 +95,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+mod dedup;
 mod mirror;
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -321,9 +322,10 @@ struct Cli {
     /// File of candidate https URLs, one per line (# comments).
     ///
     /// Not required by `--forget`, which is a repair and has to work on an
-    /// installation whose crawl configuration is broken or absent. Every other
-    /// mode needs it.
-    #[arg(long, required_unless_present = "forget")]
+    /// installation whose crawl configuration is broken or absent, nor by
+    /// `--dedup-backfill`, which reads only the live index. Every other mode
+    /// needs it.
+    #[arg(long, required_unless_present_any = ["forget", "dedup_backfill"])]
     sources: Option<PathBuf>,
     /// File tracking already-added locators (default: <key_dir>/crawler-seen.txt).
     #[arg(long)]
@@ -469,6 +471,23 @@ struct Cli {
     /// `next_check_due` is.
     #[arg(long, default_value_t = 200)]
     recheck_max: usize,
+    /// File holding the duplicate-detection fingerprint of every locator this
+    /// crawler indexed (default: <key_dir>/crawler-fingerprints.txt). See
+    /// `dedup.rs`. Crawler-local, never published.
+    #[arg(long)]
+    fingerprints: Option<PathBuf>,
+    /// Rebuild the fingerprint store from the LIVE index and exit: fetch every
+    /// live entry, fingerprint it, and print every pair of live entries that the
+    /// duplicate check would call the same site, plus the closest text matches
+    /// that it would not. Spends no LLM tokens. Removes nothing: the report is for
+    /// a curator.
+    ///
+    /// Run once after installing a crawler with duplicate detection, or the check
+    /// has nothing to compare new candidates against. Re-running refreshes the
+    /// fingerprints of sites whose content has changed since. Stop
+    /// `atlas-crawler.service` first: it rewrites a file the daemon appends to.
+    #[arg(long, conflicts_with_all = ["recheck", "forget"])]
+    dedup_backfill: bool,
 }
 
 struct Described {
@@ -2569,6 +2588,10 @@ enum Outcome {
     /// `run_recheck_pass` — this is only the record a curator reviews to decide
     /// via `atlasctl remove`.
     FlaggedOnRecheck,
+    /// Not indexed because it duplicates an entry already in the live index
+    /// (#68). The reason names the canonical locator and the signal that
+    /// matched: `same-owner`, `same-archive` or `near-text jaccard=…`.
+    DuplicateOf,
 }
 
 impl Outcome {
@@ -2584,6 +2607,7 @@ impl Outcome {
             Self::RetiredOverCapacity => "retired-over-capacity",
             Self::RetiredOverAuthorShare => "retired-over-author-share",
             Self::FlaggedOnRecheck => "flagged-on-recheck",
+            Self::DuplicateOf => "duplicate-of",
         }
     }
 }
@@ -2754,6 +2778,10 @@ fn main() -> Result<()> {
         .recheck_state
         .clone()
         .unwrap_or_else(|| key_dir.join("crawler-recheck.txt"));
+    let fingerprints_path = cli
+        .fingerprints
+        .clone()
+        .unwrap_or_else(|| key_dir.join("crawler-fingerprints.txt"));
     // Two of these pointing at the same file is not a harmless misconfiguration.
     // The quarantine and the pending queue share a line shape but NOT a first
     // column (a unix timestamp vs an attempt count), so if they collide, every
@@ -2773,6 +2801,7 @@ fn main() -> Result<()> {
         ("--quarantine", real(&quarantine_path)),
         ("--decisions", real(&decisions_path)),
         ("--recheck-state", real(&recheck_state_path)),
+        ("--fingerprints", real(&fingerprints_path)),
     ];
     for (i, (name_a, a)) in paths.iter().enumerate() {
         for (name_b, b) in &paths[i + 1..] {
@@ -2854,6 +2883,10 @@ fn main() -> Result<()> {
         );
     }
 
+    if cli.dedup_backfill {
+        return run_dedup_backfill(&cli, &fingerprints_path);
+    }
+
     if cli.recheck {
         let prices = Prices::from_cli(cli.input_price, cli.output_price)?;
         let monthly_max = usd_to_micros(cli.monthly_max, "--monthly-max")?;
@@ -2886,6 +2919,7 @@ fn main() -> Result<()> {
             &pending_path,
             &quarantine_path,
             &decisions_path,
+            &fingerprints_path,
             &mut state,
         ) {
             eprintln!("crawl run error: {e:#}");
@@ -2967,6 +3001,7 @@ fn capture_filter(seen: &HashSet<String>, quarantine: &Quarantine) -> HashSet<St
     seen.iter().cloned().chain(quarantine.held()).collect()
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_once(
     cli: &Cli,
     seen_path: &Path,
@@ -2974,6 +3009,7 @@ fn run_once(
     pending_path: &Path,
     quarantine_path: &Path,
     decisions_path: &Path,
+    fingerprints_path: &Path,
     state: &mut CrawlState,
 ) -> Result<()> {
     let mut seen = load_seen(seen_path);
@@ -2999,24 +3035,7 @@ fn run_once(
         .ok()
         .filter(|m| !m.is_empty())
         .unwrap_or_else(|| DEFAULT_LLM_MODEL.to_string());
-    let client = reqwest::blocking::Client::builder()
-        .timeout(Duration::from_secs(FETCH_TIMEOUT_SECS))
-        // Re-run the SSRF check on EVERY hop. `ssrf_check` only sees the URL we
-        // were given; without this a posted link can 302 to
-        // http://169.254.169.254/… and reach a local or metadata service, which
-        // defeats both the https-only rule and the whole IP blocklist in one
-        // redirect.
-        .redirect(reqwest::redirect::Policy::custom(|attempt| {
-            if attempt.previous().len() >= 3 {
-                return attempt.stop();
-            }
-            match ssrf_check(attempt.url().as_str()) {
-                Ok(()) => attempt.follow(),
-                Err(_) => attempt.stop(),
-            }
-        }))
-        .user_agent("atlas-crawler/0.1")
-        .build()?;
+    let client = http_client()?;
 
     let gw = gateway_http_base(&cli.node);
     // Prices are validated BEFORE anything is spent, and a bad one aborts the run
@@ -3189,6 +3208,7 @@ fn run_once(
     let mut placeholders = 0usize;
     let mut retired_thin = 0usize;
     let mut baselines = AppBaselines::default();
+    let mut dedup = DedupState::new(fingerprints_path);
     let mut author_used: HashMap<String, usize> = HashMap::new();
     let mut authors_served: HashSet<String> = HashSet::new();
     let order = pending.drain_order();
@@ -3243,6 +3263,7 @@ fn run_once(
             &mut baselines,
             &mut usage,
             &mut decisions,
+            &mut dedup,
             now_secs(),
         );
         budget.settle(usage.map(|u| prices.cost(&u)));
@@ -3585,6 +3606,8 @@ struct LiveEntry {
     subject_id: String,
     version: u64,
     locator: String,
+    /// When the entry was minted. First seen is canonical for duplicates (#68).
+    added_at: u64,
     landing_adult: bool,
     has_adult_sections: bool,
 }
@@ -3601,6 +3624,201 @@ struct LiveEntry {
 fn landing_would_change(current_adult: bool, current_has_sections: bool, new: &Assessment) -> bool {
     (new.landing == Landing::Adult) != current_adult
         || new.has_adult_sections != current_has_sections
+}
+
+/// The HTTP client every fetch goes through.
+///
+/// Re-runs the SSRF check on EVERY hop. `ssrf_check` only sees the URL we were
+/// given; without this a posted link can 302 to http://169.254.169.254/… and
+/// reach a local or metadata service, which defeats both the https-only rule and
+/// the whole IP blocklist in one redirect.
+fn http_client() -> Result<reqwest::blocking::Client> {
+    Ok(reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(FETCH_TIMEOUT_SECS))
+        .redirect(reqwest::redirect::Policy::custom(|attempt| {
+            if attempt.previous().len() >= 3 {
+                return attempt.stop();
+            }
+            match ssrf_check(attempt.url().as_str()) {
+                Ok(()) => attempt.follow(),
+                Err(_) => attempt.stop(),
+            }
+        }))
+        .user_agent("atlas-crawler/0.1")
+        .build()?)
+}
+
+/// Owner key and archive hash of a `freenet:` contract, from
+/// `atlasctl contract-info`.
+fn contract_fingerprint(cli: &Cli, id: &str) -> Result<dedup::Fingerprint> {
+    let mut cmd = Command::new(&cli.atlasctl);
+    cmd.args(["--node", &cli.node]);
+    if let Some(kd) = &cli.key_dir {
+        cmd.args(["--key-dir", &kd.to_string_lossy()]);
+    }
+    cmd.args(["contract-info", id]);
+    let out = cmd
+        .output()
+        .with_context(|| "running atlasctl contract-info")?;
+    if !out.status.success() {
+        bail!(
+            "atlasctl contract-info {id} failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    let json: serde_json::Value = serde_json::from_slice(&out.stdout)
+        .with_context(|| "atlasctl contract-info output not json")?;
+    Ok(dedup::Fingerprint::from_contract_info(&json))
+}
+
+/// A locator's duplicate-detection fingerprint (#68): owner key and archive hash
+/// for a contract of its own, and a text sketch of what the describer reads.
+///
+/// An `app:` resource gets text only. Its container is the app's, shared by every
+/// other resource of that app, so its owner and archive say nothing about it.
+///
+/// A failed `contract-info` is an error for an untrusted locator, which is then
+/// retried like any transient failure: deciding it without the owner signal
+/// would let an author's second copy of their own site in. A curated locator is
+/// never refused as a duplicate anyway, so for it the failure only costs the
+/// fingerprint its owner and archive, and is a warning.
+fn site_fingerprint(
+    cli: &Cli,
+    loc: &str,
+    page: &Page,
+    trusted: bool,
+) -> Result<dedup::Fingerprint> {
+    let mut fp = match freenet_id(loc) {
+        Some(id) => match contract_fingerprint(cli, id) {
+            Ok(fp) => fp,
+            Err(e) if !trusted => return Err(e).context("fingerprinting for duplicate detection"),
+            Err(e) => {
+                eprintln!("  warn: no owner/archive fingerprint for {loc}: {e:#}");
+                dedup::Fingerprint::default()
+            }
+        },
+        None => dedup::Fingerprint::default(),
+    };
+    fp.sketch = dedup::Sketch::of(&page.describable_text());
+    Ok(fp)
+}
+
+/// Duplicate detection's per-run state: the fingerprint store, and the live
+/// index it is checked against, read at most once per run and only if some
+/// candidate gets far enough to need it.
+struct DedupState {
+    path: PathBuf,
+    store: dedup::Store,
+    live: Option<HashSet<String>>,
+}
+
+impl DedupState {
+    fn new(path: &Path) -> Self {
+        Self {
+            path: path.to_path_buf(),
+            store: dedup::Store::load(path),
+            live: None,
+        }
+    }
+
+    /// The live entry `loc` duplicates, if any.
+    ///
+    /// An unreadable live index is an ERROR, so the candidate is retried rather
+    /// than decided. Checking against the store alone would let a removed entry
+    /// be canonical, and skipping the check would admit duplicates whenever the
+    /// node is briefly unreachable.
+    fn check(
+        &mut self,
+        cli: &Cli,
+        loc: &str,
+        fp: &dedup::Fingerprint,
+    ) -> Result<Option<dedup::Match>> {
+        if self.live.is_none() {
+            let live =
+                fetch_live_index(cli).context("reading the live index for duplicate detection")?;
+            self.live = Some(live.into_iter().map(|e| e.locator).collect());
+        }
+        let live = self.live.as_ref().expect("just set");
+        Ok(dedup::find_canonical(loc, fp, &self.store.entries, live))
+    }
+
+    /// Remember a locator that was just indexed, so a later copy of it (in this
+    /// run or any other) is caught.
+    ///
+    /// A failed write is a warning, not an error: the entry is already published,
+    /// and the cost is that copies of it are not caught until the next
+    /// `--dedup-backfill`.
+    fn record(&mut self, loc: &str, print: dedup::Fingerprint, now: u64) {
+        if let Some(live) = &mut self.live {
+            live.insert(loc.to_string());
+        }
+        let stored = dedup::Stored {
+            locator: loc.to_string(),
+            first_seen: now,
+            print,
+        };
+        if let Err(e) = self.store.record(&self.path, stored) {
+            eprintln!(
+                "warn: could not record the fingerprint of {loc} ({e:#}); copies of it \
+                 will not be caught until the next --dedup-backfill"
+            );
+        }
+    }
+}
+
+/// `--dedup-backfill`: rebuild the fingerprint store from the live index and
+/// report what the duplicate check sees in it. See the flag's doc.
+fn run_dedup_backfill(cli: &Cli, path: &Path) -> Result<()> {
+    let live = fetch_live_index(cli)?;
+    if live.is_empty() {
+        bail!("the live index read back EMPTY; refusing to rebuild the fingerprint store from it");
+    }
+    let registry = AppRegistryView::load(cli);
+    let client = http_client()?;
+    let gw = gateway_http_base(&cli.node);
+    let mut baselines = AppBaselines::default();
+    let old = dedup::Store::load(path);
+    let mut fresh: Vec<dedup::Stored> = Vec::new();
+    let mut kept_old = 0usize;
+    let mut missing = 0usize;
+    for (i, e) in live.iter().enumerate() {
+        eprintln!("[{}/{}] {}", i + 1, live.len(), e.locator);
+        let print = fetch_site(cli, &client, &gw, &e.locator, &registry, &mut baselines)
+            .and_then(|page| site_fingerprint(cli, &e.locator, &page, false));
+        match print {
+            Ok(print) => fresh.push(dedup::Stored {
+                locator: e.locator.clone(),
+                first_seen: e.added_at,
+                print,
+            }),
+            Err(err) => {
+                // Keep what we had rather than lose it over one failed fetch.
+                if let Some(prev) = old.entries.iter().find(|s| s.locator == e.locator) {
+                    eprintln!("  fetch failed ({err:#}); keeping its previous fingerprint");
+                    fresh.push(prev.clone());
+                    kept_old += 1;
+                } else {
+                    eprintln!("  fetch failed ({err:#}); NOT fingerprinted");
+                    missing += 1;
+                }
+            }
+        }
+    }
+    let store = dedup::Store { entries: fresh };
+    store.save(path, &sibling_tmp(path))?;
+    let n = store.entries.len();
+    let count =
+        |f: fn(&dedup::Fingerprint) -> bool| store.entries.iter().filter(|s| f(&s.print)).count();
+    println!(
+        "fingerprinted {n} of {} live entries ({kept_old} kept from before, {missing} missing): \
+         {} with an owner key, {} with an archive hash, {} with a text sketch",
+        live.len(),
+        count(|p| p.owner.is_some()),
+        count(|p| p.archive.is_some()),
+        count(|p| p.sketch.is_some()),
+    );
+    print!("{}", dedup::report(&store.entries));
+    Ok(())
 }
 
 /// Ask `atlasctl` for the live index. Unlike `AppRegistryView::load`, a failure
@@ -3634,6 +3852,7 @@ fn fetch_live_index(cli: &Cli) -> Result<Vec<LiveEntry>> {
                 subject_id: r["subject_id"].as_str()?.to_string(),
                 version: r["version"].as_u64()?,
                 locator: r["locator"].as_str()?.to_string(),
+                added_at: r["added_at"].as_u64().unwrap_or(0),
                 landing_adult: r["class"]["landing"].as_str() == Some("adult"),
                 has_adult_sections: r["class"]["has_adult_sections"].as_bool().unwrap_or(false),
             })
@@ -3996,19 +4215,7 @@ fn run_recheck_pass(
         .ok()
         .filter(|m| !m.is_empty())
         .unwrap_or_else(|| DEFAULT_LLM_MODEL.to_string());
-    let client = reqwest::blocking::Client::builder()
-        .timeout(Duration::from_secs(FETCH_TIMEOUT_SECS))
-        .redirect(reqwest::redirect::Policy::custom(|attempt| {
-            if attempt.previous().len() >= 3 {
-                return attempt.stop();
-            }
-            match ssrf_check(attempt.url().as_str()) {
-                Ok(()) => attempt.follow(),
-                Err(_) => attempt.stop(),
-            }
-        }))
-        .user_agent("atlas-crawler/0.1")
-        .build()?;
+    let client = http_client()?;
     let gw = gateway_http_base(&cli.node);
     let registry = AppRegistryView::load(cli);
     let mut decisions = DecisionLog::open(decisions_path);
@@ -4403,7 +4610,14 @@ impl Page {
 /// Index one locator (`https://...` or `freenet:<id><path>`): fetch its content,
 /// describe it (LLM or fallback), and add it to the index with the given kind.
 /// Returns Ok(true) if the locator was indexed, Ok(false) if the admission gate
-/// in `index_page` deliberately refused it.
+/// in `index_page` deliberately refused it, or if it duplicates a live entry.
+///
+/// The duplicate check (#68) runs BEFORE `index_page`, so a duplicate costs one
+/// extra contract GET and no LLM tokens. A locator from the operator's own
+/// sources file is fingerprinted but never refused as a duplicate: that is the
+/// override for a merge that was wrong. Add the locator to `--sources` AND
+/// `--forget` it; `--forget` alone re-queues it as untrusted, and it would be
+/// merged again.
 #[allow(clippy::too_many_arguments)]
 fn index_locator(
     cli: &Cli,
@@ -4418,8 +4632,59 @@ fn index_locator(
     baselines: &mut AppBaselines,
     usage: &mut Option<Usage>,
     log: &mut DecisionLog,
+    dedup: &mut DedupState,
     now: u64,
 ) -> Result<bool> {
+    let page = fetch_site(cli, client, gw, loc, registry, baselines)?;
+    // Only a page that will actually reach the describer is fingerprinted: a
+    // too-thin one is deferred by `index_page` anyway, and fingerprinting it would
+    // cost a contract GET on every run it stays queued.
+    let print = if page.text_for_classification().trim().chars().count() >= MIN_DESCRIBABLE_CHARS {
+        Some(site_fingerprint(cli, loc, &page, trusted)?)
+    } else {
+        None
+    };
+    if let (Some(fp), false) = (&print, trusted) {
+        if let Some(m) = dedup.check(cli, loc, fp)? {
+            let reason = format!("of {} ({})", m.canonical, m.signal.reason());
+            eprintln!("  not indexed: {loc} is a duplicate {reason}");
+            // Fail closed, as the admission refusals in `index_page` do: a
+            // duplicate verdict recorded nowhere would leave the locator in
+            // `crawler-seen.txt` with no way to find out which entry it lost to.
+            if !log.record(loc, Outcome::DuplicateOf, &reason, now) {
+                bail!(
+                    "decision log unwritable; leaving {loc} queued rather than \
+                     refusing it as a duplicate with no record"
+                );
+            }
+            return Ok(false);
+        }
+    }
+    let indexed = index_page(
+        cli, client, key, model, loc, kind, trusted, &page, usage, log, now,
+    )?;
+    if indexed {
+        if let Some(fp) = print {
+            dedup.record(loc, fp, now);
+        }
+    }
+    Ok(indexed)
+}
+
+/// Fetch everything a locator has to say, screened: the entry page plus, for an
+/// app-hosted resource, its other pages, with any page that turns out to be the
+/// app's placeholder for a missing resource refused or dropped.
+///
+/// Shared by `index_locator` and the dedup backfill, so a live entry is
+/// fingerprinted from exactly the text a new candidate is.
+fn fetch_site(
+    cli: &Cli,
+    client: &reqwest::blocking::Client,
+    gw: &str,
+    loc: &str,
+    registry: &AppRegistryView,
+    baselines: &mut AppBaselines,
+) -> Result<Page> {
     // Walk an app-hosted resource's OTHER pages before describing it. A Delta site
     // is one locator with several pages, and reading only the landing page judged
     // the whole site on it: `app:delta/AWPjDQdKey` ("Ian Clarke's Delta Website")
@@ -4474,9 +4739,7 @@ fn index_locator(
             eprintln!("  dropped {dropped} enumerated page(s) serving another site's content");
         }
     }
-    index_page(
-        cli, client, key, model, loc, kind, trusted, &page, usage, log, now,
-    )
+    Ok(page)
 }
 
 /// Minimum visible characters before a page is worth describing.
@@ -11038,6 +11301,60 @@ mod tests {
     }
 
     #[test]
+    fn duplicate_of_has_its_own_stable_token() {
+        assert_eq!(Outcome::DuplicateOf.token(), "duplicate-of");
+    }
+
+    /// The duplicate check (#68) must sit on the path that INDEXES a locator,
+    /// before the describer, and a locator that gets indexed must be remembered.
+    ///
+    /// Source-scraped because `index_locator` needs a node, a renderer and
+    /// `atlasctl` to drive; the decision itself is tested behaviourally in
+    /// `dedup.rs`. Each assertion names a mutation that otherwise passes the
+    /// whole suite: deleting the check, moving it after `index_page` (which
+    /// spends LLM tokens on a duplicate and has already published it), dropping
+    /// the decision-log record, or never recording a fingerprint (so nothing
+    /// indexed by the crawler is ever canonical).
+    #[test]
+    fn the_indexing_path_checks_for_duplicates_before_describing() {
+        let src = include_str!("main.rs");
+        let production = src
+            .split("\nmod tests")
+            .next()
+            .expect("source must have a pre-test region");
+        let at = production
+            .find("fn index_locator(")
+            .expect("index_locator must exist");
+        let end = production[at..]
+            .find("\nfn ")
+            .map(|e| at + e)
+            .unwrap_or(production.len());
+        let body = strip_comments(&production[at..end]);
+        let check = body
+            .find("dedup.check(")
+            .expect("index_locator must check for duplicates");
+        let describe = body
+            .find("index_page(")
+            .expect("index_locator must describe through index_page");
+        assert!(
+            check < describe,
+            "the duplicate check must run BEFORE index_page, which spends tokens and publishes"
+        );
+        assert!(
+            body[check..describe].contains("Outcome::DuplicateOf"),
+            "a duplicate must be recorded in the decision log with its own token"
+        );
+        assert!(
+            body[check..describe].contains("return Ok(false);"),
+            "a duplicate must not fall through to index_page"
+        );
+        assert!(
+            body[describe..].contains("dedup.record("),
+            "an indexed locator must be fingerprinted, or it can never be canonical"
+        );
+    }
+
+    #[test]
     fn flagged_on_recheck_has_its_own_stable_token() {
         assert_eq!(Outcome::FlaggedOnRecheck.token(), "flagged-on-recheck");
     }
@@ -12798,15 +13115,23 @@ mod tests {
             !production.contains("fn the_indexing_path_enumerates"),
             "the scan region must exclude the test module, or the pin matches itself"
         );
-        let at = production
-            .find("fn index_locator(")
-            .expect("index_locator must exist");
-        let body = &production[at..];
-        let end = body
-            .find("\nfn ")
-            .map(|e| at + e)
-            .unwrap_or(production.len());
-        let body = strip_comments(&production[at..end]);
+        // The fetch lives in `fetch_site` (shared with the dedup backfill), so
+        // the pin reads that, and separately requires `index_locator` to call it.
+        let fn_body = |name: &str| -> String {
+            let at = production
+                .find(&format!("fn {name}("))
+                .unwrap_or_else(|| panic!("{name} must exist"));
+            let end = production[at..]
+                .find("\nfn ")
+                .map(|e| at + e)
+                .unwrap_or(production.len());
+            strip_comments(&production[at..end])
+        };
+        assert!(
+            fn_body("index_locator").contains("fetch_site("),
+            "index_locator must describe what fetch_site fetched"
+        );
+        let body = fn_body("fetch_site");
         assert!(
             body.contains("registry.app_of(loc)") && body.contains("get_page_enumerating("),
             "index_locator must walk an app resource's other pages, or a site with a \

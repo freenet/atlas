@@ -194,6 +194,7 @@ name = "atlasctl"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "blake3",
  "bs58",
  "ciborium",
  "clap",

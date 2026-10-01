@@ -393,6 +393,11 @@ enum Cmd {
         #[arg(long)]
         out: PathBuf,
     },
+    /// Print, as one JSON object, what the crawler needs to tell who publishes a
+    /// contract and whether two contracts serve the same bytes: its code hash,
+    /// its parameters (for a web container, the owner's verifying key), and a
+    /// BLAKE3 hash of the web archive when the state has the web-container layout.
+    ContractInfo { instance: String },
     /// Repair a stale replica: GET the index state from a source node and PUT it
     /// into a target node so that node serves the current state locally. Useful
     /// while cross-node subscribe/propagation is unreliable (the target may hold
@@ -512,6 +517,7 @@ async fn main() -> Result<()> {
             metadata,
         } => webapp_put(&cli, &dir, wasm, archive, metadata).await,
         Cmd::RawGet { instance, out } => raw_get(&cli, instance, out).await,
+        Cmd::ContractInfo { instance } => contract_info(&cli, instance).await,
         Cmd::PushState { from, to } => push_state(&dir, &cli.slug, from, to).await,
     }
 }
@@ -1090,6 +1096,51 @@ async fn raw_get(cli: &Cli, instance: &str, out: &Path) -> Result<()> {
     fs::write(out, &bytes).with_context(|| format!("writing {}", out.display()))?;
     println!("wrote {} bytes to {}", bytes.len(), out.display());
     Ok(())
+}
+
+async fn contract_info(cli: &Cli, instance: &str) -> Result<()> {
+    let id: ContractInstanceId = instance
+        .parse()
+        .map_err(|e| anyhow!("bad instance id: {e}"))?;
+    let mut client = NodeClient::connect(&cli.node).await?;
+    let (state, contract) = client.get_with_contract(id).await?;
+    let archive = web_container_archive(&state);
+    let info = serde_json::json!({
+        "instance": id.to_string(),
+        "code_hash": contract.as_ref().map(|c| c.key().code_hash().to_string()),
+        "params_hex": contract.as_ref().map(|c| hex_lower(c.params().as_ref())),
+        "state_len": state.len(),
+        "archive_len": archive.map(<[u8]>::len),
+        "archive_blake3": archive.map(|a| blake3::hash(a).to_hex().to_string()),
+    });
+    println!("{info}");
+    Ok(())
+}
+
+/// The web archive inside a web-container state, or `None` if `state` does not
+/// have that layout EXACTLY: `[meta_len: u64 BE][meta][web_len: u64 BE][web]`
+/// with nothing left over (see `webapp_put`).
+///
+/// Exact, because the hash of this slice is used as "same bytes as another
+/// site": a lenient parse that accepted trailing data would hash a prefix and
+/// could call two different sites identical.
+///
+/// The metadata is skipped on purpose. It carries the version and the owner's
+/// signature, so two owners publishing byte-identical archives always differ
+/// there, and that is exactly the case the hash exists to catch.
+fn web_container_archive(state: &[u8]) -> Option<&[u8]> {
+    let take_len = |b: &[u8]| -> Option<usize> {
+        usize::try_from(u64::from_be_bytes(b.get(..8)?.try_into().ok()?)).ok()
+    };
+    let meta_len = take_len(state)?;
+    let rest = state.get(8..)?.get(meta_len..)?;
+    let web_len = take_len(rest)?;
+    let web = rest.get(8..)?;
+    (web.len() == web_len).then_some(web)
+}
+
+fn hex_lower(b: &[u8]) -> String {
+    b.iter().map(|x| format!("{x:02x}")).collect()
 }
 
 async fn webapp_put(
@@ -2171,6 +2222,45 @@ mod tests {
     }
     const ID_A: &str = "EqJ5YpEEV3XLqEvKWLQHFhGAac2qXzSUoE6k2zbdnXBr";
     const ID_B: &str = "771DvtPMwt2PumPyrFvsz7fpvU1gogcmb5qtS1yYEEH9";
+
+    fn web_state(meta: &[u8], web: &[u8]) -> Vec<u8> {
+        let mut s = (meta.len() as u64).to_be_bytes().to_vec();
+        s.extend_from_slice(meta);
+        s.extend_from_slice(&(web.len() as u64).to_be_bytes());
+        s.extend_from_slice(web);
+        s
+    }
+
+    /// The archive hash is the "same bytes as another site" signal, so the parse
+    /// must skip the signed metadata (which always differs between owners) and
+    /// must refuse anything that is not exactly the web-container layout.
+    #[test]
+    fn web_container_archive_is_the_web_part_and_only_an_exact_layout() {
+        let web = b"archive bytes";
+        assert_eq!(
+            web_container_archive(&web_state(b"owner one's signature", web)),
+            Some(&web[..])
+        );
+        assert_eq!(
+            web_container_archive(&web_state(b"owner two", web)),
+            web_container_archive(&web_state(b"a different, longer signature", web)),
+        );
+        let mut trailing = web_state(b"m", web);
+        trailing.push(0);
+        assert_eq!(web_container_archive(&trailing), None, "trailing bytes");
+        let short = web_state(b"m", web);
+        assert_eq!(
+            web_container_archive(&short[..short.len() - 1]),
+            None,
+            "truncated"
+        );
+        assert_eq!(web_container_archive(&[]), None);
+        assert_eq!(
+            web_container_archive(&u64::MAX.to_be_bytes()),
+            None,
+            "huge length"
+        );
+    }
 
     /// Editing one app must never drop another. This is the entire reason
     /// `app-set` reads before writing, and it was previously untested.
