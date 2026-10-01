@@ -334,16 +334,23 @@ impl Fingerprint {
     /// candidate's whole page against the canonical's CONTENT. The last is the
     /// clone shape when the canonical has no page sketch (an `app:` resource) and
     /// the candidate hides the copy outside its own content region.
+    ///
+    /// The whole-page pair counts only when the canonical's CONTENT is also
+    /// contained in the candidate's page. Two distinct sites built from one theme
+    /// share a large nav and footer, so their whole pages can look alike while
+    /// neither contains the other's content; a clone always contains it.
     fn pairs(&self, canon: &Self) -> Vec<(f64, f64)> {
-        [
-            (&self.sketch, &canon.sketch),
-            (&self.page_sketch, &canon.page_sketch),
-            (&self.page_sketch, &canon.sketch),
-        ]
-        .into_iter()
-        .filter_map(|(a, b)| Some((a.as_ref()?, b.as_ref()?)))
-        .map(|(cand, canon)| (cand.jaccard(canon), canon.contained_in(cand)))
-        .collect()
+        let sim = |a: &Option<Sketch>, b: &Option<Sketch>| {
+            let (cand, canon) = (a.as_ref()?, b.as_ref()?);
+            Some((cand.jaccard(canon), canon.contained_in(cand)))
+        };
+        let cross = sim(&self.page_sketch, &canon.sketch);
+        let page = sim(&self.page_sketch, &canon.page_sketch)
+            .filter(|_| cross.is_some_and(|(_, c)| c >= CONTAINED));
+        [sim(&self.sketch, &canon.sketch), page, cross]
+            .into_iter()
+            .flatten()
+            .collect()
     }
 
     /// The Jaccard that decides whether two pages are "clearly different": the
@@ -606,7 +613,27 @@ fn read_state(path: &Path) -> Result<String> {
 
 const SALT_HEADER: &str = "#salt\t";
 
-/// The fingerprint store: `crawler-fingerprints.txt`. A `#salt` header, then one
+/// Version of the text pipeline (`words`, `shingle_hash`) the stored sketches
+/// were made with, written into the header next to the salt. A sketch made by a
+/// different pipeline loads cleanly and never matches anything, so a store from
+/// another version is refused, loudly, rather than silently switching detection
+/// off. BUMP THIS whenever `words` or `shingle_hash` changes.
+const PIPELINE: u32 = 1;
+
+fn header(salt: u64) -> String {
+    format!("{SALT_HEADER}{salt:016x}\tv{PIPELINE}\n")
+}
+
+/// The salt in a header line, if the line is a header of THIS pipeline version.
+fn parse_header(line: &str) -> Option<u64> {
+    let (salt, version) = line.strip_prefix(SALT_HEADER)?.trim().split_once('\t')?;
+    (version == format!("v{PIPELINE}"))
+        .then(|| u64::from_str_radix(salt, 16).ok())
+        .flatten()
+}
+
+/// The fingerprint store: `crawler-fingerprints.txt`. A `#salt` header (salt and
+/// [`PIPELINE`] version), then one
 /// line per indexed locator:
 /// `locator \t first_seen \t owner \t archive \t sketch \t page_sketch`, `-` for
 /// an unknown field.
@@ -628,12 +655,10 @@ impl Store {
         let Some(first) = lines.next() else {
             return Ok(Self::fresh());
         };
-        let Some(salt) = first
-            .strip_prefix(SALT_HEADER)
-            .and_then(|h| u64::from_str_radix(h.trim(), 16).ok())
-        else {
+        let Some(salt) = parse_header(first) else {
             bail!(
-                "{} has no #salt header; rebuild it with --dedup-backfill",
+                "{} has no #salt header for text pipeline v{PIPELINE}; move it aside \
+                 and rebuild it with --dedup-backfill",
                 path.display()
             );
         };
@@ -681,12 +706,9 @@ impl Store {
     pub fn record(&mut self, path: &Path, s: Stored) -> Result<()> {
         let mut out = String::new();
         match read_state(path)?.lines().find(|l| !l.trim().is_empty()) {
-            None => out.push_str(&format!("{SALT_HEADER}{:016x}\n", self.salt)),
+            None => out.push_str(&header(self.salt)),
             Some(first) => {
-                let theirs = first
-                    .strip_prefix(SALT_HEADER)
-                    .and_then(|h| u64::from_str_radix(h.trim(), 16).ok());
-                if theirs != Some(self.salt) {
+                if parse_header(first) != Some(self.salt) {
                     bail!(
                         "{} was written under a different salt; not appending",
                         path.display()
@@ -709,7 +731,7 @@ impl Store {
 
     /// Rewrite the whole file, atomically.
     pub fn save(&self, path: &Path, tmp: &Path) -> Result<()> {
-        let mut body = format!("{SALT_HEADER}{:016x}\n", self.salt);
+        let mut body = header(self.salt);
         for s in &self.entries {
             body.push_str(&format_line(s));
             body.push('\n');
@@ -1231,6 +1253,27 @@ mod tests {
         assert!(find_canonical(B, &clone, &[stored(canon, 1, orig)], &live(&[canon])).is_some());
     }
 
+    /// Two distinct sites from one theme: big shared chrome, different content.
+    #[test]
+    fn sites_sharing_a_theme_are_not_merged_on_their_chrome() {
+        let chrome = run(0, 1500);
+        let site = |start: usize| Fingerprint {
+            sketch: Sketch::of(&run(start, 60), SALT),
+            page_sketch: Sketch::of(&format!("{chrome} {}", run(start, 60)), SALT),
+            ..Default::default()
+        };
+        let (a, b) = (site(10_000), site(20_000));
+        assert!(
+            a.page_sketch
+                .as_ref()
+                .unwrap()
+                .jaccard(b.page_sketch.as_ref().unwrap())
+                >= NEAR_DUP_JACCARD,
+            "the test needs whole pages that look alike"
+        );
+        assert_eq!(signal(B, &b, A, &a), None);
+    }
+
     #[test]
     fn containment_needs_jaccard_one_half_and_is_exact_below_k() {
         // 90 canonical shingles, all inside the candidate.
@@ -1422,6 +1465,10 @@ mod tests {
 
         std::fs::write(&path, format_line(&s2)).unwrap();
         assert!(Store::load(&path).is_err(), "no salt header");
+        std::fs::write(&path, format!("{SALT_HEADER}{salt:016x}\tv0\n")).unwrap();
+        assert!(Store::load(&path).is_err(), "another text pipeline");
+        std::fs::write(&path, format!("{SALT_HEADER}{salt:016x}\n")).unwrap();
+        assert!(Store::load(&path).is_err(), "no pipeline version");
         std::fs::create_dir(dir.path().join("dir")).unwrap();
         assert!(
             Store::load(&dir.path().join("dir")).is_err(),

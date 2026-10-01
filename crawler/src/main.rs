@@ -356,7 +356,7 @@ struct Cli {
     /// installation whose crawl configuration is broken or absent, nor by
     /// `--dedup-backfill`, which reads only the live index. Every other mode
     /// needs it.
-    #[arg(long, required_unless_present_any = ["forget", "dedup_backfill"])]
+    #[arg(long, required_unless_present_any = ["forget", "dedup_backfill", "dedup_report"])]
     sources: Option<PathBuf>,
     /// File tracking already-added locators (default: <key_dir>/crawler-seen.txt).
     #[arg(long)]
@@ -524,6 +524,12 @@ struct Cli {
     /// `atlas-crawler.service` first: it rewrites a file the daemon appends to.
     #[arg(long, conflicts_with_all = ["recheck", "forget"])]
     dedup_backfill: bool,
+    /// Print the `--dedup-backfill` report from the fingerprints ALREADY stored,
+    /// against the current live index, and exit. Fetches no site and changes no
+    /// file, so it is safe while the service runs. For re-reading the margins
+    /// after a threshold change, without re-rendering every entry.
+    #[arg(long, conflicts_with_all = ["recheck", "forget", "dedup_backfill"])]
+    dedup_report: bool,
 }
 
 struct Described {
@@ -2946,6 +2952,26 @@ fn main() -> Result<()> {
         );
     }
 
+    if cli.dedup_report {
+        let store = dedup::Store::load(&fingerprints_path)?;
+        let live: HashSet<String> = fetch_live_index(&cli)?
+            .into_iter()
+            .map(|e| e.locator)
+            .collect();
+        let entries: Vec<dedup::Stored> = store
+            .entries
+            .into_iter()
+            .filter(|s| live.contains(&s.locator))
+            .collect();
+        println!(
+            "{} of {} live entries have a stored fingerprint",
+            entries.len(),
+            live.len()
+        );
+        print!("{}", dedup::report(&entries));
+        return Ok(());
+    }
+
     if cli.dedup_backfill {
         return run_dedup_backfill(&cli, &fingerprints_path);
     }
@@ -3322,6 +3348,14 @@ fn run_once(
         // whole untrusted backlog permanently the first time the key is absent,
         // and it would never be reconsidered once one is configured.
         if key.is_none() && !is_trusted {
+            continue;
+        }
+        // The same for duplicate detection this run already knows it cannot run
+        // (an unreadable state file, a failed live-index read): deferring here,
+        // before `try_take`, keeps such a run from spending its attempt cap on
+        // candidates it can only defer.
+        if !is_trusted && dedup.ready().is_err() {
+            dedup_deferred += 1;
             continue;
         }
         let used = author_used.entry(author.clone()).or_insert(0);
@@ -4207,12 +4241,15 @@ fn run_dedup_backfill(cli: &Cli, path: &Path) -> Result<()> {
         match fetch_site(cli, &client, &gw, &e.locator, &registry, &mut baselines) {
             Ok(page) => {
                 let (mut print, answered) = site_fingerprint(cli, &e.locator, &page, salt);
-                // A transient contract-info failure must not erase an owner and
-                // archive an earlier backfill learned.
-                if !answered {
-                    if let Some(prev) = by_loc.get(&e.locator) {
-                        print.owner = prev.print.owner.clone();
-                        print.archive = prev.print.archive.clone();
+                // A transient contract-info failure, or a node that answered
+                // without the code, must not erase an owner and archive an
+                // earlier backfill learned.
+                if let Some(prev) = by_loc.get(&e.locator) {
+                    if !answered || print.owner.is_none() {
+                        print.owner = print.owner.or_else(|| prev.print.owner.clone());
+                    }
+                    if !answered || print.archive.is_none() {
+                        print.archive = print.archive.or_else(|| prev.print.archive.clone());
                     }
                 }
                 by_loc.insert(
@@ -12096,6 +12133,14 @@ mod tests {
             "the held list must be written after the queue"
         );
         assert!(body.contains("Err(e) if defer_cause(&e).is_some() =>"));
+        let early = body
+            .find("if !is_trusted && dedup.ready().is_err() {")
+            .expect("a run that cannot check duplicates must defer untrusted candidates early");
+        let take = body.find("budget.try_take(").expect("the budget gate");
+        assert!(
+            early < take,
+            "the early deferral must come before try_take, or it spends the attempt cap"
+        );
     }
 
     #[test]
