@@ -23,7 +23,7 @@ jobs:
     env:
       ATLAS_INDEX_ID: PLACEHOLDERnotARealIndexId111111111111111111
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       # No toolchain action: rust-toolchain.toml pins the channel, components and
       # the wasm target, and `rustup toolchain install` with no argument installs
       # exactly that. Naming a version here too would let the two drift, and the
@@ -46,7 +46,7 @@ jobs:
     name: wasm builds
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       # No toolchain action: rust-toolchain.toml pins the channel, components and
       # the wasm target, and `rustup toolchain install` with no argument installs
       # exactly that. Naming a version here too would let the two drift, and the
@@ -76,7 +76,7 @@ jobs:
     # integrator resolves it, gets a confident answer, and derives a dead key.
     # This fails the build when the WASM moved and no new record was signed.
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           # Full history: the gate compares against the PR's base commit to
           # confirm the version moved and that no record vanished.
@@ -128,7 +128,7 @@ jobs:
     name: committed contract WASM is current
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       # No toolchain action: rust-toolchain.toml pins the channel, components and
       # the wasm target, and `rustup toolchain install` with no argument installs
       # exactly that. Naming a version here too would let the two drift, and the
