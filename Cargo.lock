@@ -172,7 +172,7 @@ version = "0.1.0"
 dependencies = [
  "ciborium",
  "fn-atlas-common",
- "freenet-stdlib",
+ "freenet-stdlib 0.12.1",
 ]
 
 [[package]]
@@ -182,7 +182,7 @@ dependencies = [
  "ciborium",
  "dioxus",
  "fn-atlas-common",
- "freenet-stdlib",
+ "freenet-stdlib 0.12.1",
  "gloo-timers",
  "js-sys",
  "serde",
@@ -204,7 +204,7 @@ dependencies = [
  "fn-atlas-common",
  "freenet-migrate",
  "freenet-migrate-build",
- "freenet-stdlib",
+ "freenet-stdlib 0.12.1",
  "rand 0.8.6",
  "serde",
  "serde_json",
@@ -1524,6 +1524,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "freenet-macros"
+version = "0.3.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6447ac80d17ad1a22d87f470d1c170ca3cfa976a433883de6472c1ede381e525"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn",
+]
+
+[[package]]
 name = "freenet-migrate"
 version = "0.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1534,7 +1545,7 @@ dependencies = [
  "ciborium",
  "ed25519-dalek",
  "freenet-scaffold",
- "freenet-stdlib",
+ "freenet-stdlib 0.8.5",
  "serde",
  "serde_with",
 ]
@@ -1584,7 +1595,31 @@ dependencies = [
  "bytes",
  "chrono",
  "flatbuffers",
- "freenet-macros",
+ "freenet-macros 0.2.0",
+ "futures",
+ "semver",
+ "serde",
+ "serde_json",
+ "serde_with",
+ "thiserror 2.0.18",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "freenet-stdlib"
+version = "0.12.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8d1d34436ce7088f277e65a616951ab8ea43091e04bb18f9af562651019b656f"
+dependencies = [
+ "bincode",
+ "blake3",
+ "bs58",
+ "byteorder",
+ "bytes",
+ "chrono",
+ "flatbuffers",
+ "freenet-macros 0.3.1",
  "futures",
  "js-sys",
  "semver",
@@ -3476,7 +3511,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.3.4",
+ "getrandom 0.4.3",
  "once_cell",
  "rustix",
  "windows-sys 0.61.2",
