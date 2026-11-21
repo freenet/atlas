@@ -1525,9 +1525,9 @@ dependencies = [
 
 [[package]]
 name = "freenet-migrate"
-version = "0.6.0"
+version = "0.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "099e0ac5fed5bdd30f35d1d10a881b292ac221f2880debc470c299983f343075"
+checksum = "e9b6177524a7d4800bb8854fbfa6361ef81ac9c98919d03ed74174972f061b8c"
 dependencies = [
  "blake3",
  "bs58",
@@ -3476,7 +3476,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.3.4",
+ "getrandom 0.4.3",
  "once_cell",
  "rustix",
  "windows-sys 0.61.2",
