@@ -176,6 +176,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "atlas-rooms"
+version = "0.1.0"
+dependencies = [
+ "bs58",
+ "ciborium",
+ "ed25519-dalek",
+ "fn-atlas-common",
+ "rand 0.8.6",
+ "serde",
+]
+
+[[package]]
 name = "atlas-ui"
 version = "0.1.0"
 dependencies = [
