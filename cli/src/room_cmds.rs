@@ -112,10 +112,10 @@ fn outcome_name(o: &PointerOutcome) -> &'static str {
     match o {
         PointerOutcome::Resolved(_) => "resolved",
         PointerOutcome::Unchanged(_) => "unchanged",
-        PointerOutcome::CompetingRecord => "competing record",
+        PointerOutcome::CompetingRecord { .. } => "competing record",
         PointerOutcome::Unavailable => "unavailable",
         PointerOutcome::NeverPublished => "never published",
-        PointerOutcome::Withdrawn => "withdrawn",
+        PointerOutcome::Withdrawn { .. } => "withdrawn",
         _ => "no usable record",
     }
 }
@@ -185,8 +185,7 @@ fn sign_actions(dir: &Path, p: atlas_rooms::reconcile::Plan) -> Result<Vec<Signe
         .collect()
 }
 
-async fn sync_one(
-    cli: &Cli,
+fn sync_one(
     dir: &Path,
     state: &IndexState,
     owner: &VerifyingKey,
@@ -195,7 +194,6 @@ async fn sync_one(
     mint: &MintOptions,
     now: u64,
 ) -> Result<(Vec<SignedRecord>, Vec<String>)> {
-    let _ = cli;
     let decision = decision_for(owner, room_state);
     let p = plan(state, owner, &decision, ch, mint, now).map_err(|e| anyhow!("{e}"))?;
     let notes = p.notes.clone();
@@ -231,8 +229,7 @@ pub async fn room_add(
     let _ = next_ext(None, class)?;
     let index = require_index(cli, dir).await?;
     let room = read_room_state(cli, &owner, state_file.map(|p| p.as_path())).await?;
-    let (records, notes) =
-        sync_one(cli, dir, &index, &owner, room, ch.as_ref(), &mint, now).await?;
+    let (records, notes) = sync_one(dir, &index, &owner, room, ch.as_ref(), &mint, now)?;
     for n in &notes {
         println!("{n}");
     }
@@ -288,17 +285,7 @@ pub async fn room_refresh(
                 None
             }
         };
-        let (recs, notes) = sync_one(
-            cli,
-            dir,
-            &index,
-            o,
-            room,
-            None,
-            &MintOptions::default(),
-            now,
-        )
-        .await?;
+        let (recs, notes) = sync_one(dir, &index, o, room, None, &MintOptions::default(), now)?;
         for n in &notes {
             println!("{}: {n}", owner_b58(o));
         }

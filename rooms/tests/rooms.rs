@@ -777,7 +777,6 @@ fn an_owner_cannot_be_the_source_of_a_characterization() {
 
 #[test]
 fn another_writers_ext_keys_survive_a_refresh() {
-    let mut idx = index();
     let sk = key();
     let vk = sk.verifying_key();
     let d = eligible(evaluate(&vk, &public_room(&sk, 1, "R", None), true));
@@ -798,7 +797,6 @@ fn another_writers_ext_keys_survive_a_refresh() {
         next.ext.as_ref().unwrap().get("crawl").map(String::as_str),
         Some("x")
     );
-    drop(idx.state);
 }
 
 // ---------------------------------------------------------------------------
@@ -1173,7 +1171,7 @@ fn search_ignores_non_room_entries_and_malformed_room_locators() {
 mod golden {
     use super::*;
 
-    include!("golden_fixture.rs");
+    include!("fixtures/golden.rs");
 
     fn unhex(s: &str) -> Vec<u8> {
         (0..s.len())
@@ -1200,5 +1198,13 @@ mod golden {
             excluded(evaluate(&other, &unhex(PUBLIC), true)).0,
             Exclusion::Unverifiable(_)
         ));
+    }
+
+    #[test]
+    fn room_instance_id_matches_real_river_core() {
+        let vk = VerifyingKey::from_bytes(&unhex(OWNER_VK).try_into().unwrap()).unwrap();
+        let id = atlas_rooms::contract::room_instance_id(&vk, &[5u8; 32]);
+        let hex: String = id.iter().map(|b| format!("{b:02x}")).collect();
+        assert_eq!(hex, ROOM_ID_CODE5);
     }
 }
