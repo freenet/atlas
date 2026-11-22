@@ -796,7 +796,7 @@ mod tests {
         assert_eq!(state.live_entries().count(), 0);
 
         // A failed read (no state) changes nothing authoritative.
-        let (recs, _) =
+        let (recs, _, _) =
             sync_one(&dir, &state, &vk, None, None, &MintOptions::default(), 300).unwrap();
         assert!(recs.is_empty());
         let _ = std::fs::remove_dir_all(&dir);
