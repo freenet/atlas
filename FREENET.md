@@ -68,22 +68,21 @@ without a good read.
 
 **Limits of the privacy gate, stated plainly.**
 - **Freshness.** The gate proves the configuration was signed by the owner, not
-  that it is current. `atlasctl` reads rooms with a subscribing GET and
-  keeps a persisted anti-rollback floor for River's room-contract pointer
-  (`river_room_pointer_floor.json` in the key directory), but a subscribing GET is not a
-  network-fresh read: freenet-core serves a copy the node already hosts, is
-  subscribed to, or holds while isolated, and only otherwise asks the network. A
-  lagging or hostile node could still serve an old public configuration. The stale-read guard only
-  protects rooms already listed, so a FIRST `room-add` has nothing to compare
-  against. `room-add` prints the owner-signed configuration version and
-  privacy mode it read, so compare them with the room before publishing.
-- **Standing subscriptions.** Each room read leaves the local node subscribed to
-  that room contract (freenet-stdlib 0.8 has no unsubscribe request), so a sweep
-  subscribes the node to every listed room until the node drops them. A room the
-  network cannot find is abandoned after 25 seconds.
-- **A sweep delists at most a fifth of the rooms (minimum 3)** unless
+  that it is current. `atlasctl` reads rooms with a plain GET and keeps a
+  persisted anti-rollback floor for River's room-contract pointer
+  (`river_room_pointer_floor.json` in the key directory), and a listed room's
+  configuration version never goes backwards. A node may still serve an older
+  copy of a room, and the version guard only protects rooms already listed, so
+  a FIRST `room-add` has nothing to compare against. `room-add` prints the
+  owner-signed configuration version and privacy mode it read: the curator
+  checks them against the room before publishing.
+- **One run at a time.** Concurrent `atlasctl` runs against one key directory
+  are not supported; the floor file is not locked.
+- **A sweep delists at most a fifth of the rooms, with a floor of 3,** unless
   `--force-delist` is passed, because a River configuration change this reader
-  cannot parse delists every room it touches (fail closed).
+  cannot parse delists every room it touches (fail closed). The floor means an
+  index of 3 rooms or fewer is not protected by the cap. `--dry-run` reports
+  the would-delist count before the cap applies.
 - **Opt-out depends on the field name.** Until river#974 merges, the reader looks
   for `public_admission` by name. If River ships a different name, an owner's
   `listed == false` would read as "no policy" and the room would stay eligible,

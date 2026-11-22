@@ -39,10 +39,6 @@ pub const RIVER_AUTHOR_VK: &str = "9Ebskq4y7NvJpTQTrF1FAxU8g6bR4Rhe4TRikXba55EJ"
 #[cfg(test)]
 const ROOM_CONTRACT_POINTER_KEY: &str = "Ai4VLoC2jGdhpcB2UU8VPo3efUoxjm1Ju9VKXqRC63Az";
 
-/// Longest a single room read may block. A room the network cannot find would
-/// otherwise run the client's full 60 s roundtrip timeout per room.
-const ROOM_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(25);
-
 /// File in the key directory holding the anti-rollback floor for River's
 /// room-contract pointer.
 const FLOOR_FILE: &str = "river_room_pointer_floor.json";
@@ -140,22 +136,31 @@ fn load_floor(dir: &Path) -> Result<PointerFloor> {
 
 fn save_floor(dir: &Path, floor: &PointerFloor) -> Result<()> {
     let path = dir.join(FLOOR_FILE);
-    // A per-process, per-call temp name so two concurrent runs cannot interleave
-    // writes into one file, and an fsync before the rename so a crash leaves
-    // either the old floor or the new one, never a truncated file.
+    // A per-process, per-call temp name, fsync of the file and then of the
+    // directory, and the temp file removed on failure. Concurrent `atlasctl`
+    // runs against one key directory are not supported: load-modify-save is not
+    // locked, so the last rename wins and the floor may not rise monotonically.
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos())
         .unwrap_or(0);
     let tmp = dir.join(format!("{FLOOR_FILE}.{}.{nanos}.tmp", std::process::id()));
-    {
+    let write = || -> Result<()> {
         use std::io::Write;
         let mut f =
             std::fs::File::create(&tmp).with_context(|| format!("creating {}", tmp.display()))?;
         f.write_all(serde_json::to_string_pretty(&StoredFloor::from_floor(floor))?.as_bytes())?;
         f.sync_all()?;
+        std::fs::rename(&tmp, &path).with_context(|| format!("writing {}", path.display()))?;
+        // Make the rename itself durable.
+        std::fs::File::open(dir)?.sync_all()?;
+        Ok(())
+    };
+    let r = write();
+    if r.is_err() {
+        let _ = std::fs::remove_file(&tmp);
     }
-    std::fs::rename(&tmp, &path).with_context(|| format!("writing {}", path.display()))
+    r
 }
 
 // ---------------------------------------------------------------------------
@@ -175,13 +180,10 @@ impl PointerIo for NodePointerIo<'_> {
     type Error = std::convert::Infallible;
 
     async fn get_pointer(&mut self, id: ContractInstanceId) -> Result<PointerFetch, Self::Error> {
-        // A subscribing read (`subscribe = true`). NOT a guarantee of a
-        // network-fresh copy: freenet-core serves a locally held copy at once when
-        // this node is isolated, subscribed to the contract, or a hosting
-        // in-mesh peer for it, and only otherwise fetches from the network
-        // (`client_events.rs`, `ContractRequest::Get`). What it buys is that a
-        // copy served this way is one the node keeps updated.
-        Ok(match self.client.get_instance_optional(id, true).await {
+        // A plain GET. The node may serve a copy it already holds, so this is not
+        // proof of the network's current state; the persisted floor is what stops
+        // a rollback.
+        Ok(match self.client.get_instance_optional(id, false).await {
             Ok(Some(bytes)) => PointerFetch::State(bytes),
             Ok(None) | Err(_) => PointerFetch::Unreachable,
         })
@@ -239,29 +241,16 @@ impl RoomReader {
         Ok(Self { client, code_hash })
     }
 
-    /// A subscribing read (`subscribe = true`) of the room, bounded by
-    /// [`ROOM_READ_TIMEOUT`]. This is not a network-fresh read (see
-    /// [`NodePointerIo`]): a copy the node already hosts or is subscribed to is
-    /// served directly. A first `Add` has no stored configuration version to
-    /// compare against, so this is a limit of the privacy gate (FREENET.md).
+    /// A plain GET of the room. The node may serve an older copy it already
+    /// holds, so a FIRST `Add` has no stored configuration version to compare
+    /// against; this is a limit of the privacy gate (FREENET.md). A read that
+    /// hangs ends with the client's 60 s roundtrip timeout, which is an `Err`
+    /// and is counted in `failures` by `room_refresh`.
     ///
-    /// Side effect: the local node stays subscribed to each room contract it
-    /// reads. freenet-stdlib 0.8 has no unsubscribe request, so those
-    /// subscriptions end only when the node drops them.
-    ///
-    /// `None` is "could not read it" (not found, or timed out), NOT evidence the
-    /// room is gone.
+    /// `None` is "could not read it", NOT evidence the room is gone.
     async fn read(&mut self, owner: &VerifyingKey) -> Result<Option<Vec<u8>>> {
         let id = ContractInstanceId::new(room_instance_id(owner, &self.code_hash));
-        match tokio::time::timeout(
-            ROOM_READ_TIMEOUT,
-            self.client.get_instance_optional(id, true),
-        )
-        .await
-        {
-            Ok(r) => r,
-            Err(_) => Ok(None),
-        }
+        self.client.get_instance_optional(id, false).await
     }
 }
 
@@ -507,14 +496,23 @@ pub async fn room_refresh(
     }
     let tombs = count_tombstones(&all);
     if tombs > delist_cap(owners.len()) && !force_delist {
-        bail!(
-            "this sweep would delist {tombs} of {} room(s), more than the {} allowed without \
+        if dry_run {
+            println!(
+                "dry run: this sweep would delist {tombs} of {} room(s), more than the {} a real \
+                 run allows without --force-delist (see the notes above for which)",
+                owners.len(),
+                delist_cap(owners.len())
+            );
+        } else {
+            bail!(
+                "this sweep would delist {tombs} of {} room(s), more than the {} allowed without \
              --force-delist. Nothing was published. A change in River's configuration format \
              that this reader cannot parse looks exactly like this; check a room's state, \
              then re-run with --force-delist if the delistings are real.",
-            owners.len(),
-            delist_cap(owners.len())
-        );
+                owners.len(),
+                delist_cap(owners.len())
+            );
+        }
     }
     if all.is_empty() {
         println!("{} room(s) checked, nothing to publish", owners.len());
