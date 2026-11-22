@@ -56,9 +56,9 @@ words cannot outlive an edit.
 **Who is indexed.** Only rooms whose owner-signed configuration verifies against
 the owner key in the locator, is `PrivacyMode::Public` with a plaintext name, and
 that a curator or the owner has submitted (`atlasctl room-add`). When river#974
-adds `PublicRoomPolicy.listed`, an explicit `listed == false` always delists and
+adds `Configuration.public_admission.listed`, an explicit `listed == false` always delists and
 `listed == true` stands in for the submission; the hook is
-`view::RoomConfig::listed`, and its field name is provisional until #974 lands.
+`view::RoomConfig::listed`, pending until river#974 lands; no real configuration carries `public_admission` yet.
 A refresh delists a room that goes private or opts out, ignores a read older than
 the entry, and on an unreadable room only marks the entry `unreachable`.
 

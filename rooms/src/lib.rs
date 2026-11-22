@@ -6,7 +6,7 @@
 //! under `common/` changed, so the index address does not move.
 //!
 //! - [`eligibility`]: the gate. Public AND listed (or explicitly submitted until
-//!   river#974 adds `PublicRoomPolicy.listed`), owner signature verified.
+//!   river#974 adds `Configuration.public_admission.listed`), owner signature verified.
 //! - [`entry`]: the descriptor schema (see its module docs) and entry refresh.
 //! - [`reconcile`]: duplicates, renames, stale reads, delisting.
 //! - [`search`]: the read API for River's Discover Rooms.

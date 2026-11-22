@@ -15,7 +15,7 @@
 //! `CBOR(Configuration)` (`AuthorizedConfigurationV1::verify_signature`). The
 //! configuration is decoded to a generic CBOR value first, and the signature is
 //! checked over that value's re-encoding, so the check covers every field,
-//! including ones this view does not model (a `public_room_policy` added by
+//! including ones this view does not model (a `public_admission` added by
 //! river#974, say). A mirrored struct could not do that: it would drop the
 //! unknown field and the re-encoding would no longer match the signed bytes.
 //! The round trip is pinned against a configuration produced by real
@@ -83,7 +83,7 @@ pub struct Display {
     pub description: Option<Sealed>,
 }
 
-/// Provisional shape of river#974's `PublicRoomPolicy`. Only `listed` is read.
+/// PENDING river#974: `Configuration.public_admission: Option<PublicRoomPolicy>` (frozen design; the field does not exist in real configurations yet). Only `listed` is read.
 /// The field name is the coordinator's working shape and is #974's to finalise;
 /// see [`RoomConfig::listed`].
 #[derive(Deserialize, Clone, Debug)]
@@ -97,10 +97,10 @@ struct ConfigView {
     configuration_version: u32,
     privacy_mode: Privacy,
     display: Display,
-    // TODO(river#974): confirm the field name once #974 lands. Until the field
+    // PENDING river#974: field name per the frozen design. Until the field
     // exists in real configurations this is always `None`.
     #[serde(default)]
-    public_room_policy: Option<PolicyView>,
+    public_admission: Option<PolicyView>,
 }
 
 /// What Atlas reads from a room, after the owner signature has been verified.
@@ -109,7 +109,7 @@ pub struct RoomConfig {
     pub configuration_version: u32,
     pub privacy: Privacy,
     pub display: Display,
-    /// The owner's `PublicRoomPolicy.listed` opt-in.
+    /// The owner's `Configuration.public_admission.listed` opt-in.
     ///
     /// HOOK for river#974. `None` means the configuration carries no policy
     /// (every room today); callers must then fall back to an explicit curator or
@@ -138,7 +138,7 @@ impl RoomConfig {
             configuration_version: cfg.configuration_version,
             privacy: cfg.privacy_mode,
             display: cfg.display,
-            listed: cfg.public_room_policy.map(|p| p.listed),
+            listed: cfg.public_admission.map(|p| p.listed),
         })
     }
 }

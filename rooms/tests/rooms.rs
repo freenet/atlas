@@ -69,7 +69,7 @@ struct Cfg {
     max_direct_messages: Option<usize>,
     // Provisional river#974 shape; present only when a test sets it.
     #[serde(skip_serializing_if = "Option::is_none")]
-    public_room_policy: Option<Policy>,
+    public_admission: Option<Policy>,
 }
 
 #[derive(Serialize)]
@@ -110,7 +110,7 @@ fn cfg(version: u32, mode: Pm, name: Sealed, desc: Option<Sealed>) -> Cfg {
         max_room_name: 128,
         max_room_description: 1024,
         max_direct_messages: None,
-        public_room_policy: None,
+        public_admission: None,
     }
 }
 
@@ -227,12 +227,12 @@ fn without_a_listed_flag_an_unsubmitted_room_is_not_indexed() {
 fn the_listed_hook_opts_in_and_an_opt_out_beats_a_submission() {
     let sk = key();
     let mut c = cfg(1, Pm::Public, public_text("Room"), None);
-    c.public_room_policy = Some(Policy { listed: true });
+    c.public_admission = Some(Policy { listed: true });
     let st = signed_state(&sk, c.clone());
     // listed == true needs no submission.
     eligible(evaluate(&sk.verifying_key(), &st, false));
     // listed == false wins even over an explicit submission.
-    c.public_room_policy = Some(Policy { listed: false });
+    c.public_admission = Some(Policy { listed: false });
     let st = signed_state(&sk, c);
     assert_eq!(
         excluded(evaluate(&sk.verifying_key(), &st, true)).0,
@@ -244,7 +244,7 @@ fn the_listed_hook_opts_in_and_an_opt_out_beats_a_submission() {
 fn a_private_room_is_excluded_even_if_listed() {
     let sk = key();
     let mut c = cfg(1, Pm::Private, public_text("Room"), None);
-    c.public_room_policy = Some(Policy { listed: true });
+    c.public_admission = Some(Policy { listed: true });
     let st = signed_state(&sk, c);
     assert_eq!(
         excluded(evaluate(&sk.verifying_key(), &st, true)).0,
@@ -626,7 +626,7 @@ fn a_room_that_opts_out_of_listing_is_delisted() {
     let p = plan_for(&idx, &sk, &public_room(&sk, 1, "Room", None), None, 100);
     apply(&mut idx, p);
     let mut c = cfg(2, Pm::Public, public_text("Room"), None);
-    c.public_room_policy = Some(Policy { listed: false });
+    c.public_admission = Some(Policy { listed: false });
     let p = plan_for(&idx, &sk, &signed_state(&sk, c), None, 200);
     apply(&mut idx, p);
     assert!(live_rooms(&idx).is_empty());
