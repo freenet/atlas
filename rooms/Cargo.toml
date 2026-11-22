@@ -23,6 +23,7 @@ ed25519-dalek.workspace = true
 bs58.workspace = true
 blake3.workspace = true
 serde.workspace = true
+unicode-properties = "0.1"
 
 [dev-dependencies]
 rand.workspace = true

@@ -8,25 +8,30 @@
 //!
 //! What is removed, and why each class matters:
 //! - C0/C1 controls (ANSI escape, CR/LF): terminal injection.
-//! - Bidi overrides and isolates (U+202A-202E, U+2066-2069): make a name render
-//!   as something other than what it is, and reorder surrounding UI text.
-//! - Zero-width and invisible formatting (U+200B-200F, U+2060-2064, U+FEFF,
-//!   U+00AD): lets two different rooms render identically.
-//! - Tag characters (U+E0000-E007F): invisible payload channel.
+//! - Every Unicode format character (category Cf): bidi overrides and isolates,
+//!   zero-width characters, soft hyphen, ALM, tag characters. These make a name
+//!   render as something other than what it is, or let two rooms look identical.
+//! - Variation selectors and the invisible fillers (CGJ, Hangul and Khmer
+//!   fillers), which Cf does not cover.
 //! - Line/paragraph separators (U+2028/2029): treated as whitespace.
 //!
 //! Whitespace of any kind collapses to one space and the ends are trimmed, so a
 //! card is always a single line.
 
 fn is_invisible(c: char) -> bool {
-    matches!(c,
-        '\u{00AD}'
-        | '\u{200B}'..='\u{200F}'
-        | '\u{202A}'..='\u{202E}'
-        | '\u{2060}'..='\u{2064}'
-        | '\u{2066}'..='\u{2069}'
-        | '\u{FEFF}'
-        | '\u{E0000}'..='\u{E007F}')
+    use unicode_properties::{GeneralCategory, UnicodeGeneralCategory};
+    // Every format character (Cf) covers the bidi controls, zero-width
+    // characters, ALM (U+061C), soft hyphen, interlinear annotations
+    // (U+FFF9-FFFB), U+180E and the tag block, including ones added by later
+    // Unicode versions. The ranges below are what Cf does not cover.
+    c.general_category() == GeneralCategory::Format
+        || matches!(c,
+            // variation selectors, which change how a neighbour renders
+            '\u{FE00}'..='\u{FE0F}' | '\u{E0100}'..='\u{E01EF}'
+            | '\u{180B}'..='\u{180D}' | '\u{180F}'
+            // combining grapheme joiner and the invisible Hangul/Khmer fillers
+            | '\u{034F}' | '\u{115F}' | '\u{1160}' | '\u{17B4}' | '\u{17B5}'
+            | '\u{3164}' | '\u{FFA0}')
 }
 
 /// Clean `s` to a single printable line of at most `max_bytes` UTF-8 bytes,
@@ -91,6 +96,18 @@ mod tests {
     fn bidi_and_zero_width_are_removed() {
         let got = sanitize_line("ad\u{202E}min\u{200B}\u{FEFF}!", 200).unwrap();
         assert_eq!(got, "admin!");
+    }
+
+    #[test]
+    fn category_format_characters_and_fillers_are_removed() {
+        // ALM, CGJ, Hangul fillers, Mongolian vowel separator, variation
+        // selectors, interlinear annotation anchors.
+        let got = sanitize_line(
+            "a\u{061C}b\u{034F}c\u{115F}d\u{1160}e\u{3164}f\u{180E}g\u{FE0F}h\u{E0100}i\u{FFF9}j",
+            200,
+        )
+        .unwrap();
+        assert_eq!(got, "abcdefghij");
     }
 
     #[test]

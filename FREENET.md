@@ -53,14 +53,34 @@ room's own state, so a client reads it from the room. The index carries only
 what Atlas asserts, so the two are never merged and a stale copy of the owner's
 words cannot outlive an edit.
 
-**Who is indexed.** Only rooms whose owner-signed configuration verifies against
-the owner key in the locator, is `PrivacyMode::Public` with a plaintext name, and
-that a curator or the owner has submitted (`atlasctl room-add`). When river#974
-adds `Configuration.public_admission.listed`, an explicit `listed == false` always delists and
-`listed == true` stands in for the submission; the hook is
-`view::RoomConfig::listed`, pending until river#974 lands; no real configuration carries `public_admission` yet.
-A refresh delists a room that goes private or opts out, ignores a read older than
-the entry, and on an unreadable room only marks the entry `unreachable`.
+**Who is indexed.** Only rooms whose owner-signed configuration verifies
+(`verify_strict`) against the owner key in the locator, is `PrivacyMode::Public`
+with a plaintext name, and that a curator has submitted (`atlasctl room-add`).
+Owner self-announcement waits for river#974: the owner's opt-in is
+`Configuration.public_admission.listed` (river branch `feat/public-admission`,
+**pending until that merges**; no deployed configuration carries it yet). When it
+exists, `listed == false` always delists and `listed == true` stands in for the
+submission. A refresh delists a room that goes private, opts out, or whose
+owner-signed configuration this reader cannot parse (fail closed), ignores a read
+older than any listing for that owner (equal is not stale), and on an unreadable
+room only marks the entry `unreachable`, and only once it has gone 24 hours
+without a good read.
+
+**Limits of the privacy gate, stated plainly.**
+- **Freshness.** The gate proves the configuration was signed by the owner, not
+  that it is current. `atlasctl` reads rooms with a fresh (subscribing) GET and
+  keeps a persisted anti-rollback floor for River's room-contract pointer
+  (`river_room_pointer_floor.json` in the key directory), but a lagging or hostile
+  node could still serve an old public configuration. The stale-read guard only
+  protects rooms already listed, so a FIRST `room-add` has nothing to compare
+  against. Check a room's current state yourself before adding it.
+- **Opt-out depends on the field name.** Until river#974 merges, the reader looks
+  for `public_admission` by name. If River ships a different name, an owner's
+  `listed == false` would read as "no policy" and the room would stay eligible,
+  because `room-add` and `room-refresh` always count as a submission. The golden
+  fixtures from the #974 branch fail if the name changes.
+- **Nothing schedules `room-refresh`** ([#88](https://github.com/freenet/atlas/issues/88)),
+  so a room that goes private stays listed until someone runs it.
 
 ```bash
 atlasctl room-add <owner-key> --landing general --tags rust,chat \
@@ -70,7 +90,8 @@ atlasctl rooms [query] [--tag t] [--json] [--only-live] [--all]
 ```
 
 For links to resolve in the UI, the `river` app must be registered
-(`atlasctl app-set --app river ...`).
+(`atlasctl app-set --app river ...`; tracked in [#86](https://github.com/freenet/atlas/issues/86)).
+Rooms stay hidden by safe search until classified ([#87](https://github.com/freenet/atlas/issues/87)).
 
 ## Notes for integrators
 

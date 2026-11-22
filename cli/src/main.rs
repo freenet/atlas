@@ -382,7 +382,8 @@ enum Cmd {
     },
     /// Search listed rooms (the read path River's Discover Rooms mirrors).
     Rooms {
-        /// Case-insensitive text over title, description and tags.
+        /// Case-insensitive text over title, Atlas description and tags (the owner's
+        /// own description is not indexed).
         query: Option<String>,
         /// Require this tag. Repeatable.
         #[arg(long)]

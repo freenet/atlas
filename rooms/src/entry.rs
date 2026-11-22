@@ -224,16 +224,25 @@ pub fn next_entry(
     }))
 }
 
+/// An entry verified live within this window is not marked unreachable by a
+/// single failed read, so one flaky or hostile node cannot make a sweep publish a
+/// signed update per room, and the next good read publish another.
+pub const UNREACHABLE_GRACE_SECS: u64 = 24 * 3600;
+
 /// Mark an entry as not currently reachable, after a read that proved nothing.
-/// `None` if it is already marked, so repeated failures do not churn versions.
+/// `None` if it is already marked (repeated failures do not churn versions) or
+/// was verified live within [`UNREACHABLE_GRACE_SECS`].
 /// This is not a takedown: transient unreachability is normal on Freenet.
 pub fn mark_unreachable(current: &IndexEntry, now: u64) -> Result<Option<IndexEntry>, String> {
-    if current
-        .verified
-        .as_ref()
-        .is_some_and(|v| v.status.as_str() == VerifyStatus::UNREACHABLE)
-    {
-        return Ok(None);
+    if let Some(v) = &current.verified {
+        if v.status.as_str() == VerifyStatus::UNREACHABLE {
+            return Ok(None);
+        }
+        if v.status.as_str() == VerifyStatus::LIVE
+            && now.saturating_sub(v.last_verified_at) < UNREACHABLE_GRACE_SECS
+        {
+            return Ok(None);
+        }
     }
     Ok(Some(IndexEntry {
         version: current

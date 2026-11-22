@@ -1,7 +1,7 @@
 //! Who gets indexed. The gate is deliberately a list of REASONS TO EXCLUDE, each
 //! of which maps to a different action when the room is already listed.
 
-use atlas_common::{Locator, MAX_SNIPPET, MAX_TITLE};
+use atlas_common::{Locator, MAX_TITLE};
 use ed25519_dalek::VerifyingKey;
 
 use crate::text::sanitize_line;
@@ -19,7 +19,14 @@ pub fn parse_owner(s: &str) -> Result<VerifyingKey, String> {
         .as_slice()
         .try_into()
         .map_err(|_| format!("owner key is {} bytes, expected 32", bytes.len()))?;
-    VerifyingKey::from_bytes(&arr).map_err(|e| format!("owner key is not a valid ed25519 key: {e}"))
+    let vk = VerifyingKey::from_bytes(&arr)
+        .map_err(|e| format!("owner key is not a valid ed25519 key: {e}"))?;
+    // A small-order key can validate signatures over arbitrary messages, so it
+    // cannot identify an owner.
+    if vk.is_weak() {
+        return Err("owner key is a weak (small-order) key".to_string());
+    }
+    Ok(vk)
 }
 
 pub fn owner_b58(owner: &VerifyingKey) -> String {
@@ -47,7 +54,9 @@ pub fn owner_of_locator(loc: &Locator) -> Option<VerifyingKey> {
     }
 }
 
-/// A room that passed the gate, with its owner-signed text cleaned for display.
+/// A room that passed the gate. Holds only what the index stores: the owner key,
+/// the configuration version the read was at, and the sanitised room NAME. The
+/// owner's description is deliberately absent (clients read it from the room).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RoomDescriptor {
     pub owner: [u8; 32],
@@ -56,9 +65,6 @@ pub struct RoomDescriptor {
     pub configuration_version: u32,
     /// Owner-supplied room name, sanitised and cut to `MAX_TITLE` bytes.
     pub name: String,
-    /// Owner-supplied description, sanitised and cut to `MAX_SNIPPET` bytes.
-    /// `None` when the owner wrote none or it was not printable text.
-    pub description: Option<String>,
 }
 
 /// Why a room must NOT be (or stay) in the index.
@@ -80,6 +86,10 @@ pub enum Exclusion {
     UnusableName,
     /// The read proved nothing: undecodable state or a bad owner signature.
     Unverifiable(String),
+    /// The configuration is owner-signed but this reader cannot interpret it.
+    /// Fails closed: an owner statement we cannot read must not keep a room
+    /// listed.
+    UnsupportedConfig(String),
 }
 
 impl Exclusion {
@@ -98,6 +108,9 @@ impl std::fmt::Display for Exclusion {
             Exclusion::NotListed => write!(f, "room is not listed for discovery"),
             Exclusion::UnusableName => write!(f, "room name is empty or unprintable"),
             Exclusion::Unverifiable(e) => write!(f, "could not verify room state: {e}"),
+            Exclusion::UnsupportedConfig(e) => {
+                write!(f, "owner-signed configuration not understood: {e}")
+            }
         }
     }
 }
@@ -126,6 +139,9 @@ pub enum Decision {
 pub fn evaluate(owner: &VerifyingKey, state: &[u8], submitted: bool) -> Decision {
     let cfg = match RoomConfig::from_state(state, owner) {
         Ok(c) => c,
+        Err(ViewError::SignedButUnreadable(e)) => {
+            return Decision::Excluded(Exclusion::UnsupportedConfig(e), None)
+        }
         Err(e @ (ViewError::Undecodable(_) | ViewError::BadSignature)) => {
             return Decision::Excluded(Exclusion::Unverifiable(e.to_string()), None)
         }
@@ -154,19 +170,9 @@ pub(crate) fn decide(owner: &VerifyingKey, cfg: &RoomConfig, submitted: bool) ->
     let Some(name) = name else {
         return Decision::Excluded(Exclusion::UnusableName, cv);
     };
-    // A description that is encrypted, not UTF-8 or unprintable is simply
-    // absent: it costs the room its blurb, not its listing.
-    let description = cfg
-        .display
-        .description
-        .as_ref()
-        .and_then(|d| d.public_bytes())
-        .and_then(|b| std::str::from_utf8(b).ok())
-        .and_then(|s| sanitize_line(s, MAX_SNIPPET));
     Decision::Eligible(RoomDescriptor {
         owner: owner.to_bytes(),
         configuration_version: cfg.configuration_version,
         name,
-        description,
     })
 }

@@ -26,6 +26,8 @@ use serde::Serialize;
 enum Pm {
     Public,
     Private,
+    // A privacy mode this reader has never heard of, signed by the owner.
+    Hidden,
 }
 
 #[derive(Serialize, Clone)]
@@ -166,21 +168,76 @@ fn a_submitted_public_room_is_eligible_with_its_owner_text() {
     let st = public_room(&sk, 3, "Rust Chat", Some("All about Rust"));
     let d = eligible(evaluate(&sk.verifying_key(), &st, true));
     assert_eq!(d.name, "Rust Chat");
-    assert_eq!(d.description.as_deref(), Some("All about Rust"));
     assert_eq!(d.configuration_version, 3);
 }
 
 #[test]
-fn private_rooms_are_excluded_and_their_text_is_never_read() {
+fn private_is_decided_before_any_text_is_read() {
     let sk = key();
-    // A private room whose plaintext name is a secret-looking string: it must
-    // not appear anywhere in the outcome.
-    let st = signed_state(&sk, cfg(1, Pm::Private, public_text("TOPSECRET"), None));
+    // A private room whose name is not even valid UTF-8. If the name were read
+    // first the outcome would be `UnusableName`; it is `Private`, so the mode is
+    // checked before any text.
+    let st = signed_state(
+        &sk,
+        cfg(
+            1,
+            Pm::Private,
+            Sealed::Public {
+                value: vec![0xff, 0xfe],
+            },
+            None,
+        ),
+    );
     let (why, v) = excluded(evaluate(&sk.verifying_key(), &st, true));
     assert_eq!(why, Exclusion::Private);
-    assert!(!format!("{why:?}").contains("TOPSECRET"));
     assert_eq!(v, Some(1));
     assert!(why.delists());
+}
+
+#[test]
+fn an_owner_description_of_any_shape_does_not_affect_eligibility() {
+    let sk = key();
+    for desc in [
+        None,
+        Some(Sealed::Public {
+            value: vec![0xff, 0xfe],
+        }),
+        Some(Sealed::Private {
+            ciphertext: vec![1; 8],
+            nonce: [0; 12],
+            secret_version: 1,
+            declared_len_bytes: 4,
+        }),
+    ] {
+        let st = signed_state(&sk, cfg(1, Pm::Public, public_text("Room"), desc));
+        assert_eq!(
+            eligible(evaluate(&sk.verifying_key(), &st, true)).name,
+            "Room"
+        );
+    }
+}
+
+#[test]
+fn an_owner_signed_configuration_this_reader_cannot_parse_delists() {
+    // Signed correctly, but with a privacy mode this reader does not know.
+    // Treating that as a transient read error would let an owner-signed change
+    // never remove a listing.
+    let sk = key();
+    let st = signed_state(&sk, cfg(4, Pm::Hidden, public_text("Room"), None));
+    let (why, v) = excluded(evaluate(&sk.verifying_key(), &st, true));
+    assert!(matches!(why, Exclusion::UnsupportedConfig(_)), "{why:?}");
+    assert!(why.delists());
+    assert_eq!(v, None);
+}
+
+#[test]
+fn weak_owner_keys_are_refused() {
+    // The identity point (small order): verifies signatures over arbitrary data
+    // under non-strict verification, so it must not identify an owner.
+    let mut identity = [0u8; 32];
+    identity[0] = 1;
+    let b58 = bs58::encode(identity).into_string();
+    assert!(parse_owner(&b58).is_err());
 }
 
 #[test]
@@ -197,20 +254,6 @@ fn encrypted_names_are_excluded_even_in_public_mode() {
         excluded(evaluate(&sk.verifying_key(), &st, true)).0,
         Exclusion::EncryptedName
     );
-}
-
-#[test]
-fn encrypted_description_costs_the_blurb_not_the_listing() {
-    let sk = key();
-    let desc = Sealed::Private {
-        ciphertext: vec![1; 8],
-        nonce: [0; 12],
-        secret_version: 1,
-        declared_len_bytes: 4,
-    };
-    let st = signed_state(&sk, cfg(1, Pm::Public, public_text("Room"), Some(desc)));
-    let d = eligible(evaluate(&sk.verifying_key(), &st, true));
-    assert_eq!(d.description, None);
 }
 
 #[test]
@@ -310,15 +353,15 @@ fn garbage_state_is_unverifiable_not_a_panic() {
 #[test]
 fn hostile_text_is_neutralised_into_a_publishable_entry() {
     let sk = key();
-    let name = "Ro\x1b[2Jom\u{202E}evil\u{200B}\r\n";
-    let desc = "line1\nline2\x07\u{E0041} ".to_string() + &"x".repeat(2000);
-    let st = public_room(&sk, 1, name, Some(&desc));
+    let name =
+        "Ro\x1b[2Jom\u{202E}evil\u{200B}\u{061C}\u{3164}\r\n".to_string() + &"x".repeat(2000);
+    let st = public_room(&sk, 1, &name, None);
     let d = eligible(evaluate(&sk.verifying_key(), &st, true));
-    for t in [d.name.as_str(), d.description.as_deref().unwrap()] {
-        assert!(!t.chars().any(|c| c.is_control()), "{t:?}");
-        assert!(!t.contains('\u{202E}') && !t.contains('\u{200B}') && !t.contains('\u{E0041}'));
+    assert!(!d.name.chars().any(|c| c.is_control()), "{:?}", d.name);
+    for bad in ['\u{202E}', '\u{200B}', '\u{061C}', '\u{3164}'] {
+        assert!(!d.name.contains(bad));
     }
-    assert!(d.description.as_ref().unwrap().len() <= atlas_common::MAX_SNIPPET);
+    assert!(d.name.len() <= atlas_common::MAX_TITLE);
     // The result passes the contract's own structural check.
     let e = atlas_rooms::entry::new_entry(&d, None, vec![], false, None, None, 10).unwrap();
     RecordBody::Live(e).check_structure().unwrap();
@@ -342,26 +385,6 @@ fn an_empty_or_unprintable_or_non_utf8_name_is_excluded() {
             Exclusion::UnusableName
         );
     }
-}
-
-#[test]
-fn a_non_utf8_description_is_dropped_not_fatal() {
-    let sk = key();
-    let st = signed_state(
-        &sk,
-        cfg(
-            1,
-            Pm::Public,
-            public_text("Room"),
-            Some(Sealed::Public {
-                value: vec![0xff, 0xfe],
-            }),
-        ),
-    );
-    assert_eq!(
-        eligible(evaluate(&sk.verifying_key(), &st, true)).description,
-        None
-    );
 }
 
 // ---------------------------------------------------------------------------
@@ -492,6 +515,7 @@ fn plan_for(
             tags: vec!["rust".into()],
             featured: false,
             class: Some(general()),
+            ext: None,
         },
         now,
     )
@@ -694,14 +718,22 @@ fn duplicates_collapse_to_one_canonical_subject() {
 }
 
 #[test]
-fn an_unverifiable_read_marks_unreachable_once_and_never_delists() {
+fn an_unverifiable_read_marks_unreachable_once_after_the_grace_and_never_delists() {
+    use atlas_rooms::entry::UNREACHABLE_GRACE_SECS as GRACE;
     let mut idx = index();
     let sk = key();
     let p = plan_for(&idx, &sk, &public_room(&sk, 1, "Room", None), None, 100);
     apply(&mut idx, p);
 
+    // Inside the grace period one bad read changes nothing, so a flaky node
+    // cannot make a sweep publish an update per room.
     let impostor = public_room(&key(), 9, "Evil", None);
     let p = plan_for(&idx, &sk, &impostor, None, 200);
+    assert!(p.actions.is_empty(), "{:?}", p.notes);
+
+    // Past it, the entry is marked unreachable (and keeps its title).
+    let t = 100 + GRACE + 1;
+    let p = plan_for(&idx, &sk, &impostor, None, t);
     assert!(matches!(p.actions.as_slice(), [Action::Update(_)]));
     apply(&mut idx, p);
     let e = &live_rooms(&idx)[0];
@@ -712,11 +744,11 @@ fn an_unverifiable_read_marks_unreachable_once_and_never_delists() {
     assert_eq!(e.title, "Room", "the entry itself is untouched");
 
     // A second failure does not churn another version.
-    let p = plan_for(&idx, &sk, b"junk", None, 300);
+    let p = plan_for(&idx, &sk, b"junk", None, t + 10);
     assert!(p.actions.is_empty(), "{:?}", p.notes);
 
     // Recovery: a good read flips it back to live with a version bump.
-    let p = plan_for(&idx, &sk, &public_room(&sk, 1, "Room", None), None, 400);
+    let p = plan_for(&idx, &sk, &public_room(&sk, 1, "Room", None), None, t + 20);
     apply(&mut idx, p);
     assert_eq!(
         live_rooms(&idx)[0]
@@ -948,6 +980,7 @@ fn add_room(
             tags: tags.iter().map(|t| t.to_string()).collect(),
             featured,
             class,
+            ext: None,
         },
         now,
     )
@@ -1165,6 +1198,151 @@ fn search_ignores_non_room_entries_and_malformed_room_locators() {
 }
 
 // ---------------------------------------------------------------------------
+// Reconcile: kinds, duplicates and staleness across duplicates
+// ---------------------------------------------------------------------------
+
+fn put_entry(idx: &mut Idx, e: atlas_common::IndexEntry) {
+    let delta = IndexDelta {
+        key_auth: None,
+        records: vec![sign_rec(RecordBody::Live(e), &idx.online)],
+        apps: None,
+    };
+    idx.state.apply_delta(&delta, &idx.params).unwrap();
+}
+
+#[test]
+fn a_non_room_entry_at_the_locator_is_never_touched_and_blocks_the_add() {
+    let mut idx = index();
+    let sk = key();
+    let vk = sk.verifying_key();
+    let site = atlas_common::IndexEntry {
+        subject_id: atlas_common::SubjectId::random(),
+        version: 1,
+        kind: Kind::new(Kind::SITE),
+        title: "Not a room".into(),
+        snippet: String::new(),
+        tags: vec![],
+        locator: room_locator(&vk),
+        featured: false,
+        added_at: 1,
+        class: Some(general()),
+        verified: None,
+        ext: None,
+    };
+    put_entry(&mut idx, site.clone());
+    let d = evaluate(&vk, &public_room(&sk, 1, "Room", None), true);
+    let err = plan(&idx.state, &vk, &d, None, &MintOptions::default(), 100).unwrap_err();
+    assert!(err.contains("already used"), "{err}");
+    // Delisting a private room must not tombstone the Site either.
+    let private = evaluate(
+        &vk,
+        &signed_state(&sk, cfg(2, Pm::Private, public_text("R"), None)),
+        true,
+    );
+    let p = plan(
+        &idx.state,
+        &vk,
+        &private,
+        None,
+        &MintOptions::default(),
+        100,
+    )
+    .unwrap();
+    assert!(p.actions.is_empty());
+    // And room search does not list it.
+    assert!(search(
+        &idx.state,
+        &RoomFilter {
+            safe_search: false,
+            ..Default::default()
+        }
+    )
+    .is_empty());
+}
+
+fn room_entry_at(sk: &SigningKey, cv: u32, version: u64, added: u64) -> atlas_common::IndexEntry {
+    let d = eligible(evaluate(
+        &sk.verifying_key(),
+        &public_room(sk, cv, "Name", None),
+        true,
+    ));
+    let mut e =
+        atlas_rooms::entry::new_entry(&d, None, vec![], false, Some(general()), None, added)
+            .unwrap();
+    e.version = version;
+    e
+}
+
+#[test]
+fn a_duplicate_holding_a_newer_configuration_is_not_tombstoned_for_a_stale_canonical() {
+    let mut idx = index();
+    let sk = key();
+    // The canonical entry (higher version) was built from configuration 2; the
+    // lower-versioned duplicate from configuration 9.
+    put_entry(&mut idx, room_entry_at(&sk, 2, 5, 10));
+    put_entry(&mut idx, room_entry_at(&sk, 9, 1, 20));
+    let p = plan_for(&idx, &sk, &public_room(&sk, 5, "Name", None), None, 100);
+    assert!(p.actions.is_empty(), "{:?}", p.notes);
+    assert_eq!(live_rooms(&idx).len(), 2);
+}
+
+#[test]
+fn an_equal_configuration_version_is_not_stale() {
+    let mut idx = index();
+    let sk = key();
+    let p = plan_for(&idx, &sk, &public_room(&sk, 5, "Same", None), None, 100);
+    apply(&mut idx, p);
+    // Same version, but private: authoritative, so it delists.
+    let private = signed_state(&sk, cfg(5, Pm::Private, public_text("Same"), None));
+    let p = plan_for(&idx, &sk, &private, None, 200);
+    assert!(matches!(p.actions.as_slice(), [Action::Tombstone(_)]));
+}
+
+#[test]
+fn going_private_tombstones_every_duplicate() {
+    let mut idx = index();
+    let sk = key();
+    put_entry(&mut idx, room_entry_at(&sk, 1, 1, 10));
+    put_entry(&mut idx, room_entry_at(&sk, 1, 4, 20));
+    let private = signed_state(&sk, cfg(2, Pm::Private, public_text("Name"), None));
+    let p = plan_for(&idx, &sk, &private, None, 100);
+    assert_eq!(p.actions.len(), 2, "{:?}", p.notes);
+    apply(&mut idx, p);
+    assert!(live_rooms(&idx).is_empty());
+}
+
+#[test]
+fn an_entry_without_a_stored_version_still_refreshes() {
+    // Entries minted before `cv` existed carry no version: any signed read is
+    // accepted and stamps one, so they gain stale-read protection from then on.
+    let mut idx = index();
+    let sk = key();
+    let mut e = room_entry_at(&sk, 1, 1, 10);
+    e.ext.as_mut().unwrap().remove("cv");
+    put_entry(&mut idx, e);
+    let p = plan_for(&idx, &sk, &public_room(&sk, 1, "Renamed", None), None, 100);
+    apply(&mut idx, p);
+    let e = &live_rooms(&idx)[0];
+    assert_eq!(e.title, "Renamed");
+    assert_eq!(stored_config_version(e), Some(1));
+}
+
+#[test]
+fn only_the_canonical_duplicate_is_marked_unreachable() {
+    use atlas_rooms::entry::UNREACHABLE_GRACE_SECS as GRACE;
+    let mut idx = index();
+    let sk = key();
+    put_entry(&mut idx, room_entry_at(&sk, 1, 1, 10));
+    put_entry(&mut idx, room_entry_at(&sk, 1, 4, 20));
+    let p = plan_for(&idx, &sk, b"junk", None, 20 + GRACE + 1);
+    assert_eq!(p.actions.len(), 1, "{:?}", p.notes);
+    match &p.actions[0] {
+        Action::Update(e) => assert_eq!(e.version, 5, "the canonical (v4) entry is the one marked"),
+        other => panic!("{other:?}"),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Golden: bytes produced by real river-core
 // ---------------------------------------------------------------------------
 
@@ -1185,7 +1363,6 @@ mod golden {
         let vk = VerifyingKey::from_bytes(&unhex(OWNER_VK).try_into().unwrap()).unwrap();
         let d = eligible(evaluate(&vk, &unhex(PUBLIC), true));
         assert_eq!(d.name, "Rust Chat");
-        assert_eq!(d.description.as_deref(), Some("All about Rust"));
         assert_eq!(d.configuration_version, 3);
         assert_eq!(
             excluded(evaluate(&vk, &unhex(PRIVATE), true)).0,
@@ -1198,6 +1375,40 @@ mod golden {
             excluded(evaluate(&other, &unhex(PUBLIC), true)).0,
             Exclusion::Unverifiable(_)
         ));
+    }
+
+    // PENDING river#974 (branch feat/public-admission, not yet merged): these
+    // fixtures come from that branch's river-core. They pin the field NAME the
+    // reader looks for. If River renames it, `listed == false` would silently
+    // read as "no policy" and an opted-out room would stay eligible, so these
+    // fail loudly instead.
+    #[test]
+    fn public_admission_listed_false_is_an_opt_out_even_when_submitted() {
+        let vk = VerifyingKey::from_bytes(&unhex(OWNER_VK).try_into().unwrap()).unwrap();
+        assert_eq!(
+            excluded(evaluate(&vk, &unhex(LISTED_FALSE), true)).0,
+            Exclusion::NotListed
+        );
+    }
+
+    #[test]
+    fn public_admission_listed_true_needs_no_submission() {
+        let vk = VerifyingKey::from_bytes(&unhex(OWNER_VK).try_into().unwrap()).unwrap();
+        eligible(evaluate(&vk, &unhex(LISTED_TRUE), false));
+        // And the same room without a policy is NOT eligible unsubmitted.
+        assert_eq!(
+            excluded(evaluate(&vk, &unhex(PUBLIC), false)).0,
+            Exclusion::NotListed
+        );
+    }
+
+    #[test]
+    fn a_policy_on_a_private_room_is_inert() {
+        let vk = VerifyingKey::from_bytes(&unhex(OWNER_VK).try_into().unwrap()).unwrap();
+        assert_eq!(
+            excluded(evaluate(&vk, &unhex(PRIVATE_LISTED_TRUE), true)).0,
+            Exclusion::Private
+        );
     }
 
     #[test]
