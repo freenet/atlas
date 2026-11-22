@@ -39,6 +39,10 @@ pub const RIVER_AUTHOR_VK: &str = "9Ebskq4y7NvJpTQTrF1FAxU8g6bR4Rhe4TRikXba55EJ"
 #[cfg(test)]
 const ROOM_CONTRACT_POINTER_KEY: &str = "Ai4VLoC2jGdhpcB2UU8VPo3efUoxjm1Ju9VKXqRC63Az";
 
+/// Longest a single room read may block. A room the network cannot find would
+/// otherwise run the client's full 60 s roundtrip timeout per room.
+const ROOM_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(25);
+
 /// File in the key directory holding the anti-rollback floor for River's
 /// room-contract pointer.
 const FLOOR_FILE: &str = "river_room_pointer_floor.json";
@@ -136,11 +140,21 @@ fn load_floor(dir: &Path) -> Result<PointerFloor> {
 
 fn save_floor(dir: &Path, floor: &PointerFloor) -> Result<()> {
     let path = dir.join(FLOOR_FILE);
-    let tmp = dir.join(format!("{FLOOR_FILE}.tmp"));
-    std::fs::write(
-        &tmp,
-        serde_json::to_string_pretty(&StoredFloor::from_floor(floor))?,
-    )?;
+    // A per-process, per-call temp name so two concurrent runs cannot interleave
+    // writes into one file, and an fsync before the rename so a crash leaves
+    // either the old floor or the new one, never a truncated file.
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let tmp = dir.join(format!("{FLOOR_FILE}.{}.{nanos}.tmp", std::process::id()));
+    {
+        use std::io::Write;
+        let mut f =
+            std::fs::File::create(&tmp).with_context(|| format!("creating {}", tmp.display()))?;
+        f.write_all(serde_json::to_string_pretty(&StoredFloor::from_floor(floor))?.as_bytes())?;
+        f.sync_all()?;
+    }
     std::fs::rename(&tmp, &path).with_context(|| format!("writing {}", path.display()))
 }
 
@@ -161,9 +175,12 @@ impl PointerIo for NodePointerIo<'_> {
     type Error = std::convert::Infallible;
 
     async fn get_pointer(&mut self, id: ContractInstanceId) -> Result<PointerFetch, Self::Error> {
-        // A fresh read (`subscribe = true`): the pointer is what stops an older
-        // room-contract generation being trusted, so a cached copy is not good
-        // enough.
+        // A subscribing read (`subscribe = true`). NOT a guarantee of a
+        // network-fresh copy: freenet-core serves a locally held copy at once when
+        // this node is isolated, subscribed to the contract, or a hosting
+        // in-mesh peer for it, and only otherwise fetches from the network
+        // (`client_events.rs`, `ContractRequest::Get`). What it buys is that a
+        // copy served this way is one the node keeps updated.
         Ok(match self.client.get_instance_optional(id, true).await {
             Ok(Some(bytes)) => PointerFetch::State(bytes),
             Ok(None) | Err(_) => PointerFetch::Unreachable,
@@ -222,13 +239,29 @@ impl RoomReader {
         Ok(Self { client, code_hash })
     }
 
-    /// A FRESH read (`subscribe = true`) of the room: the node's cached copy can
-    /// predate the owner making the room private, and a first `Add` has no stored
-    /// configuration version to detect that. `None` is "could not read it", NOT
-    /// evidence the room is gone.
+    /// A subscribing read (`subscribe = true`) of the room, bounded by
+    /// [`ROOM_READ_TIMEOUT`]. This is not a network-fresh read (see
+    /// [`NodePointerIo`]): a copy the node already hosts or is subscribed to is
+    /// served directly. A first `Add` has no stored configuration version to
+    /// compare against, so this is a limit of the privacy gate (FREENET.md).
+    ///
+    /// Side effect: the local node stays subscribed to each room contract it
+    /// reads. freenet-stdlib 0.8 has no unsubscribe request, so those
+    /// subscriptions end only when the node drops them.
+    ///
+    /// `None` is "could not read it" (not found, or timed out), NOT evidence the
+    /// room is gone.
     async fn read(&mut self, owner: &VerifyingKey) -> Result<Option<Vec<u8>>> {
         let id = ContractInstanceId::new(room_instance_id(owner, &self.code_hash));
-        self.client.get_instance_optional(id, true).await
+        match tokio::time::timeout(
+            ROOM_READ_TIMEOUT,
+            self.client.get_instance_optional(id, true),
+        )
+        .await
+        {
+            Ok(r) => r,
+            Err(_) => Ok(None),
+        }
     }
 }
 
@@ -293,11 +326,43 @@ fn sync_one(
     ch: Option<&Characterization>,
     mint: &MintOptions,
     now: u64,
-) -> Result<(Vec<SignedRecord>, Vec<String>)> {
+) -> Result<(Vec<SignedRecord>, Vec<String>, String)> {
     let decision = decision_for(owner, room_state);
+    let read = describe_read(&decision);
     let p = plan(state, owner, &decision, ch, mint, now).map_err(|e| anyhow!("{e}"))?;
     let notes = p.notes.clone();
-    Ok((sign_actions(dir, p)?, notes))
+    Ok((sign_actions(dir, p)?, notes, read))
+}
+
+/// What the read established, for the curator to compare against the room.
+fn describe_read(d: &Decision) -> String {
+    match d {
+        Decision::Eligible(desc) => format!(
+            "read: owner-signed configuration version {}, privacy mode Public",
+            desc.configuration_version
+        ),
+        Decision::Excluded(Exclusion::Private, Some(v)) => {
+            format!("read: owner-signed configuration version {v}, privacy mode Private")
+        }
+        Decision::Excluded(why, Some(v)) => {
+            format!("read: owner-signed configuration version {v} ({why})")
+        }
+        Decision::Excluded(why, None) => format!("read: nothing verified ({why})"),
+    }
+}
+
+/// Most rooms one sweep may delist without `--force-delist`: a fifth of the
+/// swept rooms, and never fewer than 3. A River configuration reshape that this
+/// reader cannot parse would otherwise tombstone every listed room in one run.
+fn delist_cap(rooms: usize) -> usize {
+    (rooms / 5).max(3)
+}
+
+fn count_tombstones(records: &[SignedRecord]) -> usize {
+    records
+        .iter()
+        .filter(|r| matches!(r.body, RecordBody::Tomb(_)))
+        .count()
 }
 
 /// Flags that only shape a NEW entry. On a room that is already listed they would
@@ -364,7 +429,10 @@ pub async fn room_add(
         Some(p) => Some(read_state_file(p)?),
         None => RoomReader::connect(cli, dir).await?.read(&owner).await?,
     };
-    let (records, notes) = sync_one(dir, &index, &owner, room, ch.as_ref(), &mint, now)?;
+    let (records, notes, read) = sync_one(dir, &index, &owner, room, ch.as_ref(), &mint, now)?;
+    // Printed so the curator can compare it with the room before it is published;
+    // this is the only check a first add gets against a stale read.
+    println!("{read}");
     for n in &notes {
         println!("{n}");
     }
@@ -390,6 +458,7 @@ pub async fn room_refresh(
     owner: Option<&str>,
     state_file: Option<&PathBuf>,
     dry_run: bool,
+    force_delist: bool,
 ) -> Result<()> {
     let now = now_secs();
     let index = require_index(cli, dir).await?;
@@ -429,11 +498,23 @@ pub async fn room_refresh(
             },
             (None, None) => unreachable!("a reader exists whenever there is no state file"),
         };
-        let (recs, notes) = sync_one(dir, &index, o, room, None, &MintOptions::default(), now)?;
+        let (recs, notes, _read) =
+            sync_one(dir, &index, o, room, None, &MintOptions::default(), now)?;
         for n in &notes {
             println!("{}: {n}", owner_b58(o));
         }
         all.extend(recs);
+    }
+    let tombs = count_tombstones(&all);
+    if tombs > delist_cap(owners.len()) && !force_delist {
+        bail!(
+            "this sweep would delist {tombs} of {} room(s), more than the {} allowed without \
+             --force-delist. Nothing was published. A change in River's configuration format \
+             that this reader cannot parse looks exactly like this; check a room's state, \
+             then re-run with --force-delist if the delistings are real.",
+            owners.len(),
+            delist_cap(owners.len())
+        );
     }
     if all.is_empty() {
         println!("{} room(s) checked, nothing to publish", owners.len());
@@ -667,7 +748,7 @@ mod tests {
         let sk = SigningKey::from_bytes(&[5u8; 32]);
         let vk = sk.verifying_key();
         let st = room_state(&sk, 1, "Public", "Rust Chat");
-        let (recs, notes) = sync_one(
+        let (recs, notes, _read) = sync_one(
             &dir,
             &state,
             &vk,
@@ -691,7 +772,7 @@ mod tests {
         assert_eq!(state.live_entries().count(), 1);
 
         let private = room_state(&sk, 2, "Private", "Rust Chat");
-        let (recs, _) = sync_one(
+        let (recs, _, _) = sync_one(
             &dir,
             &state,
             &vk,
@@ -719,6 +800,30 @@ mod tests {
             sync_one(&dir, &state, &vk, None, None, &MintOptions::default(), 300).unwrap();
         assert!(recs.is_empty());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_delist_cap_scales_with_the_sweep_and_has_a_floor() {
+        assert_eq!(delist_cap(1), 3);
+        assert_eq!(delist_cap(14), 3);
+        assert_eq!(delist_cap(100), 20);
+    }
+
+    #[test]
+    fn describe_read_reports_version_and_privacy_mode() {
+        let sk = SigningKey::from_bytes(&[8u8; 32]);
+        let vk = sk.verifying_key();
+        let public = decision_for(&vk, Some(room_state(&sk, 7, "Public", "R")));
+        assert_eq!(
+            describe_read(&public),
+            "read: owner-signed configuration version 7, privacy mode Public"
+        );
+        let private = decision_for(&vk, Some(room_state(&sk, 9, "Private", "R")));
+        assert_eq!(
+            describe_read(&private),
+            "read: owner-signed configuration version 9, privacy mode Private"
+        );
+        assert!(describe_read(&decision_for(&vk, None)).starts_with("read: nothing verified"));
     }
 
     #[test]

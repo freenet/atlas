@@ -379,6 +379,11 @@ enum Cmd {
         state_file: Option<PathBuf>,
         #[arg(long)]
         dry_run: bool,
+        /// Allow one sweep to delist more than a fifth of the rooms (minimum 3).
+        /// Without it such a sweep publishes nothing, so a River format change
+        /// this reader cannot parse cannot wipe the room index in one run.
+        #[arg(long)]
+        force_delist: bool,
     },
     /// Search listed rooms (the read path River's Discover Rooms mirrors).
     Rooms {
@@ -578,9 +583,17 @@ async fn main() -> Result<()> {
             owner,
             state_file,
             dry_run,
+            force_delist,
         } => {
-            room_cmds::room_refresh(&cli, &dir, owner.as_deref(), state_file.as_ref(), *dry_run)
-                .await
+            room_cmds::room_refresh(
+                &cli,
+                &dir,
+                owner.as_deref(),
+                state_file.as_ref(),
+                *dry_run,
+                *force_delist,
+            )
+            .await
         }
         Cmd::Rooms {
             query,
