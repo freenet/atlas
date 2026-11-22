@@ -105,6 +105,13 @@ registry does not know are valid but render as "Unavailable" until it is
 registered, so ordering between adding entries and registering an app does not
 matter.
 
+## River rooms
+
+`atlasctl room-add`, `room-refresh` and `rooms` index public River rooms. The
+locator and entry schema, what is and is not stored, and the gate are documented
+in [FREENET.md](FREENET.md#river-rooms-in-the-index). Implementation:
+[`rooms/`](rooms/).
+
 ## Status
 
 Atlas is early and evolving. The first version, a fast, populated, read-only

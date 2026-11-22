@@ -1,0 +1,30 @@
+[package]
+name = "atlas-rooms"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Atlas indexing of public River rooms: eligibility, descriptor schema, reconcile and search. Native only; never linked into the index contract."
+
+# DELIBERATELY NOT a dependency of `contracts/index-contract`, and deliberately
+# not part of `atlas-common`: any change under `common/` or `contracts/` re-keys
+# the index. Room indexing is expressed entirely in the existing open
+# vocabularies (`Kind`, `Locator::AppResource`, `IndexEntry::ext`), so this
+# crate can change freely without moving the index address.
+#
+# It also does NOT depend on `river-core`: that crate needs freenet-stdlib 0.12
+# and atlasctl links 0.8, and two stdlib versions can never link into one
+# binary. The few room-state fields read here are mirrored in `view.rs`, and the
+# owner signature is verified over the exact bytes River signs.
+
+[dependencies]
+atlas-common = { workspace = true, features = ["rng"] }
+ciborium.workspace = true
+ed25519-dalek.workspace = true
+bs58.workspace = true
+blake3.workspace = true
+serde.workspace = true
+unicode-properties = "0.1"
+
+[dev-dependencies]
+rand.workspace = true
+ed25519-dalek = { workspace = true, features = ["rand_core"] }
