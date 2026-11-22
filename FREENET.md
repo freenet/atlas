@@ -20,6 +20,58 @@ This file enumerates the Freenet contracts published from this repository — wh
 - **[`cli/`](cli/) — `atlasctl`.** Command-line publishing/query client.
 - **[`crawler/`](crawler/) — `atlas-crawler`.** Background service that discovers and describes resources (via an LLM) and publishes entries into the index. Someone building a competing curator would look here for the shape of a well-formed entry, not to reuse the crawler itself.
 
+## River rooms in the index
+
+Public River rooms are indexed as ordinary entries, so reading them needs no new
+contract or API: read the index state and filter. The Rust implementation is the
+[`atlas-rooms`](rooms/) crate, whose `search::search` is the read path River's
+Discover Rooms mirrors. **No contract or `common/` change was needed, so the
+index address does not move.**
+
+| `IndexEntry` field | Meaning for a room |
+|---|---|
+| `kind` | `"Room"` |
+| `locator` | `AppResource { app: "river", resource: <room owner verifying key, base58, FULL key>, path: "" }`, URI `app:river/<owner key>` |
+| `title` | The owner's room name, a sanitised snapshot taken from the owner-signed configuration. The contract requires a title; this is the one owner-sourced field. |
+| `snippet` | Atlas's OWN characterisation (curator or LLM), or empty. Never the owner's description. |
+| `ext.ss` | Source of `snippet`: `c` curator, `l` LLM. Absent when `snippet` is empty. |
+| `ext.ts` | Source of `title`, always `o` (owner). |
+| `ext.cv` | Owner-signed `configuration_version` the title was read at. A read at a lower version is ignored as stale. |
+| `ext.rv` | Room-descriptor schema version, `1`. |
+| `tags`, `class`, `featured` | Curator-asserted, as for any entry. Unclassified rooms are hidden by safe search. |
+| `verified` | When Atlas last read the room's signed state: `live` (read and valid) or `unreachable` (a read proved nothing; not a takedown). |
+
+**Identity.** The room's identity is the owner key. It survives room-WASM
+re-keys because River derives the contract from the owner key plus the CURRENT
+room-contract code hash, which it resolves from its own signed pointer record
+(`river.room-contract`). Atlas stores no contract id and no room-WASM hash.
+`atlasctl` resolves that pointer at run time and refuses to guess when it does
+not resolve. Short handles are display-only.
+
+**The owner's description is not in the index.** It is owner-signed in the
+room's own state, so a client reads it from the room. The index carries only
+what Atlas asserts, so the two are never merged and a stale copy of the owner's
+words cannot outlive an edit.
+
+**Who is indexed.** Only rooms whose owner-signed configuration verifies against
+the owner key in the locator, is `PrivacyMode::Public` with a plaintext name, and
+that a curator or the owner has submitted (`atlasctl room-add`). When river#974
+adds `PublicRoomPolicy.listed`, an explicit `listed == false` always delists and
+`listed == true` stands in for the submission; the hook is
+`view::RoomConfig::listed`, and its field name is provisional until #974 lands.
+A refresh delists a room that goes private or opts out, ignores a read older than
+the entry, and on an unreadable room only marks the entry `unreachable`.
+
+```bash
+atlasctl room-add <owner-key> --landing general --tags rust,chat \
+    --characterization "A busy channel for Rust learners."   # --dry-run to preview
+atlasctl room-refresh [<owner-key>]    # renames, going private, re-verification
+atlasctl rooms [query] [--tag t] [--json] [--only-live] [--all]
+```
+
+For links to resolve in the UI, the `river` app must be registered
+(`atlasctl app-set --app river ...`).
+
 ## Notes for integrators
 
 - The index contract's frequent, silent re-keying (any `common/`/`contracts/` change) is exactly the failure class [freenet-core#5194](https://github.com/freenet/freenet-core/issues/5194) is meant to fix. **Atlas now publishes a pointer record — resolve it instead of pinning a key** (below).
