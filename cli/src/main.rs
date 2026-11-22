@@ -4,6 +4,7 @@
 
 mod api;
 mod migration;
+mod room_cmds;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
@@ -334,6 +335,66 @@ enum Cmd {
         #[arg(long)]
         json: bool,
     },
+    /// Index a public River room: reads its owner-signed state, checks it is
+    /// Public and listed/submitted, and mints or refreshes ONE `Room` entry.
+    ///
+    /// The owner key is the room's identity (full base58 key, never a short
+    /// handle or a contract id). The room's own name and description are copied
+    /// from its signed configuration; `--characterization` adds an independent
+    /// curator/LLM description that is stored with its source and never merged
+    /// into the owner text. Without a classification the entry is unclassified,
+    /// which Atlas's safe search hides, exactly as for `add`.
+    RoomAdd {
+        /// Room owner verifying key, base58 (the full key).
+        owner: String,
+        /// Read the room's CBOR state from this file (from `raw-get`) instead of
+        /// resolving River's pointer and fetching it from the node.
+        #[arg(long)]
+        state_file: Option<PathBuf>,
+        /// Independent description of the room, attributed via
+        /// `--characterization-source`. Replaces the owner text on the card.
+        #[arg(long)]
+        characterization: Option<String>,
+        #[arg(long, value_enum, default_value = "curator")]
+        characterization_source: room_cmds::CharSource,
+        /// Comma-separated tags.
+        #[arg(long, default_value = "")]
+        tags: String,
+        #[arg(long)]
+        featured: bool,
+        /// Print what would be published without sending it.
+        #[arg(long)]
+        dry_run: bool,
+        #[command(flatten)]
+        class: ClassArgs,
+    },
+    /// Re-read listed rooms and publish what changed: renames, a room going
+    /// private or opting out (delisted), and `verified` renewals. A read that
+    /// proves nothing marks the entry unreachable and never delists it.
+    RoomRefresh {
+        /// One room (owner key). Omit to sweep every listed room.
+        owner: Option<String>,
+        #[arg(long)]
+        state_file: Option<PathBuf>,
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Search listed rooms (the read path River's Discover Rooms mirrors).
+    Rooms {
+        /// Case-insensitive text over title, description and tags.
+        query: Option<String>,
+        /// Require this tag. Repeatable.
+        #[arg(long)]
+        tag: Vec<String>,
+        /// Include unclassified and non-general rooms (safe search off).
+        #[arg(long)]
+        all: bool,
+        /// Only rooms verified live recently.
+        #[arg(long)]
+        only_live: bool,
+        #[arg(long)]
+        json: bool,
+    },
     /// Print the index contract id (no network).
     Key,
     /// Print the current index id plus every legacy (pre-rebuild) id, so a
@@ -487,6 +548,45 @@ async fn main() -> Result<()> {
             expect_version,
         } => app_set(&cli, &dir, app, None, *expect_version).await,
         Cmd::Apps { json } => apps(&cli, &dir, *json).await,
+        Cmd::RoomAdd {
+            owner,
+            state_file,
+            characterization,
+            characterization_source,
+            tags,
+            featured,
+            dry_run,
+            class,
+        } => {
+            room_cmds::room_add(
+                &cli,
+                &dir,
+                owner,
+                state_file.as_ref(),
+                characterization.as_deref(),
+                *characterization_source,
+                tags,
+                *featured,
+                *dry_run,
+                class,
+            )
+            .await
+        }
+        Cmd::RoomRefresh {
+            owner,
+            state_file,
+            dry_run,
+        } => {
+            room_cmds::room_refresh(&cli, &dir, owner.as_deref(), state_file.as_ref(), *dry_run)
+                .await
+        }
+        Cmd::Rooms {
+            query,
+            tag,
+            all,
+            only_live,
+            json,
+        } => room_cmds::rooms(&cli, &dir, query.as_deref(), tag, *all, *only_live, *json).await,
         Cmd::Show { subscribe, json } => show(&cli, &dir, *subscribe, *json).await,
         Cmd::Key => {
             let params = params_bytes(&dir, &cli.slug)?;
@@ -2148,7 +2248,15 @@ fn parse_kind(s: &str) -> Result<Kind> {
         // gate is therefore purely a curator-side policy: opening one of these
         // later is an edit to this function alone, with no schema change and so
         // no contract re-key.
-        "room" | "document" | "media" | "feed" => bail!(
+        // Rooms are minted by `room-add`, which reads the room's signed state and
+        // enforces the public-and-listed gate. A hand-typed `add --kind room`
+        // would bypass that gate and the owner-key locator, so it stays refused.
+        "room" => bail!(
+            "kind 'room' is minted by `atlasctl room-add <owner-key>`, which checks \
+             the room is public and listed and takes its name from the room's own \
+             signed state. Use that, or app|site for `add`."
+        ),
+        "document" | "media" | "feed" => bail!(
             "kind '{s}' is reserved for future per-kind Open semantics: the wire \
              format accepts any kind, but nothing knows how to open such an entry \
              yet, and a published entry can only be tombstoned, never un-minted. \
@@ -2515,7 +2623,7 @@ mod tests {
     /// "unknown kind" would reasonably conclude they had typoed.
     #[test]
     fn parse_kind_refuses_the_reserved_kinds() {
-        for k in ["room", "document", "media", "feed", "Room", "FEED"] {
+        for k in ["document", "media", "feed", "FEED"] {
             let err = parse_kind(k).expect_err("a reserved kind must not be mintable");
             assert!(
                 err.to_string().to_lowercase().contains("reserved"),
@@ -2531,6 +2639,16 @@ mod tests {
         // …and the mintable ones still mint, so none of the above is vacuous.
         assert_eq!(parse_kind("app").unwrap(), Kind::new(Kind::APP));
         assert_eq!(parse_kind("site").unwrap(), Kind::new(Kind::SITE));
+    }
+
+    /// `add --kind room` would skip the public-and-listed gate and the owner-key
+    /// locator, so it is refused with a pointer to `room-add`.
+    #[test]
+    fn parse_kind_sends_rooms_to_room_add() {
+        for k in ["room", "Room", "ROOM"] {
+            let err = parse_kind(k).expect_err("rooms are minted by room-add");
+            assert!(err.to_string().contains("room-add"), "{k}: {err}");
+        }
     }
 
     #[test]
