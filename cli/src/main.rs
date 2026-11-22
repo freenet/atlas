@@ -339,10 +339,10 @@ enum Cmd {
     /// Public and listed/submitted, and mints or refreshes ONE `Room` entry.
     ///
     /// The owner key is the room's identity (full base58 key, never a short
-    /// handle or a contract id). The room's own name and description are copied
-    /// from its signed configuration; `--characterization` adds an independent
-    /// curator/LLM description that is stored with its source and never merged
-    /// into the owner text. Without a classification the entry is unclassified,
+    /// handle or a contract id). The room's name is snapshotted from its signed
+    /// configuration; `--characterization` adds Atlas's own curator/LLM
+    /// description, stored with its source. The owner's description stays in the
+    /// room, where clients read it live. Without a classification the entry is unclassified,
     /// which Atlas's safe search hides, exactly as for `add`.
     RoomAdd {
         /// Room owner verifying key, base58 (the full key).
@@ -351,8 +351,9 @@ enum Cmd {
         /// resolving River's pointer and fetching it from the node.
         #[arg(long)]
         state_file: Option<PathBuf>,
-        /// Independent description of the room, attributed via
-        /// `--characterization-source`. Replaces the owner text on the card.
+        /// Atlas's own description of the room, attributed via
+        /// `--characterization-source`. The owner's description is not copied
+        /// into the index; clients read it live from the room.
         #[arg(long)]
         characterization: Option<String>,
         #[arg(long, value_enum, default_value = "curator")]

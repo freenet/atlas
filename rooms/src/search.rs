@@ -36,8 +36,9 @@ pub struct RoomHit {
     pub subject_id: String,
     pub title: String,
     pub snippet: String,
-    /// Who wrote `snippet`: the owner, a curator, or an LLM.
-    pub snippet_source: TextSource,
+    /// Who wrote `snippet`: a curator or an LLM. `None` when it is empty.
+    /// The OWNER's description is not here; read it from the room state.
+    pub snippet_source: Option<TextSource>,
     pub tags: Vec<String>,
     pub featured: bool,
     pub added_at: u64,

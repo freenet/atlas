@@ -326,9 +326,9 @@ fn hit_json(h: &RoomHit) -> serde_json::Value {
         "title": h.title,
         "snippet": h.snippet,
         "snippet_source": match h.snippet_source {
-            TextSource::Owner => "owner",
-            TextSource::Curator => "curator",
-            TextSource::Llm => "llm",
+            Some(TextSource::Curator) => "curator",
+            Some(TextSource::Llm) => "llm",
+            Some(TextSource::Owner) | None => "none",
         },
         "tags": h.tags,
         "featured": h.featured,
@@ -389,9 +389,9 @@ trait SourceLabel {
 impl SourceLabel for RoomHit {
     fn snippet_source_label(&self) -> &'static str {
         match self.snippet_source {
-            TextSource::Owner => "owner text",
-            TextSource::Curator => "curator text",
-            TextSource::Llm => "llm text",
+            Some(TextSource::Curator) => "curator text",
+            Some(TextSource::Llm) => "llm text",
+            Some(TextSource::Owner) | None => "no description",
         }
     }
 }

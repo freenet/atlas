@@ -522,8 +522,9 @@ fn adding_a_room_mints_a_valid_signed_entry() {
     assert_eq!(rooms.len(), 1);
     let e = &rooms[0];
     assert_eq!(e.title, "Rust Chat");
-    assert_eq!(e.snippet, "All about Rust");
-    assert_eq!(snippet_source(e), TextSource::Owner);
+    // The owner's description is NOT copied into the index.
+    assert_eq!(e.snippet, "");
+    assert_eq!(snippet_source(e), None);
     assert_eq!(stored_config_version(e), Some(1));
     assert_eq!(
         e.verified.as_ref().unwrap().status.as_str(),
@@ -729,11 +730,11 @@ fn an_unverifiable_read_marks_unreachable_once_and_never_delists() {
 }
 
 // ---------------------------------------------------------------------------
-// Owner text vs curator text
+// Owner text stays in the room; the index carries Atlas's own text
 // ---------------------------------------------------------------------------
 
 #[test]
-fn curator_text_is_attributed_and_never_merged_with_the_owner_text() {
+fn the_owner_description_is_never_stored_and_curator_text_is_attributed() {
     let mut idx = index();
     let sk = key();
     let ch =
@@ -743,52 +744,29 @@ fn curator_text_is_attributed_and_never_merged_with_the_owner_text() {
     apply(&mut idx, p);
     let e = &live_rooms(&idx)[0];
     assert_eq!(e.snippet, "A busy channel for Rust learners.");
-    assert_eq!(snippet_source(e), TextSource::Curator);
-    assert!(!e.snippet.contains("OWNER WORDS"));
+    assert_eq!(snippet_source(e), Some(TextSource::Curator));
     assert_eq!(
         e.ext.as_ref().unwrap().get("ts").map(String::as_str),
         Some("o")
     );
+    // Nowhere in the signed entry is the owner's description.
+    assert!(!format!("{e:?}").contains("OWNER WORDS"));
 
-    // The owner editing their description neither replaces nor mixes into the
-    // curator text...
+    // The owner editing their description changes nothing in the index, and a
+    // refresh does not disturb the curator text.
     let st2 = public_room(&sk, 2, "Rust Chat", Some("NEW OWNER WORDS"));
     let p = plan_for(&idx, &sk, &st2, None, 200);
     apply(&mut idx, p);
     let e = &live_rooms(&idx)[0];
     assert_eq!(e.snippet, "A busy channel for Rust learners.");
-    assert_eq!(snippet_source(e), TextSource::Curator);
+    assert_eq!(snippet_source(e), Some(TextSource::Curator));
+    assert!(!format!("{e:?}").contains("NEW OWNER WORDS"));
 
-    // ...and an LLM characterisation is attributed as such.
+    // An LLM characterisation is attributed as such.
     let llm = Characterization::new("Chat about Rust.", TextSource::Llm).unwrap();
     let p = plan_for(&idx, &sk, &st2, Some(&llm), 300);
     apply(&mut idx, p);
-    assert_eq!(snippet_source(&live_rooms(&idx)[0]), TextSource::Llm);
-}
-
-#[test]
-fn an_owner_sourced_snippet_follows_the_owner_description() {
-    let mut idx = index();
-    let sk = key();
-    let p = plan_for(
-        &idx,
-        &sk,
-        &public_room(&sk, 1, "R", Some("first")),
-        None,
-        100,
-    );
-    apply(&mut idx, p);
-    let p = plan_for(
-        &idx,
-        &sk,
-        &public_room(&sk, 2, "R", Some("second")),
-        None,
-        200,
-    );
-    apply(&mut idx, p);
-    let e = &live_rooms(&idx)[0];
-    assert_eq!(e.snippet, "second");
-    assert_eq!(snippet_source(e), TextSource::Owner);
+    assert_eq!(snippet_source(&live_rooms(&idx)[0]), Some(TextSource::Llm));
 }
 
 #[test]
@@ -961,12 +939,13 @@ fn add_room(
 ) -> VerifyingKey {
     let sk = key();
     let vk = sk.verifying_key();
-    let d = evaluate(&vk, &public_room(&sk, 1, name, desc), true);
+    let d = evaluate(&vk, &public_room(&sk, 1, name, None), true);
+    let ch = desc.map(|t| Characterization::new(t, TextSource::Curator).unwrap());
     let p = plan(
         &idx.state,
         &vk,
         &d,
-        None,
+        ch.as_ref(),
         &MintOptions {
             tags: tags.iter().map(|t| t.to_string()).collect(),
             featured,
