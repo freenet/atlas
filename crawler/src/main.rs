@@ -78,9 +78,13 @@
 //! ordinary entry: the old taxonomy had no class that fitted it. See
 //! `RedistributionSigns`.
 //!
-//! Atlas lists only content suitable for a general audience. The model is asked
-//! one question about that (`suitable_for_general_audience`); a page it answers
-//! `false` for is not listed and is recorded as `not-suitable` with no reason.
+//! Atlas lists only content suitable for a general audience. The review detects
+//! explicit or pornographic content and other unsuitable content. Illegal
+//! material is a subset of that and is excluded by the same rule. One class keeps
+//! the system simple and robust.
+//!
+//! The model is asked one question about that (`suitable_for_general_audience`);
+//! a page it answers `false` for is not listed and is recorded as `not-suitable`.
 //! The signed `landing` and `has_adult_sections` fields stay in the index schema
 //! and the crawler always writes `general` and `false`.
 //!
@@ -586,7 +590,7 @@ struct Cli {
     #[arg(long, requires = "not_general_tombstone")]
     max_removals: Option<usize>,
     /// Maintenance: rewrite decision-log lines that carry the retired
-    /// `refused-illegal` outcome to `not-suitable` with no reason, in place. A
+    /// `refused-illegal` outcome to `not-suitable`, in place. A
     /// DRY RUN (counts the lines, writes nothing) unless `--apply` is also given.
     /// `--apply` refuses to run while `atlas-crawler.service` is active, because
     /// the crawler appends to the same file and holds no lock on it.
@@ -808,7 +812,7 @@ impl Redistribution {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 struct Assessment {
     /// Whether the content is suitable for a general audience. `false` is not
-    /// listed and is recorded as `not-suitable` with no reason.
+    /// listed and is recorded as `not-suitable`.
     suitable: bool,
     volatility: Volatility,
     redistribution: RedistributionSigns,
@@ -881,7 +885,8 @@ impl Assessment {
 
     /// The observations behind a refusal, for the log and the operator's line.
     ///
-    /// A `not-suitable` refusal has no reason recorded, so it has no evidence.
+    /// `not-suitable` is one class, so there is no sub-category to record and no
+    /// evidence string.
     fn evidence_for(&self, outcome: Outcome) -> String {
         if outcome == Outcome::NotSuitable {
             String::new()
@@ -2687,7 +2692,7 @@ fn sibling_tmp(path: &Path) -> PathBuf {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Outcome {
     Indexed,
-    /// Not listed: not suitable for a general audience. No reason is recorded.
+    /// Not listed: not suitable for a general audience. One class, so there is no sub-category to record.
     NotSuitable,
     RefusedRedistribution,
     /// An operator discarded a previous decision with `--forget`. Recorded so the
@@ -7952,7 +7957,9 @@ const DESCRIBE_SYSTEM_PROMPT: &str =
         Report what you can SEE on the page. Do not infer intent. \
         suitable_for_general_audience: true only if everything on the page, including \
         material deeper in behind navigation or an age gate, is suitable for a general \
-        audience; false otherwise. \
+        audience; false for sexually explicit or pornographic content, graphic \
+        violence or gore, or other content not suitable for a general audience. \
+        Ordinary adult language is fine. \
         volatility: would a description of the RESOURCE still be accurate after its \
         contents change? Answer \"static\" unless the page is nothing but a stream of \
         posts, where the current posts are the only describable thing about it. A \
@@ -11142,7 +11149,7 @@ mod tests {
         );
     }
 
-    /// A `not-suitable` refusal carries no reason: no evidence string at all, so
+    /// `not-suitable` is one class: no evidence string at all, so
     /// neither the log line nor the operator's line can hold one.
     #[test]
     fn not_suitable_records_no_reason() {
@@ -11205,6 +11212,16 @@ mod tests {
     #[test]
     fn the_prompt_asks_for_suitability_and_not_the_retired_keys() {
         assert!(DESCRIBE_SYSTEM_PROMPT.contains("suitable_for_general_audience (boolean)"));
+        for part in [
+            "sexually explicit or pornographic content",
+            "graphic violence or gore",
+            "Ordinary adult language is fine",
+        ] {
+            assert!(
+                DESCRIBE_SYSTEM_PROMPT.contains(part),
+                "the suitability definition must include {part:?}"
+            );
+        }
         for retired in ["illegal", "has_adult_sections", "landing"] {
             assert!(
                 !DESCRIBE_SYSTEM_PROMPT.contains(retired),
