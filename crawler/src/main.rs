@@ -2713,6 +2713,9 @@ enum Outcome {
     /// (#68). The reason names the canonical locator and the signal that
     /// matched: `same-owner`, `same-archive` or `near-text jaccard=…`.
     DuplicateOf,
+    /// `--rejudge-below-classifier --apply` found the entry suitable. It
+    /// supersedes any earlier not-suitable flag for the locator.
+    Rejudged,
 }
 
 impl Outcome {
@@ -2729,6 +2732,7 @@ impl Outcome {
             Self::RetiredOverAuthorShare => "retired-over-author-share",
             Self::FlaggedOnRecheck => "flagged-on-recheck",
             Self::DuplicateOf => "duplicate-of",
+            Self::Rejudged => "rejudged",
         }
     }
 }
@@ -4539,17 +4543,63 @@ fn rewrite_decision_lines(body: &str) -> (String, usize) {
 /// (id 1 and up) under an id below `below`, and not already published as
 /// not general (the tombstone tool selects those). Sorted by subject, at most
 /// `limit`.
-fn rejudge_candidates(live: &[LiveEntry], below: u16, limit: usize) -> Vec<&LiveEntry> {
+fn rejudge_candidates<'a>(
+    live: &'a [LiveEntry],
+    below: u16,
+    limit: usize,
+    log_body: &str,
+) -> Vec<&'a LiveEntry> {
+    // Resumable: an entry whose latest decision-log line is a re-judge result
+    // under the current classifier id is done, so a bounded run moves on to the
+    // entries after it. Only `--apply` writes those lines.
+    let tag = rejudge_tag();
+    let mut done: HashSet<&str> = HashSet::new();
+    for line in log_body.lines() {
+        let cols: Vec<&str> = line.splitn(4, '\t').collect();
+        if let [_, _, loc, reason] = cols.as_slice() {
+            if reason.contains(&tag) {
+                done.insert(loc);
+            } else {
+                done.remove(loc);
+            }
+        } else if let [_, _, loc] = cols.as_slice() {
+            done.remove(loc);
+        }
+    }
     let mut v: Vec<&LiveEntry> = live
         .iter()
         .filter(|e| {
             e.classifier.is_some_and(|c| c >= 1 && c < u64::from(below))
                 && !live_entry_not_general(e)
+                && !done.contains(e.locator.as_str())
         })
         .collect();
     v.sort_by(|a, b| a.subject_id.cmp(&b.subject_id));
     v.truncate(limit);
     v
+}
+
+/// The marker written into every re-judge decision-log line.
+fn rejudge_tag() -> String {
+    format!("rejudged-classifier={CLASSIFIER_ID}")
+}
+
+/// What the re-judge loop does after a budget answer.
+#[derive(Debug, PartialEq, Eq)]
+enum BudgetStep {
+    Proceed,
+    /// The per-host share is used up: go on to the next candidate.
+    SkipHost,
+    /// The run's budget is exhausted: stop.
+    Stop,
+}
+
+fn budget_step(r: Result<(), Denied>) -> BudgetStep {
+    match r {
+        Ok(()) => BudgetStep::Proceed,
+        Err(Denied::HostShare) => BudgetStep::SkipHost,
+        Err(Denied::Exhausted) => BudgetStep::Stop,
+    }
 }
 
 /// `--rejudge-below-classifier`. See the flag's doc. Spends from the budget
@@ -4568,7 +4618,9 @@ fn run_rejudge(
     if live.is_empty() {
         bail!("the index read back EMPTY; refusing to re-judge it");
     }
-    let candidates = rejudge_candidates(&live, below, limit);
+    let log_path = decisions_path;
+    let log_body = fs::read_to_string(log_path).unwrap_or_default();
+    let candidates = rejudge_candidates(&live, below, limit, &log_body);
     println!(
         "{} live entries have classifier below {below}; examining {} (--limit {limit})",
         live.iter()
@@ -4619,9 +4671,16 @@ fn run_rejudge(
             skipped += 1;
             continue;
         }
-        if budget.try_take(&e.locator).is_err() {
-            eprintln!("  rejudge: budget denied; stopping");
-            break;
+        match budget_step(budget.try_take(&e.locator)) {
+            BudgetStep::Proceed => {}
+            BudgetStep::SkipHost => {
+                skipped += 1;
+                continue;
+            }
+            BudgetStep::Stop => {
+                eprintln!("  rejudge: budget exhausted; stopping");
+                break;
+            }
         }
         let mut usage: Option<Usage> = None;
         let desc = describe_llm(
@@ -4639,19 +4698,26 @@ fn run_rejudge(
             continue;
         };
         judged += 1;
-        if let Some(Admission::Refuse(Outcome::NotSuitable)) =
-            desc.assessment.as_ref().map(Assessment::admit)
-        {
+        let not_ok = matches!(
+            desc.assessment.as_ref().map(Assessment::admit),
+            Some(Admission::Refuse(Outcome::NotSuitable))
+        );
+        if not_ok {
             not_suitable += 1;
             println!("not suitable: {} {}", e.subject_id, e.locator);
-            if cli.apply
-                && !decisions.record(
-                    &e.locator,
+        }
+        if cli.apply {
+            // Either way a line is written: a suitable verdict supersedes an
+            // earlier flag, and both mark the entry done for a resumed run.
+            let (outcome, reason) = if not_ok {
+                (
                     Outcome::FlaggedOnRecheck,
-                    NOT_SUITABLE_FLAG_PREFIX,
-                    now,
+                    format!("{NOT_SUITABLE_FLAG_PREFIX} ({})", rejudge_tag()),
                 )
-            {
+            } else {
+                (Outcome::Rejudged, format!("suitable ({})", rejudge_tag()))
+            };
+            if !decisions.record(&e.locator, outcome, &reason, now) {
                 bail!("decision log unwritable; stopping");
             }
         }
@@ -11948,13 +12014,81 @@ mod tests {
         v[2].classifier = Some(0); // by hand
         v[3].classifier = None; // unclassified
         v[4].landing_not_general = true; // tombstone tool's
-        let ids: Vec<&str> = rejudge_candidates(&v, 5, 10)
+        let ids: Vec<&str> = rejudge_candidates(&v, 5, 10, "")
             .iter()
             .map(|e| e.subject_id.as_str())
             .collect();
         assert_eq!(ids, ["s0"]);
         v[1].classifier = Some(3);
-        assert_eq!(rejudge_candidates(&v, 5, 1).len(), 1, "bounded by --limit");
+        assert_eq!(
+            rejudge_candidates(&v, 5, 1, "").len(),
+            1,
+            "bounded by --limit"
+        );
+    }
+
+    /// A flag followed by a later suitable re-judge is superseded: the latest line
+    /// decides, so the tombstone tool no longer selects the entry.
+    #[test]
+    fn a_later_suitable_rejudge_supersedes_an_earlier_flag() {
+        let live = parse_live_index(INDEX_JSON.as_bytes()).unwrap();
+        let tag = rejudge_tag();
+        let flag =
+            format!("1\tflagged-on-recheck\tfreenet:A/\t{NOT_SUITABLE_FLAG_PREFIX} ({tag})\n");
+        assert!(tombstone_candidates(&live, &flag)
+            .iter()
+            .any(|(e, _)| e.subject_id == "a"));
+        let log = format!(
+            "{flag}2\t{}\tfreenet:A/\tsuitable ({tag})\n",
+            Outcome::Rejudged.token()
+        );
+        assert!(!tombstone_candidates(&live, &log)
+            .iter()
+            .any(|(e, _)| e.subject_id == "a"));
+        // And flagged again later: selected again.
+        let again =
+            format!("{log}3\tflagged-on-recheck\tfreenet:A/\t{NOT_SUITABLE_FLAG_PREFIX} ({tag})\n");
+        assert!(tombstone_candidates(&live, &again)
+            .iter()
+            .any(|(e, _)| e.subject_id == "a"));
+    }
+
+    /// A bounded run moves past entries already re-judged under this classifier.
+    #[test]
+    fn a_bounded_rejudge_resumes_after_the_entries_already_done() {
+        let mut v: Vec<LiveEntry> = (0..4).map(|_| live("general", false)).collect();
+        for (i, e) in v.iter_mut().enumerate() {
+            e.subject_id = format!("s{i}");
+            e.locator = format!("freenet:L{i}/");
+            e.landing_not_general = false;
+        }
+        let ids = |log: &str| -> Vec<String> {
+            rejudge_candidates(&v, 5, 2, log)
+                .iter()
+                .map(|e| e.subject_id.clone())
+                .collect()
+        };
+        assert_eq!(ids(""), ["s0", "s1"]);
+        let tag = rejudge_tag();
+        let log = format!(
+            "1\trejudged\tfreenet:L0/\tsuitable ({tag})\n\
+             1\tflagged-on-recheck\tfreenet:L1/\t{NOT_SUITABLE_FLAG_PREFIX} ({tag})\n"
+        );
+        assert_eq!(ids(&log), ["s2", "s3"]);
+        // A result under an older classifier id does not count as done.
+        let old = "1\trejudged\tfreenet:L0/\tsuitable (rejudged-classifier=4)\n";
+        assert_eq!(ids(old), ["s0", "s1"]);
+        // A later line of any other kind reopens the entry.
+        let reopened = format!("{log}2\tindexed\tfreenet:L0/\tvolatility=static\n");
+        assert_eq!(ids(&reopened), ["s0", "s2"]);
+    }
+
+    /// A per-host denial skips that entry; only global exhaustion stops the run.
+    #[test]
+    fn a_host_share_denial_skips_and_only_exhaustion_stops() {
+        assert_eq!(budget_step(Ok(())), BudgetStep::Proceed);
+        assert_eq!(budget_step(Err(Denied::HostShare)), BudgetStep::SkipHost);
+        assert_eq!(budget_step(Err(Denied::Exhausted)), BudgetStep::Stop);
     }
 
     /// A live-flag decision is made before the sweep fetches, spends budget or
