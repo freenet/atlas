@@ -2908,7 +2908,7 @@ fn main() -> Result<()> {
     // budget, reasoning that population-derived ceilings kept it to "tens, not
     // hundreds" of calls a day -- true for the RENDER count, but every one of
     // those calls that finds changed content is a real, billed OpenAI request
-    // (vision-eligible, so up to the full per-call reservation), and nothing
+    // (up to the full per-call reservation), and nothing
     // stood between that and the API. `--monthly-max` is supposed to be the
     // hard money ceiling; a path that ignores it is not a detail, it is the
     // one invariant this whole re-key exists to protect.
@@ -4906,8 +4906,8 @@ impl RecheckSchedule {
 /// mechanism — that one already exists and produces exactly what is needed),
 /// walks whatever the local schedule says is due (bounded by
 /// `--recheck-max`), and for each: re-fetches through the SAME
-/// `get_page_enumerating` path new locators use (vision heuristics apply
-/// identically), fingerprints the content exactly as `ThinPrint`/
+/// `get_page_enumerating` path
+/// new locators use, fingerprints the content exactly as `ThinPrint`/
 /// `normalise_text`/`fnv1a64` already do for thin-content retirement, and acts
 /// on what it finds — see the outcome branches inline below for the specific
 /// rule each one follows.
@@ -4916,7 +4916,7 @@ impl RecheckSchedule {
 /// uses via `try_take`/`settle`, so `--monthly-max` bounds this pass too. The
 /// population-derived ceilings keep the RENDER count small (tens, not
 /// hundreds, a day) but every render whose content changed is a real, billed
-/// OpenAI call — vision-eligible, so up to a full reservation — and nothing
+/// OpenAI call, up to a full reservation, and nothing
 /// about "renders are cheap" makes that call free. `--recheck-max` remains a
 /// separate safety valve on top, not a substitute for the money cap.
 fn run_recheck_pass(
