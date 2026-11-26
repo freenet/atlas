@@ -95,12 +95,9 @@
 //! `--not-general-tombstone --apply` runs them against the live index;
 //! `--rewrite-decision-log` counts the retired `refused-illegal` lines, and
 //! `--rewrite-decision-log --apply` rewrites them to `not-suitable` and refuses
-//! while `atlas-crawler.service` is active. `--rejudge-below-classifier N
-//! --limit M` asks the model the current question about entries classified under
-//! an older id, within the budget ledger, and with `--apply` only flags them in
-//! the decision log; `--not-general-tombstone` also selects those flags, and
-//! `--apply` refuses more than max(10, 20% of the index) removals unless
-//! `--max-removals` allows it.
+//! while `atlas-crawler.service` is active. `--not-general-tombstone --apply`
+//! refuses more than max(10, 20% of the index) removals unless `--max-removals`
+//! allows it.
 //!
 //! The volatility description of a resource is PUBLISHED. The redistribution
 //! findings are NOT: they gate admission locally and are recorded in the decision
@@ -338,7 +335,7 @@ fn usd(micros: Micros) -> String {
 #[command(
     group(
         ArgGroup::new("apply_target")
-            .args(["not_general_tombstone", "rewrite_decision_log", "rejudge_below_classifier"])
+            .args(["not_general_tombstone", "rewrite_decision_log"])
             .multiple(true)
     ),
     group(
@@ -388,7 +385,7 @@ struct Cli {
     /// needs it.
     #[arg(long, required_unless_present_any = [
         "forget", "dedup_backfill", "dedup_report", "not_general_report",
-        "not_general_tombstone", "rewrite_decision_log", "rejudge_below_classifier"
+        "not_general_tombstone", "rewrite_decision_log"
     ])]
     sources: Option<PathBuf>,
     /// File tracking already-added locators (default: <key_dir>/crawler-seen.txt).
@@ -568,21 +565,18 @@ struct Cli {
     /// Reads the live index through `atlasctl show --json`, or from
     /// `--index-json FILE` (the saved output of that command).
     #[arg(long, conflicts_with_all = [
-        "recheck", "forget", "dedup_backfill", "dedup_report", "rejudge_below_classifier"
+        "recheck", "forget", "dedup_backfill", "dedup_report"
     ])]
     not_general_report: bool,
     /// Maintenance: tombstone, with `atlasctl remove`, the entries
-    /// `--not-general-report` lists plus the entries whose latest decision-log
-    /// line is a `not-suitable` flag (from `--recheck` or
-    /// `--rejudge-below-classifier`). The report lists the two groups separately.
-    /// A DRY RUN unless `--apply` is also given: without it this prints the
+    /// `--not-general-report` lists (selected on the signed landing and
+    /// adult-sections fields only). A DRY RUN unless `--apply` is also given: without it this prints the
     /// `atlasctl remove` command for each entry and changes nothing. `--apply`
     /// needs the live index, so it cannot be combined with `--index-json`, and it
     /// refuses more removals than max(10, 20% of the index) unless
     /// `--max-removals` allows that many. Stop `atlas-crawler.service` first.
     #[arg(long, conflicts_with_all = [
-        "recheck", "forget", "dedup_backfill", "dedup_report", "not_general_report",
-        "rejudge_below_classifier"
+        "recheck", "forget", "dedup_backfill", "dedup_report", "not_general_report"
     ])]
     not_general_tombstone: bool,
     /// The most removals `--not-general-tombstone --apply` may perform in one
@@ -596,28 +590,11 @@ struct Cli {
     /// the crawler appends to the same file and holds no lock on it.
     #[arg(long, conflicts_with_all = [
         "recheck", "forget", "dedup_backfill", "dedup_report", "not_general_report",
-        "not_general_tombstone", "rejudge_below_classifier"
+        "not_general_tombstone"
     ])]
     rewrite_decision_log: bool,
-    /// Maintenance: ask the model the current question about live entries that
-    /// were classified under a classifier id below this one (ids start at 1; 0 is
-    /// a hand classification and is skipped), at most `--limit` entries, spending
-    /// from the same budget ledger as a crawl. Without `--apply` it only prints
-    /// what the model would now call not suitable. With `--apply` it also FLAGS
-    /// those entries in the decision log. It never removes or edits an entry:
-    /// applying the policy to existing entries is an operator step
-    /// (`--not-general-tombstone`).
-    #[arg(long, requires = "limit", conflicts_with_all = [
-        "recheck", "forget", "dedup_backfill", "dedup_report", "not_general_report",
-        "not_general_tombstone", "rewrite_decision_log"
-    ])]
-    rejudge_below_classifier: Option<u16>,
-    /// The most entries `--rejudge-below-classifier` examines in one run.
-    #[arg(long, requires = "rejudge_below_classifier")]
-    limit: Option<usize>,
-    /// Perform the real step of `--not-general-tombstone`,
-    /// `--rewrite-decision-log` or `--rejudge-below-classifier`. Without it
-    /// these only report.
+    /// Perform the real step of `--not-general-tombstone` or
+    /// `--rewrite-decision-log`. Without it both only report.
     #[arg(long, requires = "apply_target")]
     apply: bool,
     /// A saved copy of `atlasctl show --json`, read instead of the live index by
@@ -2713,9 +2690,6 @@ enum Outcome {
     /// (#68). The reason names the canonical locator and the signal that
     /// matched: `same-owner`, `same-archive` or `near-text jaccard=…`.
     DuplicateOf,
-    /// `--rejudge-below-classifier --apply` found the entry suitable. It
-    /// supersedes any earlier not-suitable flag for the locator.
-    Rejudged,
 }
 
 impl Outcome {
@@ -2732,7 +2706,6 @@ impl Outcome {
             Self::RetiredOverAuthorShare => "retired-over-author-share",
             Self::FlaggedOnRecheck => "flagged-on-recheck",
             Self::DuplicateOf => "duplicate-of",
-            Self::Rejudged => "rejudged",
         }
     }
 }
@@ -3034,7 +3007,7 @@ fn main() -> Result<()> {
     }
 
     if cli.not_general_report || cli.not_general_tombstone {
-        return run_not_general(&cli, &decisions_path);
+        return run_not_general(&cli);
     }
     if cli.rewrite_decision_log {
         return run_rewrite_decision_log(&decisions_path, cli.apply, &|| {
@@ -3067,29 +3040,6 @@ fn main() -> Result<()> {
 
     if cli.dedup_backfill {
         return run_dedup_backfill(&cli, &fingerprints_path);
-    }
-
-    if let Some(below) = cli.rejudge_below_classifier {
-        let prices = Prices::from_cli(cli.input_price, cli.output_price)?;
-        let monthly_max = usd_to_micros(cli.monthly_max, "--monthly-max")?;
-        let mut ledger = SpendLedger::load(&spend_path, now_secs());
-        let mut budget = Budget::new(
-            &mut ledger,
-            cli.max,
-            cli.daily_max,
-            cli.per_host_max,
-            monthly_max,
-            &prices,
-        );
-        return run_rejudge(
-            &cli,
-            &decisions_path,
-            &mut budget,
-            &prices,
-            below,
-            cli.limit.unwrap_or(0),
-            now_secs(),
-        );
     }
 
     if cli.recheck {
@@ -3886,16 +3836,10 @@ struct LiveEntry {
     locator: String,
     /// When the entry was minted. First seen is canonical for duplicates (#68).
     added_at: Option<u64>,
-    /// `class.classifier`, when the entry has a classification.
-    classifier: Option<u64>,
     /// `class.landing` is present and is not `general`.
     landing_not_general: bool,
     has_adult_sections: bool,
 }
-
-/// The decision-log reason of a `flagged-on-recheck` line for a `not-suitable`
-/// verdict. `--not-general-tombstone` selects entries by this prefix.
-const NOT_SUITABLE_FLAG_PREFIX: &str = "would now be refused on recheck: not-suitable";
 
 /// The reason logged when the entry's own live flags decided it, not the model.
 const LIVE_FLAGS_REASON: &str = "would now be refused on recheck: not-suitable (decided by the \
@@ -4321,72 +4265,14 @@ fn not_general_entries(live: &[LiveEntry]) -> Vec<&LiveEntry> {
     live.iter().filter(|e| live_entry_not_general(e)).collect()
 }
 
-/// Why an entry is a tombstone candidate.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum Why {
-    /// Its published landing is not general or it has adult sections.
-    LiveFlags,
-    /// Its latest decision-log line is a `not-suitable` flag from a recheck or a
-    /// re-judge.
-    LoggedFlag,
-}
-
-impl Why {
-    fn label(self) -> &'static str {
-        match self {
-            Self::LiveFlags => "live-flags",
-            Self::LoggedFlag => "logged-not-suitable-flag",
-        }
-    }
-}
-
-/// Live entries whose LATEST decision-log line is a `flagged-on-recheck` line
-/// for a `not-suitable` verdict, excluding those the live flags already select.
-fn logged_flag_entries<'a>(live: &'a [LiveEntry], log_body: &str) -> Vec<&'a LiveEntry> {
-    let mut latest: HashMap<&str, bool> = HashMap::new();
-    for line in log_body.lines() {
-        let cols: Vec<&str> = line.splitn(4, '\t').collect();
-        if let [_, outcome, loc, reason] = cols.as_slice() {
-            latest.insert(
-                loc,
-                *outcome == Outcome::FlaggedOnRecheck.token()
-                    && reason.starts_with(NOT_SUITABLE_FLAG_PREFIX),
-            );
-        } else if let [_, _, loc] = cols.as_slice() {
-            latest.insert(loc, false);
-        }
-    }
-    live.iter()
-        .filter(|e| !live_entry_not_general(e) && latest.get(e.locator.as_str()) == Some(&true))
-        .collect()
-}
-
-/// Every tombstone candidate, with the reason, live-flag entries first.
-fn tombstone_candidates<'a>(live: &'a [LiveEntry], log_body: &str) -> Vec<(&'a LiveEntry, Why)> {
-    not_general_entries(live)
-        .into_iter()
-        .map(|e| (e, Why::LiveFlags))
-        .chain(
-            logged_flag_entries(live, log_body)
-                .into_iter()
-                .map(|e| (e, Why::LoggedFlag)),
-        )
-        .collect()
-}
-
 /// One report line per entry, in the order given.
-fn not_general_listing(entries: &[(&LiveEntry, Why)]) -> String {
+fn not_general_listing(entries: &[&LiveEntry]) -> String {
     entries
         .iter()
-        .map(|(e, why)| {
+        .map(|e| {
             format!(
-                "{}\tv{}\t{}\tlanding_not_general={}\thas_adult_sections={}\twhy={}\n",
-                e.subject_id,
-                e.version,
-                e.locator,
-                e.landing_not_general,
-                e.has_adult_sections,
-                why.label()
+                "{}\tv{}\t{}\tlanding_not_general={}\thas_adult_sections={}\n",
+                e.subject_id, e.version, e.locator, e.landing_not_general, e.has_adult_sections
             )
         })
         .collect()
@@ -4422,7 +4308,7 @@ fn atlasctl_remove(cli: &Cli, subject: &str, cur_version: u64) -> Result<()> {
 ///
 /// Nothing is written unless `--not-general-tombstone --apply` is given, and
 /// that combination reads the live index, never a saved file.
-fn run_not_general(cli: &Cli, log_path: &Path) -> Result<()> {
+fn run_not_general(cli: &Cli) -> Result<()> {
     let apply = cli.not_general_tombstone && cli.apply;
     if apply && cli.index_json.is_some() {
         bail!("--apply needs the live index; it cannot be combined with --index-json");
@@ -4436,29 +4322,12 @@ fn run_not_general(cli: &Cli, log_path: &Path) -> Result<()> {
     if live.is_empty() {
         bail!("the index read back EMPTY; refusing to report on it");
     }
-    // The decision log is read here, by an operator-run maintenance command, as
-    // input to a report the operator reads and then confirms with `--apply`. It is
-    // never a crawl decision input: the crawl and recheck paths still only append
-    // (see `the_decision_log_is_never_read_back`). A log that does not exist yet
-    // selects nothing.
-    let log_body = fs::read_to_string(log_path).unwrap_or_default();
-    let hits = if cli.not_general_tombstone {
-        tombstone_candidates(&live, &log_body)
-    } else {
-        not_general_entries(&live)
-            .into_iter()
-            .map(|e| (e, Why::LiveFlags))
-            .collect()
-    };
-    let count = |w: Why| hits.iter().filter(|(_, x)| *x == w).count();
+    let hits = not_general_entries(&live);
     print!("{}", not_general_listing(&hits));
     println!(
-        "{} of {} entries: {} with a landing that is not general or adult sections, \
-         {} flagged not-suitable in the decision log",
+        "{} of {} entries have a landing that is not general or have adult sections",
         hits.len(),
-        live.len(),
-        count(Why::LiveFlags),
-        count(Why::LoggedFlag)
+        live.len()
     );
     if !cli.not_general_tombstone {
         return Ok(());
@@ -4474,7 +4343,7 @@ fn run_not_general(cli: &Cli, log_path: &Path) -> Result<()> {
         );
     }
     let mut failed = 0usize;
-    for (e, _) in &hits {
+    for e in &hits {
         if apply {
             match atlasctl_remove(cli, &e.subject_id, e.version) {
                 Ok(()) => println!("tombstoned {}", e.subject_id),
@@ -4537,201 +4406,6 @@ fn rewrite_decision_lines(body: &str) -> (String, usize) {
         out.push_str(nl);
     }
     (out, changed)
-}
-
-/// Live entries `--rejudge-below-classifier` examines: classified by a machine
-/// (id 1 and up) under an id below `below`, and not already published as
-/// not general (the tombstone tool selects those). Sorted by subject, at most
-/// `limit`.
-fn rejudge_candidates<'a>(
-    live: &'a [LiveEntry],
-    below: u16,
-    limit: usize,
-    log_body: &str,
-) -> Vec<&'a LiveEntry> {
-    // Resumable: an entry whose latest decision-log line is a re-judge result
-    // under the current classifier id is done, so a bounded run moves on to the
-    // entries after it. Only `--apply` writes those lines.
-    let tag = rejudge_tag();
-    let mut done: HashSet<&str> = HashSet::new();
-    for line in log_body.lines() {
-        let cols: Vec<&str> = line.splitn(4, '\t').collect();
-        if let [_, _, loc, reason] = cols.as_slice() {
-            if reason.contains(&tag) {
-                done.insert(loc);
-            } else {
-                done.remove(loc);
-            }
-        } else if let [_, _, loc] = cols.as_slice() {
-            done.remove(loc);
-        }
-    }
-    let mut v: Vec<&LiveEntry> = live
-        .iter()
-        .filter(|e| {
-            e.classifier.is_some_and(|c| c >= 1 && c < u64::from(below))
-                && !live_entry_not_general(e)
-                && !done.contains(e.locator.as_str())
-        })
-        .collect();
-    v.sort_by(|a, b| a.subject_id.cmp(&b.subject_id));
-    v.truncate(limit);
-    v
-}
-
-/// The marker written into every re-judge decision-log line.
-fn rejudge_tag() -> String {
-    format!("rejudged-classifier={CLASSIFIER_ID}")
-}
-
-/// What the re-judge loop does after a budget answer.
-#[derive(Debug, PartialEq, Eq)]
-enum BudgetStep {
-    Proceed,
-    /// The per-host share is used up: go on to the next candidate.
-    SkipHost,
-    /// The run's budget is exhausted: stop.
-    Stop,
-}
-
-fn budget_step(r: Result<(), Denied>) -> BudgetStep {
-    match r {
-        Ok(()) => BudgetStep::Proceed,
-        Err(Denied::HostShare) => BudgetStep::SkipHost,
-        Err(Denied::Exhausted) => BudgetStep::Stop,
-    }
-}
-
-/// `--rejudge-below-classifier`. See the flag's doc. Spends from the budget
-/// ledger, stops when it denies, and never edits or removes an entry: with
-/// `--apply` it only appends `flagged-on-recheck` lines to the decision log.
-fn run_rejudge(
-    cli: &Cli,
-    decisions_path: &Path,
-    budget: &mut Budget,
-    prices: &Prices,
-    below: u16,
-    limit: usize,
-    now: u64,
-) -> Result<()> {
-    let live = fetch_live_index(cli)?;
-    if live.is_empty() {
-        bail!("the index read back EMPTY; refusing to re-judge it");
-    }
-    let log_path = decisions_path;
-    let log_body = fs::read_to_string(log_path).unwrap_or_default();
-    let candidates = rejudge_candidates(&live, below, limit, &log_body);
-    println!(
-        "{} live entries have classifier below {below}; examining {} (--limit {limit})",
-        live.iter()
-            .filter(|e| e.classifier.is_some_and(|c| c >= 1 && c < u64::from(below)))
-            .count(),
-        candidates.len()
-    );
-    let Some(key) = std::env::var("OPENAI_API_KEY")
-        .ok()
-        .filter(|k| !k.is_empty())
-    else {
-        for e in &candidates {
-            println!("would re-judge {} {}", e.subject_id, e.locator);
-        }
-        println!("OPENAI_API_KEY is not set: listed only, nothing judged");
-        return Ok(());
-    };
-    let model = std::env::var("ATLAS_LLM_MODEL")
-        .ok()
-        .filter(|m| !m.is_empty())
-        .unwrap_or_else(|| DEFAULT_LLM_MODEL.to_string());
-    let client = http_client()?;
-    let gw = gateway_http_base(&cli.node);
-    let registry = AppRegistryView::load(cli);
-    let mut decisions = DecisionLog::open(decisions_path);
-    let (mut judged, mut not_suitable, mut skipped) = (0usize, 0usize, 0usize);
-    for e in candidates {
-        let enumerate = registry
-            .app_of(&e.locator)
-            .map(|(_, resource)| (resource.to_string(), cli.app_max_pages));
-        let page = match get_page_enumerating(
-            cli,
-            &client,
-            &gw,
-            &e.locator,
-            &registry,
-            enumerate.as_ref().map(|(r, n)| (r.as_str(), *n)),
-        ) {
-            Ok(p) => p,
-            Err(err) => {
-                eprintln!("  rejudge: {} unreachable ({err:#})", e.subject_id);
-                skipped += 1;
-                continue;
-            }
-        };
-        let body = page.text_for_classification();
-        if body.trim().chars().count() < MIN_DESCRIBABLE_CHARS {
-            skipped += 1;
-            continue;
-        }
-        match budget_step(budget.try_take(&e.locator)) {
-            BudgetStep::Proceed => {}
-            BudgetStep::SkipHost => {
-                skipped += 1;
-                continue;
-            }
-            BudgetStep::Stop => {
-                eprintln!("  rejudge: budget exhausted; stopping");
-                break;
-            }
-        }
-        let mut usage: Option<Usage> = None;
-        let desc = describe_llm(
-            &client,
-            &key,
-            &model,
-            &e.locator,
-            &body,
-            page.screenshot.as_deref(),
-            &mut usage,
-        );
-        budget.settle(usage.map(|u| prices.cost(&u)));
-        let Ok(desc) = desc else {
-            skipped += 1;
-            continue;
-        };
-        judged += 1;
-        let not_ok = matches!(
-            desc.assessment.as_ref().map(Assessment::admit),
-            Some(Admission::Refuse(Outcome::NotSuitable))
-        );
-        if not_ok {
-            not_suitable += 1;
-            println!("not suitable: {} {}", e.subject_id, e.locator);
-        }
-        if cli.apply {
-            // Either way a line is written: a suitable verdict supersedes an
-            // earlier flag, and both mark the entry done for a resumed run.
-            let (outcome, reason) = if not_ok {
-                (
-                    Outcome::FlaggedOnRecheck,
-                    format!("{NOT_SUITABLE_FLAG_PREFIX} ({})", rejudge_tag()),
-                )
-            } else {
-                (Outcome::Rejudged, format!("suitable ({})", rejudge_tag()))
-            };
-            if !decisions.record(&e.locator, outcome, &reason, now) {
-                bail!("decision log unwritable; stopping");
-            }
-        }
-    }
-    println!(
-        "re-judged {judged}: {not_suitable} not suitable, {skipped} skipped. {}",
-        if cli.apply {
-            "Flagged in the decision log; nothing was removed. Run --not-general-tombstone \
-             to act on the flags."
-        } else {
-            "Dry run: nothing was written. Add --apply to flag them."
-        }
-    );
-    Ok(())
 }
 
 const CRAWLER_SERVICE: &str = "atlas-crawler.service";
@@ -4946,7 +4620,6 @@ fn parse_live_index(json: &[u8]) -> Result<Vec<LiveEntry>> {
                 version: r["version"].as_u64()?,
                 locator: r["locator"].as_str()?.to_string(),
                 added_at: r["added_at"].as_u64(),
-                classifier: r["class"]["classifier"].as_u64(),
                 landing_not_general: r["class"]["landing"]
                     .as_str()
                     .is_some_and(|l| l != LANDING_FLAG),
@@ -11823,7 +11496,6 @@ mod tests {
             version: 3,
             locator: format!("freenet:{RIVER}/{landing}-{adult_sections}"),
             added_at: None,
-            classifier: Some(4),
             landing_not_general: landing != "general",
             has_adult_sections: adult_sections,
         }
@@ -11858,12 +11530,10 @@ mod tests {
             ["b", "c"],
             "unclassified `d` and general `a` are not listed"
         );
-        let tagged: Vec<(&LiveEntry, Why)> =
-            hits.into_iter().map(|e| (e, Why::LiveFlags)).collect();
         assert_eq!(
-            not_general_listing(&tagged),
-            "b\tv2\tfreenet:B/\tlanding_not_general=true\thas_adult_sections=false\twhy=live-flags\n\
-             c\tv5\tfreenet:C/\tlanding_not_general=false\thas_adult_sections=true\twhy=live-flags\n"
+            not_general_listing(&hits),
+            "b\tv2\tfreenet:B/\tlanding_not_general=true\thas_adult_sections=false\n\
+             c\tv5\tfreenet:C/\tlanding_not_general=false\thas_adult_sections=true\n"
         );
     }
 
@@ -11889,8 +11559,7 @@ mod tests {
             idx.to_str().unwrap(),
         ]);
         assert!(!cli.apply);
-        run_not_general(&cli, &dir.join("none.txt"))
-            .expect("a dry run succeeds without running atlasctl");
+        run_not_general(&cli).expect("a dry run succeeds without running atlasctl");
         // The real step needs the live index, never a saved file.
         let cli = Cli::parse_from([
             "atlas-crawler",
@@ -11901,40 +11570,8 @@ mod tests {
             "--index-json",
             idx.to_str().unwrap(),
         ]);
-        assert!(run_not_general(&cli, &dir.join("none.txt")).is_err());
+        assert!(run_not_general(&cli).is_err());
         let _ = fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn logged_not_suitable_flags_are_tombstone_candidates_listed_separately() {
-        let live = parse_live_index(INDEX_JSON.as_bytes()).unwrap();
-        let log = format!(
-            "1\tflagged-on-recheck\tfreenet:A/\t{NOT_SUITABLE_FLAG_PREFIX}\n\
-             1\tflagged-on-recheck\tfreenet:D/\t{NOT_SUITABLE_FLAG_PREFIX}\n\
-             1\tflagged-on-recheck\tfreenet:B/\t{LIVE_FLAGS_REASON}\n"
-        );
-        let c = tombstone_candidates(&live, &log);
-        let got: Vec<(&str, Why)> = c.iter().map(|(e, w)| (e.subject_id.as_str(), *w)).collect();
-        assert_eq!(
-            got,
-            [
-                ("b", Why::LiveFlags),
-                ("c", Why::LiveFlags),
-                ("a", Why::LoggedFlag),
-                ("d", Why::LoggedFlag)
-            ],
-            "b is listed once, by its live flags"
-        );
-        assert!(not_general_listing(&c).contains("freenet:A/\tlanding_not_general=false\thas_adult_sections=false\twhy=logged-not-suitable-flag"));
-        // Only the LATEST line counts: a later decision supersedes the flag.
-        let later = format!("{log}2\tindexed\tfreenet:A/\tvolatility=static\n");
-        let c = tombstone_candidates(&live, &later);
-        assert!(!c.iter().any(|(e, _)| e.subject_id == "a"));
-        // A different flag reason is not a not-suitable flag.
-        let other = "1\tflagged-on-recheck\tfreenet:A/\twould now be refused on recheck: refused-redistribution — x\n";
-        assert!(!tombstone_candidates(&live, other)
-            .iter()
-            .any(|(e, _)| e.subject_id == "a"));
     }
 
     #[test]
@@ -11963,7 +11600,7 @@ mod tests {
         // --apply cannot be given with --index-json, so exercise the cap on the
         // pure function and the dry-run note on the real path.
         assert!(
-            tombstone_candidates(&parse_live_index(&fs::read(&idx).unwrap()).unwrap(), "").len()
+            not_general_entries(&parse_live_index(&fs::read(&idx).unwrap()).unwrap()).len()
                 > removal_cap(12, None)
         );
         let _ = fs::remove_dir_all(&dir);
@@ -11983,8 +11620,7 @@ mod tests {
         assert!(bad(&["--index-json", "x.json"]));
         assert!(bad(&["--not-general-report", "--apply"]));
         assert!(bad(&["--max-removals", "3"]));
-        assert!(bad(&["--rejudge-below-classifier", "5"]), "needs --limit");
-        assert!(bad(&["--limit", "5"]));
+        assert!(bad(&["--rejudge-below-classifier", "5", "--limit", "5"]));
         assert!(!bad(&[
             "--not-general-tombstone",
             "--apply",
@@ -11992,103 +11628,6 @@ mod tests {
             "3"
         ]));
         assert!(!bad(&["--not-general-report", "--index-json", "x.json"]));
-        assert!(!bad(&[
-            "--rejudge-below-classifier",
-            "5",
-            "--limit",
-            "5",
-            "--apply"
-        ]));
-    }
-
-    #[test]
-    fn rejudge_selects_machine_classified_entries_below_the_id_within_the_limit() {
-        let mut v: Vec<LiveEntry> = (0..5).map(|i| live("general", i % 2 == 0)).collect();
-        for (i, e) in v.iter_mut().enumerate() {
-            e.subject_id = format!("s{i}");
-            e.has_adult_sections = false;
-            e.landing_not_general = false;
-            e.classifier = Some(4);
-        }
-        v[1].classifier = Some(5); // current
-        v[2].classifier = Some(0); // by hand
-        v[3].classifier = None; // unclassified
-        v[4].landing_not_general = true; // tombstone tool's
-        let ids: Vec<&str> = rejudge_candidates(&v, 5, 10, "")
-            .iter()
-            .map(|e| e.subject_id.as_str())
-            .collect();
-        assert_eq!(ids, ["s0"]);
-        v[1].classifier = Some(3);
-        assert_eq!(
-            rejudge_candidates(&v, 5, 1, "").len(),
-            1,
-            "bounded by --limit"
-        );
-    }
-
-    /// A flag followed by a later suitable re-judge is superseded: the latest line
-    /// decides, so the tombstone tool no longer selects the entry.
-    #[test]
-    fn a_later_suitable_rejudge_supersedes_an_earlier_flag() {
-        let live = parse_live_index(INDEX_JSON.as_bytes()).unwrap();
-        let tag = rejudge_tag();
-        let flag =
-            format!("1\tflagged-on-recheck\tfreenet:A/\t{NOT_SUITABLE_FLAG_PREFIX} ({tag})\n");
-        assert!(tombstone_candidates(&live, &flag)
-            .iter()
-            .any(|(e, _)| e.subject_id == "a"));
-        let log = format!(
-            "{flag}2\t{}\tfreenet:A/\tsuitable ({tag})\n",
-            Outcome::Rejudged.token()
-        );
-        assert!(!tombstone_candidates(&live, &log)
-            .iter()
-            .any(|(e, _)| e.subject_id == "a"));
-        // And flagged again later: selected again.
-        let again =
-            format!("{log}3\tflagged-on-recheck\tfreenet:A/\t{NOT_SUITABLE_FLAG_PREFIX} ({tag})\n");
-        assert!(tombstone_candidates(&live, &again)
-            .iter()
-            .any(|(e, _)| e.subject_id == "a"));
-    }
-
-    /// A bounded run moves past entries already re-judged under this classifier.
-    #[test]
-    fn a_bounded_rejudge_resumes_after_the_entries_already_done() {
-        let mut v: Vec<LiveEntry> = (0..4).map(|_| live("general", false)).collect();
-        for (i, e) in v.iter_mut().enumerate() {
-            e.subject_id = format!("s{i}");
-            e.locator = format!("freenet:L{i}/");
-            e.landing_not_general = false;
-        }
-        let ids = |log: &str| -> Vec<String> {
-            rejudge_candidates(&v, 5, 2, log)
-                .iter()
-                .map(|e| e.subject_id.clone())
-                .collect()
-        };
-        assert_eq!(ids(""), ["s0", "s1"]);
-        let tag = rejudge_tag();
-        let log = format!(
-            "1\trejudged\tfreenet:L0/\tsuitable ({tag})\n\
-             1\tflagged-on-recheck\tfreenet:L1/\t{NOT_SUITABLE_FLAG_PREFIX} ({tag})\n"
-        );
-        assert_eq!(ids(&log), ["s2", "s3"]);
-        // A result under an older classifier id does not count as done.
-        let old = "1\trejudged\tfreenet:L0/\tsuitable (rejudged-classifier=4)\n";
-        assert_eq!(ids(old), ["s0", "s1"]);
-        // A later line of any other kind reopens the entry.
-        let reopened = format!("{log}2\tindexed\tfreenet:L0/\tvolatility=static\n");
-        assert_eq!(ids(&reopened), ["s0", "s2"]);
-    }
-
-    /// A per-host denial skips that entry; only global exhaustion stops the run.
-    #[test]
-    fn a_host_share_denial_skips_and_only_exhaustion_stops() {
-        assert_eq!(budget_step(Ok(())), BudgetStep::Proceed);
-        assert_eq!(budget_step(Err(Denied::HostShare)), BudgetStep::SkipHost);
-        assert_eq!(budget_step(Err(Denied::Exhausted)), BudgetStep::Stop);
     }
 
     /// A live-flag decision is made before the sweep fetches, spends budget or
@@ -12106,7 +11645,7 @@ mod tests {
                 "{later} precedes the live-flag check"
             );
         }
-        assert!(LIVE_FLAGS_REASON.starts_with(NOT_SUITABLE_FLAG_PREFIX));
+        assert!(LIVE_FLAGS_REASON.starts_with("would now be refused on recheck: not-suitable"));
         assert!(LIVE_FLAGS_REASON.contains("not by the model"));
     }
 
