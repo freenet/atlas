@@ -669,7 +669,7 @@ impl Volatility {
 /// entry.
 ///
 /// The model cannot know whether a rightsholder consented to THIS copy, so it
-/// is asked only for what it can SEE on the page plus whether it recognizes the
+/// is asked only for what the page text shows plus whether it recognizes the
 /// specific work, and the decision is made in Rust by [`Redistribution::of`],
 /// where it is testable, reviewable, and changeable without a prompt edit.
 ///
@@ -7536,7 +7536,7 @@ const DESCRIBE_SYSTEM_PROMPT: &str =
         claims_own_authorship (boolean), \
         release_markers (boolean), \
         recognized_commercial_work (boolean). \
-        Report what you can SEE on the page. Do not infer intent. \
+        Report what the page text shows. Do not infer intent. \
         suitable_for_general_audience: true only if everything on the page, including \
         material deeper in behind navigation or an age gate, is suitable for a general \
         audience; false for sexually explicit or pornographic content, graphic \
@@ -7568,8 +7568,8 @@ const DESCRIBE_SYSTEM_PROMPT: &str =
         (an artist publishing their own work, a developer publishing their own program). \
         release_markers: true if the page carries scene or rip markers — FLAC, rip, x264, \
         scene tags, file sizes, \"releases\", track counts. \
-        recognized_commercial_work: true only if you are CONFIDENT the SPECIFIC work shown — \
-        an album title, tracklist, cover art, film title, software product name, or book \
+        recognized_commercial_work: true only if you are CONFIDENT the SPECIFIC work the text names — \
+        an album title, tracklist, film title, software product name, or book \
         title — is an existing commercial, all-rights-reserved release. Answer false for \
         unfamiliar work by a creator you do not recognize, and for work you know to be openly \
         licensed or in the public domain, even if it was also sold (such as a novel its \
@@ -11442,19 +11442,43 @@ mod tests {
     }
 
     /// Source-scrape pin: the crawler must not grow an image path again.
+    ///
+    /// Scans every crawler source file and the renderer. The needles are built
+    /// at run time, and lines of this test module that build them are excluded
+    /// explicitly, so the test cannot match its own needle definitions.
     #[test]
     fn the_crawler_source_has_no_image_path() {
-        let src = include_str!("main.rs");
-        for needle in
-            forbidden_image_needles()
-                .into_iter()
-                .take(2)
-                .chain([["capture_", "screenshot"].concat()])
-        {
-            assert!(
-                !src.contains(&needle),
-                "main.rs must not contain {needle:?}: the crawler classifies page text only"
-            );
+        let needles: Vec<String> = forbidden_image_needles()
+            .into_iter()
+            .take(2)
+            .chain([
+                ["capture_", "screenshot"].concat(),
+                ["input_", "image"].concat(),
+                ["screenshot", "("].concat(),
+                ["--", "shot"].concat(),
+            ])
+            .collect();
+        let files: [(&str, &str); 4] = [
+            ("src/main.rs", include_str!("main.rs")),
+            ("src/dedup.rs", include_str!("dedup.rs")),
+            ("src/mirror.rs", include_str!("mirror.rs")),
+            ("render.js", include_str!("../render.js")),
+        ];
+        for (name, src) in files {
+            for (n, line) in src.lines().enumerate() {
+                // The only lines allowed to mention a needle are the ones that
+                // assemble it from pieces, which never spell it out in full.
+                if line.contains(".concat()") {
+                    continue;
+                }
+                for needle in &needles {
+                    assert!(
+                        !line.contains(needle.as_str()),
+                        "{name}:{} must not contain {needle:?}: the crawler classifies page text only",
+                        n + 1
+                    );
+                }
+            }
         }
     }
 
