@@ -75,18 +75,33 @@
 //! The model is asked for OBSERVATIONS, never verdicts, and the decisions are
 //! made in Rust (`Redistribution::of`, and the gate in `Assessment::admit`). Asking for
 //! a verdict is what put a page of commercial album rips into the index as an
-//! ordinary entry: the old taxonomy's only relevant class was `illegal`, anchored
-//! on serious crimes, so the model had nowhere to put it. See
+//! ordinary entry: the old taxonomy had no class that fitted it. See
 //! `RedistributionSigns`.
 //!
-//! Two rules follow from the index being world-readable. Descriptions of a
-//! resource (`landing`, `has_adult_sections`, `volatility`) are PUBLISHED, because
-//! the UI needs them to hold adult landing pages behind a safe-search toggle.
-//! Judgements about a third party (illegality, redistribution) are NOT: they gate
-//! admission locally and are recorded in the decision log, which is ours.
+//! Atlas lists only content suitable for a general audience. The review detects
+//! explicit or pornographic content and other unsuitable content. Illegal
+//! material is a subset of that and is excluded by the same rule. One class keeps
+//! the system simple and robust.
 //!
-//! Adult material is INDEXED, not dropped. Involuntary exposure is prevented at
-//! presentation rather than by exclusion — see the gate in `index_page`.
+//! The model is asked one question about that (`suitable_for_general_audience`);
+//! a page it answers `false` for is not listed and is recorded as `not-suitable`.
+//! The signed `landing` and `has_adult_sections` fields stay in the index schema
+//! and the crawler always writes `general` and `false`.
+//!
+//! Maintenance after this policy took effect (offline, dry run by default):
+//! `--not-general-report [--index-json FILE]` lists live entries whose landing is
+//! not `general` or whose `has_adult_sections` is true;
+//! `--not-general-tombstone` prints the `atlasctl remove` command for each, and
+//! `--not-general-tombstone --apply` runs them against the live index;
+//! `--rewrite-decision-log` counts the retired `refused-illegal` lines, and
+//! `--rewrite-decision-log --apply` rewrites them to `not-suitable` and refuses
+//! while `atlas-crawler.service` is active. `--not-general-tombstone --apply`
+//! refuses more than max(10, 20% of the index) removals unless `--max-removals`
+//! allows it.
+//!
+//! The volatility description of a resource is PUBLISHED. The redistribution
+//! findings are NOT: they gate admission locally and are recorded in the decision
+//! log, which is ours.
 //!
 //! # Duplicates and clones (#68)
 //!
@@ -130,7 +145,7 @@ mod dedup;
 mod mirror;
 
 use anyhow::{anyhow, bail, Context, Result};
-use clap::Parser;
+use clap::{ArgGroup, Parser};
 
 const MAX_FETCH_BYTES: usize = 512 * 1024;
 /// Cap on the headless renderer's JSON output. Generous next to MAX_FETCH_BYTES
@@ -317,6 +332,18 @@ fn usd(micros: Micros) -> String {
 
 #[derive(Parser)]
 #[command(name = "atlas-crawler", about = "Automated Atlas curator")]
+#[command(
+    group(
+        ArgGroup::new("apply_target")
+            .args(["not_general_tombstone", "rewrite_decision_log"])
+            .multiple(true)
+    ),
+    group(
+        ArgGroup::new("index_json_target")
+            .args(["not_general_report", "not_general_tombstone"])
+            .multiple(true)
+    )
+)]
 struct Cli {
     #[arg(
         long,
@@ -356,7 +383,10 @@ struct Cli {
     /// installation whose crawl configuration is broken or absent, nor by
     /// `--dedup-backfill`, which reads only the live index. Every other mode
     /// needs it.
-    #[arg(long, required_unless_present_any = ["forget", "dedup_backfill", "dedup_report"])]
+    #[arg(long, required_unless_present_any = [
+        "forget", "dedup_backfill", "dedup_report", "not_general_report",
+        "not_general_tombstone", "rewrite_decision_log"
+    ])]
     sources: Option<PathBuf>,
     /// File tracking already-added locators (default: <key_dir>/crawler-seen.txt).
     #[arg(long)]
@@ -530,6 +560,47 @@ struct Cli {
     /// after a threshold change, without re-rendering every entry.
     #[arg(long, conflicts_with_all = ["recheck", "forget", "dedup_backfill"])]
     dedup_report: bool,
+    /// Maintenance, offline: list every live entry whose landing is not
+    /// `general` or whose `has_adult_sections` is true, and exit. Writes nothing.
+    /// Reads the live index through `atlasctl show --json`, or from
+    /// `--index-json FILE` (the saved output of that command).
+    #[arg(long, conflicts_with_all = [
+        "recheck", "forget", "dedup_backfill", "dedup_report"
+    ])]
+    not_general_report: bool,
+    /// Maintenance: tombstone, with `atlasctl remove`, the entries
+    /// `--not-general-report` lists (selected on the signed landing and
+    /// adult-sections fields only). A DRY RUN unless `--apply` is also given: without it this prints the
+    /// `atlasctl remove` command for each entry and changes nothing. `--apply`
+    /// needs the live index, so it cannot be combined with `--index-json`, and it
+    /// refuses more removals than max(10, 20% of the index) unless
+    /// `--max-removals` allows that many. Stop `atlas-crawler.service` first.
+    #[arg(long, conflicts_with_all = [
+        "recheck", "forget", "dedup_backfill", "dedup_report", "not_general_report"
+    ])]
+    not_general_tombstone: bool,
+    /// The most removals `--not-general-tombstone --apply` may perform in one
+    /// run, overriding the default of max(10, 20% of the index).
+    #[arg(long, requires = "not_general_tombstone")]
+    max_removals: Option<usize>,
+    /// Maintenance: rewrite decision-log lines that carry the retired
+    /// `refused-illegal` outcome to `not-suitable`, in place. A
+    /// DRY RUN (counts the lines, writes nothing) unless `--apply` is also given.
+    /// `--apply` refuses to run while `atlas-crawler.service` is active, because
+    /// the crawler appends to the same file and holds no lock on it.
+    #[arg(long, conflicts_with_all = [
+        "recheck", "forget", "dedup_backfill", "dedup_report", "not_general_report",
+        "not_general_tombstone"
+    ])]
+    rewrite_decision_log: bool,
+    /// Perform the real step of `--not-general-tombstone` or
+    /// `--rewrite-decision-log`. Without it both only report.
+    #[arg(long, requires = "apply_target")]
+    apply: bool,
+    /// A saved copy of `atlasctl show --json`, read instead of the live index by
+    /// `--not-general-report` and the dry run of `--not-general-tombstone`.
+    #[arg(long, requires = "index_json_target")]
+    index_json: Option<PathBuf>,
 }
 
 struct Described {
@@ -571,29 +642,17 @@ struct Described {
 /// is false for work known to be openly licensed even if it was also sold.
 /// Classifier 3 recognized Big Buck Bunny (CC BY) as a commercial film and
 /// refused the site playing it.
-const CLASSIFIER_ID: u16 = 4;
-
-/// What a visitor sees IMMEDIATELY on arriving, before navigating anywhere.
 ///
-/// Descriptive, and PUBLISHED to the index: it is a statement about what the
-/// resource shows, which the UI needs in order to keep adult landing pages behind
-/// a safe-search toggle. Contrast [`Redistribution`], which is a judgement about
-/// a third party and stays local.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum Landing {
-    General,
-    Adult,
-}
+/// Bumped 4 -> 5 on 2026-11-26: the `landing`, `has_adult_sections` and `illegal`
+/// questions were replaced by the single `suitable_for_general_audience`.
+const CLASSIFIER_ID: u16 = 5;
 
-impl Landing {
-    /// The `atlasctl --landing` spelling.
-    fn flag(&self) -> &'static str {
-        match self {
-            Self::General => "general",
-            Self::Adult => "adult",
-        }
-    }
-}
+/// The `atlasctl --landing` value the crawler writes. Atlas lists only content
+/// suitable for a general audience, so this is always `general`.
+const LANDING_FLAG: &str = "general";
+
+/// The `atlasctl --adult-sections` value the crawler writes. Always `false`.
+const ADULT_SECTIONS_FLAG: &str = "false";
 
 /// Whether a description is a durable property of the resource or a snapshot of
 /// whatever happened to be on it at the moment we looked.
@@ -619,11 +678,9 @@ impl Volatility {
 /// the bug it was introduced to fix. `freenet:2BpuV9KMCWNEuscBx6Gx3xLGRBvKpHoU8mcsuRXixsub/`
 /// (BaroShare, a general-purpose encrypted file-sharing app whose landing page is
 /// a live feed) went into the index as "Kanye West Graduation Album FLAC Files".
-/// The old taxonomy offered `illegal` / `nsfw` / `ok`, with `illegal` anchored in
-/// the prompt on child sexual abuse material and content facilitating serious
-/// crimes. A model reading a commercial album's track listing correctly concludes
-/// that is not a serious crime, and there was no other class to put it in, so it
-/// returned `ok` and Atlas published the entry.
+/// The old taxonomy had a single `rating` with no class that fitted a commercial
+/// album's track listing, so the model returned `ok` and Atlas published the
+/// entry.
 ///
 /// The model cannot know whether a rightsholder consented to THIS copy, so it
 /// is asked only for what it can SEE on the page plus whether it recognizes the
@@ -725,18 +782,16 @@ impl Redistribution {
 
 /// What the classifier observed about a page.
 ///
-/// Split into what is PUBLISHED (`landing`, `has_adult_sections`, `volatility` —
-/// descriptions of the resource, which the UI needs) and what stays LOCAL
-/// (`illegal`, `redistribution` — judgements about a third party). The index is
+/// Split into what is PUBLISHED (`volatility`, a description of the resource)
+/// and what stays LOCAL (`suitable`, `redistribution`). The index is
 /// world-readable, so writing a copyright assessment into it would publish an
 /// accusation Atlas cannot substantiate. See `add_entry`.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 struct Assessment {
-    landing: Landing,
-    has_adult_sections: bool,
+    /// Whether the content is suitable for a general audience. `false` is not
+    /// listed and is recorded as `not-suitable`.
+    suitable: bool,
     volatility: Volatility,
-    /// Content illegal to host or distribute. A hard refusal, unchanged.
-    illegal: bool,
     redistribution: RedistributionSigns,
 }
 
@@ -760,8 +815,8 @@ impl Assessment {
     /// Ordered most-serious first, because the operator reads one line per locator
     /// and it should name the worst thing found.
     fn admit(&self) -> Admission {
-        if self.illegal {
-            return Admission::Refuse(Outcome::RefusedIllegal);
+        if !self.suitable {
+            return Admission::Refuse(Outcome::NotSuitable);
         }
         // Redistribution is decided HERE, in Rust, from observations — never asked
         // of the model as a verdict. See `Redistribution::of`.
@@ -788,8 +843,7 @@ impl Assessment {
         // repairable, because it lands in `crawler-seen.txt` and the re-check
         // pass scopes to already-published subjects, so a locator refused before
         // it became a subject is outside re-adjudication for good. That is the
-        // same argument the adult-landing decision below already makes; it
-        // applies here and more strongly, because the harm prevented is smaller.
+        // same argument applies here, and the harm prevented is small.
         //
         // `volatility` stays PUBLISHED as CURATOR metadata: it reaches the signed
         // entry and `atlasctl show`, and nothing else reads it today. Do NOT read
@@ -797,33 +851,34 @@ impl Assessment {
         // (`ui/src/main.rs` holds it constant in its fixtures precisely so a
         // filter that started depending on it would be noticed), and recheck
         // tiering cannot see it at all, because `RecheckTier::of` takes only the
-        // locator and the two adult flags and `LiveEntry` carries no volatility
-        // field. Revisiting feeds more often is a REASONABLE thing to build on
+        // locator and `LiveEntry` carries no volatility field. Revisiting feeds more often is a REASONABLE thing to build on
         // this signal and is not built; see #66. The classifier's own accuracy on
         // this field is #65 (identity diluted by a volatile body).
         //
         // Do not re-add a refusal here without evidence that the gate is right
         // more often than it is wrong.
-        // Adult LANDING pages are ADMITTED, deliberately, where they used to be
-        // dropped. Involuntary exposure is prevented at presentation: the UI holds
-        // them behind a safe-search toggle that is on by default, and a gated site
-        // (general landing, adult sections deeper in) is shown with a badge. A
-        // crawler that refuses them instead makes them permanently unfindable AND
-        // unreviewable, since nothing recorded why — which is the state the
-        // decision log exists to end.
         Admission::Admit
     }
 
     /// The observations behind a refusal, for the log and the operator's line.
+    ///
+    /// `not-suitable` is one class, so there is no sub-category to record and no
+    /// evidence string.
+    fn evidence_for(&self, outcome: Outcome) -> String {
+        if outcome == Outcome::NotSuitable {
+            String::new()
+        } else {
+            self.evidence()
+        }
+    }
+
+    /// The redistribution observations and volatility.
     fn evidence(&self) -> String {
         let s = &self.redistribution;
         format!(
-            "landing={} adult_sections={} volatility={} illegal={} complete_works={} \
+            "volatility={} complete_works={} \
              rightsholders={} own_authorship={} release_markers={} recognized_work={}",
-            self.landing.flag(),
-            self.has_adult_sections,
             self.volatility.flag(),
-            self.illegal,
             s.distributes_complete_works,
             s.distinct_rightsholders,
             s.claims_own_authorship,
@@ -838,7 +893,7 @@ impl Outcome {
     /// the stable grep key: this is prose and may be reworded freely.
     fn refusal_line(&self) -> &'static str {
         match self {
-            Self::RefusedIllegal => "BLOCKED (illegal content), not indexed",
+            Self::NotSuitable => "not indexed (not suitable for a general audience)",
             Self::RefusedRedistribution => {
                 "not indexed (redistribution of others' commercial works)"
             }
@@ -2614,7 +2669,8 @@ fn sibling_tmp(path: &Path) -> PathBuf {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Outcome {
     Indexed,
-    RefusedIllegal,
+    /// Not listed: not suitable for a general audience. One class, so there is no sub-category to record.
+    NotSuitable,
     RefusedRedistribution,
     /// An operator discarded a previous decision with `--forget`. Recorded so the
     /// log explains why a locator that was refused shows up indexed later.
@@ -2625,7 +2681,7 @@ enum Outcome {
     RetiredOverCapacity,
     RetiredOverAuthorShare,
     /// The re-verification sweep re-classified a PUBLISHED entry and the fresh
-    /// classification would now be REFUSED (illegal, or redistribution). The
+    /// classification would now be REFUSED (not suitable, or redistribution). The
     /// published entry is left untouched — see
     /// `run_recheck_pass` — this is only the record a curator reviews to decide
     /// via `atlasctl remove`.
@@ -2640,7 +2696,7 @@ impl Outcome {
     fn token(&self) -> &'static str {
         match self {
             Self::Indexed => "indexed",
-            Self::RefusedIllegal => "refused-illegal",
+            Self::NotSuitable => "not-suitable",
             Self::RefusedRedistribution => "refused-redistribution",
             Self::Forgotten => "forgotten",
             Self::Gone => "gone",
@@ -2670,10 +2726,8 @@ const DECISIONS_KEEP: usize = MAX_DECISIONS * 3 / 4;
 /// An append-only record of WHY each locator's fate was decided.
 ///
 /// `crawler-seen.txt` records THAT a locator was decided about and nothing else,
-/// so a policy change cannot find what the old policy refused. Adult material is
-/// exactly that case: it used to be dropped and is now indexed behind a
-/// safe-search toggle, and every site refused under the old rule is unreachable —
-/// it is in the seen file, indistinguishable from a site that was indexed.
+/// so a policy change cannot find what the old policy refused: a refused site is
+/// in the seen file, indistinguishable from a site that was indexed.
 ///
 /// It is an AUDIT RECORD, not a control input. Nothing reads it back to decide
 /// anything, and it must stay that way: the moment a decision depends on it, a
@@ -2950,6 +3004,15 @@ fn main() -> Result<()> {
                 decisions: &decisions_path,
             },
         );
+    }
+
+    if cli.not_general_report || cli.not_general_tombstone {
+        return run_not_general(&cli);
+    }
+    if cli.rewrite_decision_log {
+        return run_rewrite_decision_log(&decisions_path, cli.apply, &|| {
+            service_is_active(CRAWLER_SERVICE)
+        });
     }
 
     if cli.dedup_report {
@@ -3714,8 +3777,7 @@ const RECHECK_UNREACHABLE_STRIKES: u32 = 3;
 
 /// Which backoff tier a live entry belongs to.
 ///
-/// High-drift entries — app-hosted resources, and anything already carrying
-/// adult content — are checked far more often on a far shorter ceiling than
+/// High-drift entries (app-hosted resources) are checked far more often on a far shorter ceiling than
 /// everything else, and out of their OWN population-derived budget (see
 /// `TARGET_DAILY_RENDERS_HIGHDRIFT`'s doc for why it must not share with
 /// standard).
@@ -3727,11 +3789,9 @@ enum RecheckTier {
 
 impl RecheckTier {
     /// `app:` locators drift because the app can republish anything behind the
-    /// same handle at any time; adult-flagged entries drift because they are
-    /// the category most consequential to leave stale (a page that stopped
-    /// being adult, or started).
-    fn of(locator: &str, landing_adult: bool, has_adult_sections: bool) -> Self {
-        if locator.starts_with("app:") || landing_adult || has_adult_sections {
+    /// same handle at any time.
+    fn of(locator: &str) -> Self {
+        if locator.starts_with("app:") {
             Self::HighDrift
         } else {
             Self::Standard
@@ -3776,22 +3836,22 @@ struct LiveEntry {
     locator: String,
     /// When the entry was minted. First seen is canonical for duplicates (#68).
     added_at: Option<u64>,
-    landing_adult: bool,
+    /// `class.landing` is present and is not `general`.
+    landing_not_general: bool,
     has_adult_sections: bool,
 }
 
-/// Whether a fresh assessment would change what is currently PUBLISHED for
-/// `landing`/`has_adult_sections` — the one field the involuntary-exposure
-/// design depends on (safe search hides on `landing`, the badge reads
-/// `has_adult_sections`). A change here must never auto-publish through the
-/// recheck sweep: it is the first path where a re-render of adversary-
-/// controlled content can move that field with no human in the loop, on a
-/// recurring cadence, and a title/snippet refresh does not carry that risk.
-/// Extracted as a pure function rather than left inline so it is testable
-/// directly, not only via a source scrape of `run_recheck_pass`.
-fn landing_would_change(current_adult: bool, current_has_sections: bool, new: &Assessment) -> bool {
-    (new.landing == Landing::Adult) != current_adult
-        || new.has_adult_sections != current_has_sections
+/// The reason logged when the entry's own live flags decided it, not the model.
+const LIVE_FLAGS_REASON: &str = "would now be refused on recheck: not-suitable (decided by the \
+     live landing and adult-sections flags, not by the model)";
+
+/// Whether a live entry is published as anything other than general-audience
+/// (`landing` not general, or `has_adult_sections` true). Atlas lists only content
+/// suitable for a general audience, so the recheck sweep never re-publishes such an
+/// entry as general: it flags it and leaves it for the maintenance tool
+/// (`--not-general-tombstone`).
+fn live_entry_not_general(e: &LiveEntry) -> bool {
+    e.landing_not_general || e.has_adult_sections
 }
 
 /// The HTTP client every fetch goes through.
@@ -4199,6 +4259,207 @@ impl DedupState {
     }
 }
 
+/// The live entries Atlas no longer lists: landing not `general`, or
+/// `has_adult_sections` true.
+fn not_general_entries(live: &[LiveEntry]) -> Vec<&LiveEntry> {
+    live.iter().filter(|e| live_entry_not_general(e)).collect()
+}
+
+/// One report line per entry, in the order given.
+fn not_general_listing(entries: &[&LiveEntry]) -> String {
+    entries
+        .iter()
+        .map(|e| {
+            format!(
+                "{}\tv{}\t{}\tlanding_not_general={}\thas_adult_sections={}\n",
+                e.subject_id, e.version, e.locator, e.landing_not_general, e.has_adult_sections
+            )
+        })
+        .collect()
+}
+
+/// The most removals one `--apply` may perform: `explicit` if given, else
+/// max(10, 20% of the index).
+fn removal_cap(index_len: usize, explicit: Option<usize>) -> usize {
+    explicit.unwrap_or_else(|| 10.max(index_len / 5))
+}
+
+/// Tombstone one subject with `atlasctl remove`.
+fn atlasctl_remove(cli: &Cli, subject: &str, cur_version: u64) -> Result<()> {
+    let mut cmd = Command::new(&cli.atlasctl);
+    cmd.args(["--node", &cli.node]);
+    if let Some(kd) = &cli.key_dir {
+        cmd.args(["--key-dir", &kd.to_string_lossy()]);
+    }
+    cmd.arg("remove");
+    cmd.arg(format!("--subject={subject}"));
+    cmd.arg(format!("--cur-version={cur_version}"));
+    let out = cmd.output().with_context(|| "running atlasctl remove")?;
+    if !out.status.success() {
+        bail!(
+            "atlasctl remove failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+    Ok(())
+}
+
+/// `--not-general-report` and `--not-general-tombstone`. See the flags' docs.
+///
+/// Nothing is written unless `--not-general-tombstone --apply` is given, and
+/// that combination reads the live index, never a saved file.
+fn run_not_general(cli: &Cli) -> Result<()> {
+    let apply = cli.not_general_tombstone && cli.apply;
+    if apply && cli.index_json.is_some() {
+        bail!("--apply needs the live index; it cannot be combined with --index-json");
+    }
+    let live = match &cli.index_json {
+        Some(path) => parse_live_index(
+            &fs::read(path).with_context(|| format!("reading {}", path.display()))?,
+        )?,
+        None => fetch_live_index(cli)?,
+    };
+    if live.is_empty() {
+        bail!("the index read back EMPTY; refusing to report on it");
+    }
+    let hits = not_general_entries(&live);
+    print!("{}", not_general_listing(&hits));
+    println!(
+        "{} of {} entries have a landing that is not general or have adult sections",
+        hits.len(),
+        live.len()
+    );
+    if !cli.not_general_tombstone {
+        return Ok(());
+    }
+    let cap = removal_cap(live.len(), cli.max_removals);
+    if apply && hits.len() > cap {
+        bail!(
+            "refusing to remove {} of {} entries: the limit is {cap}. Check the list, then \
+             pass --max-removals {} to allow it",
+            hits.len(),
+            live.len(),
+            hits.len()
+        );
+    }
+    let mut failed = 0usize;
+    for e in &hits {
+        if apply {
+            match atlasctl_remove(cli, &e.subject_id, e.version) {
+                Ok(()) => println!("tombstoned {}", e.subject_id),
+                Err(err) => {
+                    failed += 1;
+                    eprintln!("error: {}: {err:#}", e.subject_id);
+                }
+            }
+        } else {
+            println!(
+                "dry run: atlasctl remove --subject={} --cur-version={}",
+                e.subject_id, e.version
+            );
+        }
+    }
+    if !apply {
+        println!("dry run: nothing changed. Add --apply to tombstone these entries.");
+        if hits.len() > cap {
+            println!("note: --apply would refuse this many (limit {cap}) without --max-removals");
+        }
+    }
+    if failed > 0 {
+        bail!("{failed} tombstone(s) failed");
+    }
+    Ok(())
+}
+
+/// Rewrite retired `refused-illegal` decision-log lines to `not-suitable` with an
+/// empty reason. Returns the new body and how many lines changed. Every other
+/// line is kept byte for byte.
+fn rewrite_decision_lines(body: &str) -> (String, usize) {
+    const OLD_RECHECK: &str = "would now be refused on recheck: refused-illegal";
+    let mut changed = 0usize;
+    let mut out = String::with_capacity(body.len());
+    for line in body.split_inclusive('\n') {
+        let (text, nl) = match line.strip_suffix('\n') {
+            Some(t) => (t, "\n"),
+            None => (line, ""),
+        };
+        let cols: Vec<&str> = text.splitn(4, '\t').collect();
+        let new = match cols.as_slice() {
+            [ts, "refused-illegal", loc, ..] => {
+                Some(format!("{ts}\t{}\t{loc}\t", Outcome::NotSuitable.token()))
+            }
+            [ts, "flagged-on-recheck", loc, reason] if reason.starts_with(OLD_RECHECK) => {
+                Some(format!(
+                    "{ts}\tflagged-on-recheck\t{loc}\twould now be refused on recheck: {}",
+                    Outcome::NotSuitable.token()
+                ))
+            }
+            _ => None,
+        };
+        match new {
+            Some(n) => {
+                changed += 1;
+                out.push_str(&n);
+            }
+            None => out.push_str(text),
+        }
+        out.push_str(nl);
+    }
+    (out, changed)
+}
+
+const CRAWLER_SERVICE: &str = "atlas-crawler.service";
+
+/// Whether `systemctl is-active` reports the unit active. A machine without
+/// systemctl (or without the unit) reports inactive.
+fn service_is_active(unit: &str) -> bool {
+    Command::new("systemctl")
+        .args(["is-active", "--quiet", unit])
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+/// `--rewrite-decision-log`. See the flag's doc.
+fn run_rewrite_decision_log(
+    path: &Path,
+    apply: bool,
+    service_active: &dyn Fn() -> bool,
+) -> Result<()> {
+    let body = fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+    let (new, changed) = rewrite_decision_lines(&body);
+    if !apply {
+        println!(
+            "dry run: {changed} line(s) in {} would be rewritten to not-suitable. \
+             Add --apply to rewrite them.",
+            path.display()
+        );
+        return Ok(());
+    }
+    // The crawler appends to this file and holds no lock on it, so a rewrite
+    // while it runs can drop the lines it appends in between.
+    if service_active() {
+        bail!("{CRAWLER_SERVICE} is active; stop it before --apply");
+    }
+    if changed > 0 {
+        use std::io::Write;
+        let tmp = sibling_tmp(path);
+        let mut f = fs::File::create(&tmp).with_context(|| format!("writing {}", tmp.display()))?;
+        f.write_all(new.as_bytes())
+            .and_then(|()| f.sync_all())
+            .with_context(|| format!("writing {}", tmp.display()))?;
+        drop(f);
+        fs::rename(&tmp, path).with_context(|| format!("replacing {}", path.display()))?;
+        if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
+            if let Ok(d) = fs::File::open(dir) {
+                let _ = d.sync_all();
+            }
+        }
+    }
+    println!("rewrote {changed} line(s) in {}", path.display());
+    Ok(())
+}
+
 /// `--dedup-backfill`: rebuild the fingerprint store from the live index and
 /// report what the duplicate check sees in it. See the flag's doc.
 fn run_dedup_backfill(cli: &Cli, path: &Path) -> Result<()> {
@@ -4341,8 +4602,13 @@ fn fetch_live_index(cli: &Cli) -> Result<Vec<LiveEntry>> {
             String::from_utf8_lossy(&out.stderr)
         );
     }
-    let parsed: serde_json::Value = serde_json::from_slice(&out.stdout)
-        .with_context(|| "atlasctl show --json output not json")?;
+    parse_live_index(&out.stdout)
+}
+
+/// Parse the output of `atlasctl show --json`.
+fn parse_live_index(json: &[u8]) -> Result<Vec<LiveEntry>> {
+    let parsed: serde_json::Value =
+        serde_json::from_slice(json).with_context(|| "atlasctl show --json output not json")?;
     let rows = parsed
         .as_array()
         .ok_or_else(|| anyhow!("atlasctl show --json did not return a JSON array"))?;
@@ -4354,7 +4620,9 @@ fn fetch_live_index(cli: &Cli) -> Result<Vec<LiveEntry>> {
                 version: r["version"].as_u64()?,
                 locator: r["locator"].as_str()?.to_string(),
                 added_at: r["added_at"].as_u64(),
-                landing_adult: r["class"]["landing"].as_str() == Some("adult"),
+                landing_not_general: r["class"]["landing"]
+                    .as_str()
+                    .is_some_and(|l| l != LANDING_FLAG),
                 has_adult_sections: r["class"]["has_adult_sections"].as_bool().unwrap_or(false),
             })
         })
@@ -4398,8 +4666,8 @@ fn recheck_update(
             .collect();
         cmd.arg(format!("--tags={}", tags.join(",")));
         if let Some(a) = &d.assessment {
-            cmd.arg(format!("--landing={}", a.landing.flag()));
-            cmd.arg(format!("--adult-sections={}", a.has_adult_sections));
+            cmd.arg(format!("--landing={LANDING_FLAG}"));
+            cmd.arg(format!("--adult-sections={ADULT_SECTIONS_FLAG}"));
             cmd.arg(format!("--volatility={}", a.volatility.flag()));
             // The classifier id belongs with the answers it produced. Without it, a
             // recheck-corrected entry carries a taxonomy-3 volatility answer
@@ -4686,14 +4954,12 @@ fn run_recheck_pass(
     let mut schedule = RecheckSchedule::load(recheck_state_path);
     schedule.prune_to(&live_ids);
 
-    // Tiers and population counts come from the SAME snapshot: an entry that
-    // crosses landing/has_adult_sections between passes must not see a ceiling
-    // sized for a population it no longer belongs to.
+    // Tiers and population counts come from the SAME snapshot.
     let mut standard_pop = 0usize;
     let mut highdrift_pop = 0usize;
     let mut tier_of: HashMap<String, RecheckTier> = HashMap::new();
     for e in &live {
-        let tier = RecheckTier::of(&e.locator, e.landing_adult, e.has_adult_sections);
+        let tier = RecheckTier::of(&e.locator);
         match tier {
             RecheckTier::Standard => standard_pop += 1,
             RecheckTier::HighDrift => highdrift_pop += 1,
@@ -4742,6 +5008,26 @@ fn run_recheck_pass(
             RecheckTier::Standard => standard_pop,
             RecheckTier::HighDrift => highdrift_pop,
         });
+        // An entry published as anything but general is decided by its own live
+        // flags, before any fetch, budget or model call: it is flagged for
+        // `--not-general-tombstone` and never re-published as general.
+        if live_entry_not_general(e) {
+            if decisions.record(
+                &e.locator,
+                Outcome::FlaggedOnRecheck,
+                LIVE_FLAGS_REASON,
+                now,
+            ) {
+                eprintln!(
+                    "  recheck: {} is published as not general (decided by its live \
+                     landing and adult-sections flags, not the model) — flagging",
+                    e.subject_id
+                );
+                schedule.record_unchanged(&e.subject_id, ceiling, now);
+                flagged += 1;
+            }
+            continue;
+        }
         let app = registry.app_of(&e.locator);
         let enumerate = app
             .as_ref()
@@ -4845,24 +5131,8 @@ fn run_recheck_pass(
                     }
                 };
                 let admission = desc.assessment.as_ref().map(Assessment::admit);
-                // A landing/adult-sections FLIP, in EITHER direction, is not a
-                // cosmetic correction: it is the one field the whole
-                // involuntary-exposure design depends on (safe search hides on
-                // `landing`, the badge reads `has_adult_sections`), and this is
-                // the first path where a re-render of ADVERSARY-CONTROLLED
-                // content can change it with no human in the loop, on a
-                // recurring cadence. An admitted title/snippet/tag refresh
-                // still auto-publishes — that risk is bounded and reversible by
-                // definition, the entry was already admitted. A landing change
-                // gets the SAME treatment as a would-now-be-refused verdict:
-                // leave the published entry untouched and flag it, rather than
-                // trust a single automated read of a page that just changed to
-                // move the one field that decides who gets warned.
-                let landing_changed = desc.assessment.as_ref().is_some_and(|a| {
-                    landing_would_change(e.landing_adult, e.has_adult_sections, a)
-                });
                 match admission {
-                    Some(Admission::Admit) | None if !landing_changed => {
+                    Some(Admission::Admit) | None => {
                         // Only advance the schedule when the correction
                         // actually PUBLISHED. On failure (a version race
                         // against a concurrent editor, a network error), the
@@ -4877,42 +5147,6 @@ fn run_recheck_pass(
                             schedule.record_changed(&e.subject_id, tier, print, now);
                         }
                     }
-                    Some(Admission::Admit) | None => {
-                        // landing_changed: flag instead of auto-publishing. See
-                        // the comment above the match.
-                        let evidence = desc
-                            .assessment
-                            .as_ref()
-                            .map(|a| {
-                                let was = if e.landing_adult {
-                                    Landing::Adult
-                                } else {
-                                    Landing::General
-                                };
-                                format!(
-                                    "landing {} -> {}, adult sections {} -> {}",
-                                    was.flag(),
-                                    a.landing.flag(),
-                                    e.has_adult_sections,
-                                    a.has_adult_sections
-                                )
-                            })
-                            .unwrap_or_default();
-                        if decisions.record(
-                            &e.locator,
-                            Outcome::FlaggedOnRecheck,
-                            &format!("landing/adult-sections would change on recheck: {evidence}"),
-                            now,
-                        ) {
-                            eprintln!(
-                                "  recheck: {} landing/adult-sections would change \
-                                 ({evidence}) — leaving published, flagging for review",
-                                e.subject_id
-                            );
-                            schedule.record_changed(&e.subject_id, tier, print, now);
-                            flagged += 1;
-                        }
-                    }
                     Some(Admission::Refuse(outcome)) => {
                         // Leave the published entry untouched: this is a
                         // bigger, more consequential decision than correcting
@@ -4923,7 +5157,7 @@ fn run_recheck_pass(
                         let evidence = desc
                             .assessment
                             .as_ref()
-                            .map(Assessment::evidence)
+                            .map(|a| a.evidence_for(outcome))
                             .unwrap_or_default();
                         // Same gate as the too-thin arm above: only advance once
                         // the flag is actually on record.
@@ -4931,8 +5165,9 @@ fn run_recheck_pass(
                             &e.locator,
                             Outcome::FlaggedOnRecheck,
                             &format!(
-                                "would now be refused on recheck: {} — {evidence}",
-                                outcome.token()
+                                "would now be refused on recheck: {}{}{evidence}",
+                                outcome.token(),
+                                if evidence.is_empty() { "" } else { " — " }
                             ),
                             now,
                         ) {
@@ -5376,8 +5611,9 @@ fn index_page(
     // their sources file.
     if let Some(a) = &desc.assessment {
         if let Admission::Refuse(outcome) = a.admit() {
-            let evidence = a.evidence();
-            eprintln!("  {}: {loc} — {evidence}", outcome.refusal_line());
+            let evidence = a.evidence_for(outcome);
+            let sep = if evidence.is_empty() { "" } else { " " };
+            eprintln!("  {}: {loc}{sep}{evidence}", outcome.refusal_line());
             // Fail CLOSED, and note what "closed" means here: the locator stays
             // QUEUED, not refused-and-forgotten. A refusal recorded nowhere is
             // exactly the opacity this log exists to remove — `crawler-seen.txt`
@@ -5404,12 +5640,7 @@ fn index_page(
         loc,
         Outcome::Indexed,
         &match &desc.assessment {
-            Some(a) => format!(
-                "landing={} adult_sections={} volatility={}",
-                a.landing.flag(),
-                a.has_adult_sections,
-                a.volatility.flag()
-            ),
+            Some(a) => format!("volatility={}", a.volatility.flag()),
             None => "unassessed (title/meta fallback, curated source)".to_string(),
         },
         now,
@@ -7440,10 +7671,8 @@ const LLM_TEXT_CHARS: usize = 6000;
 /// the real thing rather than an assumption about its length.
 ///
 /// It asks for OBSERVATIONS, not verdicts. The previous version asked for a
-/// single `rating` of `illegal` / `nsfw` / `ok`, with `illegal` anchored on child
-/// sexual abuse material and content facilitating serious crimes — so a model
-/// reading a page of commercial album rips had no class that fitted and answered
-/// `ok`, and Atlas published BaroShare as "Kanye West Graduation Album FLAC
+/// single `rating` with no class that fitted a page of commercial album rips, so
+/// the model answered `ok`, and Atlas published BaroShare as "Kanye West Graduation Album FLAC
 /// Files". Every judgement now happens in Rust, where it can be tested against
 /// real pages and changed without a prompt edit; the model is asked only for
 /// things visible on the page.
@@ -7457,28 +7686,25 @@ const DESCRIBE_SYSTEM_PROMPT: &str =
         title (string, short), \
         snippet (string, one factual sentence), \
         tags (array of up to 5 lowercase keywords), \
-        landing (string: \"general\" or \"adult\"), \
-        has_adult_sections (boolean), \
+        suitable_for_general_audience (boolean), \
         volatility (string: \"static\" or \"feed\"), \
-        illegal (boolean), \
         distributes_complete_works (boolean), \
         distinct_rightsholders (integer), \
         claims_own_authorship (boolean), \
         release_markers (boolean), \
         recognized_commercial_work (boolean). \
-        Report what you can SEE on the page. Do not infer intent or legality. \
-        landing: what a visitor sees IMMEDIATELY on arriving — \"adult\" if that is sexually \
-        explicit or pornographic material, otherwise \"general\". \
-        has_adult_sections: true if adult material exists deeper in, behind navigation or an \
-        age gate, whatever the landing page shows. \
+        Report what you can SEE on the page. Do not infer intent. \
+        suitable_for_general_audience: true only if everything on the page, including \
+        material deeper in behind navigation or an age gate, is suitable for a general \
+        audience; false for sexually explicit or pornographic content, graphic \
+        violence or gore, or other content not suitable for a general audience. \
+        Ordinary adult language is fine. \
         volatility: would a description of the RESOURCE still be accurate after its \
         contents change? Answer \"static\" unless the page is nothing but a stream of \
         posts, where the current posts are the only describable thing about it. A \
         directory, index, gallery, message board or application is \"static\" even when \
         the items it lists change constantly, because what the resource IS does not \
         change. Judge the resource, not the freshness of what it happens to show today. \
-        illegal: true only for content illegal to host or distribute, such as child sexual \
-        abuse material or content facilitating serious crimes. \
         In every answer below, \"commercial\" means commercially released, all-rights-reserved \
         work: a record-label album, a studio film or TV series, retail software, a published \
         book. Openly licensed work (Creative Commons, free software) and public-domain work \
@@ -7694,27 +7920,7 @@ fn describe_llm(
     // cautious choice. Defaulting to "fine" is how the bug this taxonomy replaced
     // got into the index. An absent answer means we did not get a judgement, so
     // the honest move is to have no judgement yet and ask again later.
-    let assessment = Assessment {
-        landing: match req_str(&parsed, "landing")?.as_str() {
-            "general" => Landing::General,
-            "adult" => Landing::Adult,
-            other => bail!("llm returned an unrecognised landing {other:?}"),
-        },
-        has_adult_sections: req_bool(&parsed, "has_adult_sections")?,
-        volatility: match req_str(&parsed, "volatility")?.as_str() {
-            "static" => Volatility::Static,
-            "feed" => Volatility::Feed,
-            other => bail!("llm returned an unrecognised volatility {other:?}"),
-        },
-        illegal: req_bool(&parsed, "illegal")?,
-        redistribution: RedistributionSigns {
-            distributes_complete_works: req_bool(&parsed, "distributes_complete_works")?,
-            distinct_rightsholders: req_u32(&parsed, "distinct_rightsholders")?,
-            claims_own_authorship: req_bool(&parsed, "claims_own_authorship")?,
-            release_markers: req_bool(&parsed, "release_markers")?,
-            recognized_commercial_work: req_bool(&parsed, "recognized_commercial_work")?,
-        },
-    };
+    let assessment = parse_assessment(&parsed)?;
     if title.is_empty() {
         bail!("llm returned empty title");
     }
@@ -7740,6 +7946,25 @@ fn req_str(v: &serde_json::Value, key: &str) -> Result<String> {
         .and_then(|x| x.as_str())
         .map(|s| s.trim().to_ascii_lowercase())
         .ok_or_else(|| anyhow!("llm response is missing the string field {key:?}"))
+}
+
+/// The classification half of the model's JSON reply. Every field is required.
+fn parse_assessment(parsed: &serde_json::Value) -> Result<Assessment> {
+    Ok(Assessment {
+        suitable: req_bool(parsed, "suitable_for_general_audience")?,
+        volatility: match req_str(parsed, "volatility")?.as_str() {
+            "static" => Volatility::Static,
+            "feed" => Volatility::Feed,
+            other => bail!("llm returned an unrecognised volatility {other:?}"),
+        },
+        redistribution: RedistributionSigns {
+            distributes_complete_works: req_bool(parsed, "distributes_complete_works")?,
+            distinct_rightsholders: req_u32(parsed, "distinct_rightsholders")?,
+            claims_own_authorship: req_bool(parsed, "claims_own_authorship")?,
+            release_markers: req_bool(parsed, "release_markers")?,
+            recognized_commercial_work: req_bool(parsed, "recognized_commercial_work")?,
+        },
+    })
 }
 
 fn req_bool(v: &serde_json::Value, key: &str) -> Result<bool> {
@@ -7822,18 +8047,17 @@ fn add_entry(cli: &Cli, loc: &str, kind: &str, d: &Described) -> Result<()> {
     cmd.arg(format!("--locator={loc}"));
     // The PUBLISHED half of the assessment, and only that half.
     //
-    // `landing`, `has_adult_sections` and `volatility` are descriptions of the
-    // resource: the UI needs them to keep an adult landing page behind the
-    // safe-search toggle and to badge a gated site. The `illegal` and
-    // redistribution findings are NOT sent, and must not be: the index is
-    // world-readable, so storing a copyright or legality assessment there
-    // publishes an accusation about a third party from a model's reading of one
-    // page. Those stay local — they gate admission here and are recorded in the
-    // decision log, which is ours.
+    // `volatility` is a description of the resource and is sent. `landing` and
+    // `has_adult_sections` stay in the signed schema, and the crawler always
+    // writes `general` and `false`. The suitability and redistribution findings
+    // are NOT sent, and must not be: the index is world-readable, so storing a
+    // copyright assessment there publishes an accusation about a third party
+    // from a model's reading of one page. Those stay local: they gate admission
+    // here and are recorded in the decision log, which is ours.
     // (`redistribution_findings_are_never_published` pins that.)
     if let Some(a) = &d.assessment {
-        cmd.arg(format!("--landing={}", a.landing.flag()));
-        cmd.arg(format!("--adult-sections={}", a.has_adult_sections));
+        cmd.arg(format!("--landing={LANDING_FLAG}"));
+        cmd.arg(format!("--adult-sections={ADULT_SECTIONS_FLAG}"));
         cmd.arg(format!("--volatility={}", a.volatility.flag()));
         cmd.arg(format!("--classifier={CLASSIFIER_ID}"));
     }
@@ -10300,8 +10524,8 @@ mod tests {
     /// drift silently.
     #[test]
     fn the_published_flag_strings_are_exactly_as_the_cli_parses_them() {
-        assert_eq!(Landing::General.flag(), "general");
-        assert_eq!(Landing::Adult.flag(), "adult");
+        assert_eq!(LANDING_FLAG, "general");
+        assert_eq!(ADULT_SECTIONS_FLAG, "false");
         assert_eq!(Volatility::Static.flag(), "static");
         assert_eq!(Volatility::Feed.flag(), "feed");
     }
@@ -10556,10 +10780,8 @@ mod tests {
     /// A clean, static, general-audience page with no redistribution signs.
     fn clean_assessment() -> Assessment {
         Assessment {
-            landing: Landing::General,
-            has_adult_sections: false,
+            suitable: true,
             volatility: Volatility::Static,
-            illegal: false,
             redistribution: RedistributionSigns::default(),
         }
     }
@@ -10578,11 +10800,11 @@ mod tests {
 
         assert_eq!(
             Assessment {
-                illegal: true,
+                suitable: false,
                 ..clean_assessment()
             }
             .admit(),
-            Admission::Refuse(Outcome::RefusedIllegal)
+            Admission::Refuse(Outcome::NotSuitable)
         );
         assert_eq!(
             Assessment {
@@ -10639,80 +10861,162 @@ mod tests {
         );
     }
 
-    /// The policy change: adult material is INDEXED, not dropped.
-    ///
-    /// This is the assertion that catches the regression that would otherwise
-    /// compile, pass everything else, and quietly make every adult site
-    /// permanently unfindable again — with nothing recording why, which is the
-    /// state that made the old behaviour impossible to revisit. Exposure is
-    /// prevented at presentation (a safe-search toggle, on by default), not by
-    /// exclusion.
+    /// Atlas lists only content suitable for a general audience. A page the
+    /// model answers `false` for is not listed, whatever else is true of it, and
+    /// the outcome carries no sub-category.
     #[test]
-    fn adult_material_is_indexed_rather_than_refused() {
+    fn content_not_suitable_for_a_general_audience_is_not_listed() {
         assert_eq!(
             Assessment {
-                landing: Landing::Adult,
-                has_adult_sections: true,
+                suitable: false,
                 ..clean_assessment()
             }
             .admit(),
-            Admission::Admit,
-            "an adult LANDING page must be indexed and held behind safe search"
+            Admission::Refuse(Outcome::NotSuitable)
         );
-        // The gated case: general landing, adult material deeper in. Shown
-        // normally, with a badge.
+        assert_eq!(Outcome::NotSuitable.token(), "not-suitable");
+        // It outranks the other gates, so the one line the operator reads is the
+        // same whatever else the page also tripped.
         assert_eq!(
             Assessment {
-                landing: Landing::General,
-                has_adult_sections: true,
-                ..clean_assessment()
+                suitable: false,
+                volatility: Volatility::Feed,
+                redistribution: baroshare_signs(),
             }
             .admit(),
-            Admission::Admit
-        );
-        // …and adult content is not a licence to skip the other gates.
-        assert_eq!(
-            Assessment {
-                landing: Landing::Adult,
-                illegal: true,
-                ..clean_assessment()
-            }
-            .admit(),
-            Admission::Refuse(Outcome::RefusedIllegal)
+            Admission::Refuse(Outcome::NotSuitable)
         );
     }
 
+    /// `not-suitable` is one class: no evidence string at all, so
+    /// neither the log line nor the operator's line can hold one.
+    #[test]
+    fn not_suitable_records_no_reason() {
+        let a = Assessment {
+            suitable: false,
+            redistribution: baroshare_signs(),
+            ..clean_assessment()
+        };
+        assert_eq!(a.evidence_for(Outcome::NotSuitable), "");
+        assert!(!a.evidence_for(Outcome::RefusedRedistribution).is_empty());
+        let dir = std::env::temp_dir().join(format!("atlas-ns-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("decisions.txt");
+        let mut log = DecisionLog::open(&path);
+        assert!(log.record(
+            "freenet:x/",
+            Outcome::NotSuitable,
+            &a.evidence_for(Outcome::NotSuitable),
+            7
+        ));
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            "7\tnot-suitable\tfreenet:x/\t\n"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The model reply that used to mean `adult` (landing or sections) or
+    /// `illegal` is now `suitable_for_general_audience: false`, and a reply still
+    /// using the retired keys is not accepted as a classification.
+    #[test]
+    fn a_reply_that_is_not_suitable_parses_to_a_not_listed_assessment() {
+        let reply = |suitable: &str| {
+            serde_json::json!({
+                "title": "t", "snippet": "s", "tags": [],
+                "suitable_for_general_audience": suitable == "true",
+                "volatility": "static",
+                "distributes_complete_works": false, "distinct_rightsholders": 0,
+                "claims_own_authorship": false, "release_markers": false,
+                "recognized_commercial_work": false,
+            })
+        };
+        let a = parse_assessment(&reply("false")).unwrap();
+        assert!(!a.suitable);
+        assert_eq!(a.admit(), Admission::Refuse(Outcome::NotSuitable));
+        let ok = parse_assessment(&reply("true")).unwrap();
+        assert_eq!(ok.admit(), Admission::Admit);
+        // The retired keys alone are an error, never a default.
+        let old = serde_json::json!({
+            "title": "t", "landing": "adult", "has_adult_sections": true,
+            "illegal": true, "volatility": "static",
+            "distributes_complete_works": false, "distinct_rightsholders": 0,
+            "claims_own_authorship": false, "release_markers": false,
+            "recognized_commercial_work": false,
+        });
+        assert!(parse_assessment(&old).is_err());
+    }
+
+    /// The prompt asks the one question and none of the retired ones.
+    #[test]
+    fn the_prompt_asks_for_suitability_and_not_the_retired_keys() {
+        assert!(DESCRIBE_SYSTEM_PROMPT.contains("suitable_for_general_audience (boolean)"));
+        for part in [
+            "sexually explicit or pornographic content",
+            "graphic violence or gore",
+            "Ordinary adult language is fine",
+        ] {
+            assert!(
+                DESCRIBE_SYSTEM_PROMPT.contains(part),
+                "the suitability definition must include {part:?}"
+            );
+        }
+        for retired in ["illegal", "has_adult_sections", "landing"] {
+            assert!(
+                !DESCRIBE_SYSTEM_PROMPT.contains(retired),
+                "retired key {retired:?} still in the prompt"
+            );
+        }
+    }
+
+    /// The crawler only ever writes `general` and `false` to the signed fields,
+    /// on both the add and the recheck-update path.
+    #[test]
+    fn the_crawler_only_writes_general_and_false() {
+        let src = include_str!("main.rs");
+        let production = src.split("\nmod tests").next().unwrap();
+        let writes: Vec<&str> = production
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .filter(|l| l.contains("--landing=") || l.contains("--adult-sections="))
+            .collect();
+        assert_eq!(
+            writes.len(),
+            4,
+            "add_entry and recheck_update write both: {writes:?}"
+        );
+        for l in &writes {
+            assert!(
+                l.contains("{LANDING_FLAG}") || l.contains("{ADULT_SECTIONS_FLAG}"),
+                "a landing/adult-sections write that is not the constant: {l}"
+            );
+        }
+    }
+
     /// The operator reads one line per locator, so it must name the WORST thing
-    /// found. A page that is illegal, redistributing and a feed reports illegal.
+    /// found.
     #[test]
     fn the_gate_reports_the_most_serious_finding() {
         let everything = Assessment {
-            landing: Landing::Adult,
-            has_adult_sections: true,
+            suitable: false,
             volatility: Volatility::Feed,
-            illegal: true,
             redistribution: baroshare_signs(),
         };
-        assert_eq!(
-            everything.admit(),
-            Admission::Refuse(Outcome::RefusedIllegal)
-        );
+        assert_eq!(everything.admit(), Admission::Refuse(Outcome::NotSuitable));
         // Drop the worst and the next one surfaces, rather than the gate falling
         // through to whatever happens to be last.
         assert_eq!(
             Assessment {
-                illegal: false,
+                suitable: true,
                 ..everything
             }
             .admit(),
             Admission::Refuse(Outcome::RefusedRedistribution)
         );
-        // Nothing serious left. Adult landing and a feed verdict are both
-        // classified-and-published rather than refused, so the page is ADMITTED
-        // even though two of its five fields are the "worst" values they can take.
+        // A feed verdict is classified-and-published rather than refused.
         assert_eq!(
             Assessment {
-                illegal: false,
+                suitable: true,
                 redistribution: RedistributionSigns::default(),
                 ..everything
             }
@@ -10922,10 +11226,8 @@ mod tests {
     #[test]
     fn the_prompt_asks_for_every_observable_the_rule_consumes() {
         for field in [
-            "landing",
-            "has_adult_sections",
+            "suitable_for_general_audience",
             "volatility",
-            "illegal",
             "distributes_complete_works",
             "distinct_rightsholders",
             "claims_own_authorship",
@@ -11188,55 +11490,208 @@ mod tests {
         assert!(wants_screenshot(&heavy));
     }
 
-    fn assessment(landing: Landing, has_adult_sections: bool) -> Assessment {
-        Assessment {
-            landing,
-            has_adult_sections,
-            volatility: Volatility::Static,
-            illegal: false,
-            redistribution: RedistributionSigns::default(),
+    fn live(landing: &str, adult_sections: bool) -> LiveEntry {
+        LiveEntry {
+            subject_id: format!("s-{landing}-{adult_sections}"),
+            version: 3,
+            locator: format!("freenet:{RIVER}/{landing}-{adult_sections}"),
+            added_at: None,
+            landing_not_general: landing != "general",
+            has_adult_sections: adult_sections,
         }
     }
 
-    /// The gate the recheck sweep's auto-publish path depends on: any change to
-    /// `landing` or `has_adult_sections`, in EITHER direction, must be reported
-    /// as a change — this is what routes an auto-correction to
-    /// `FlaggedOnRecheck` instead of publishing it unreviewed. Both fields are
-    /// exercised independently (a real page could turn adult without ever
-    /// touching `has_adult_sections`, or vice versa), and a same-value case
-    /// proves the function is not simply always `true`.
+    /// A live entry published as anything but general is never re-published as
+    /// general by the recheck sweep, in either of the two signed fields.
     #[test]
-    fn landing_would_change_catches_a_flip_in_either_field_either_direction() {
-        assert!(landing_would_change(
-            false,
-            false,
-            &assessment(Landing::Adult, false)
-        ));
-        assert!(landing_would_change(
-            true,
-            false,
-            &assessment(Landing::General, false)
-        ));
-        assert!(landing_would_change(
-            false,
-            false,
-            &assessment(Landing::General, true)
-        ));
-        assert!(landing_would_change(
-            false,
-            true,
-            &assessment(Landing::General, false)
-        ));
-        assert!(!landing_would_change(
-            false,
-            false,
-            &assessment(Landing::General, false)
-        ));
-        assert!(!landing_would_change(
-            true,
-            true,
-            &assessment(Landing::Adult, true)
-        ));
+    fn live_entry_not_general_covers_both_signed_fields() {
+        assert!(!live_entry_not_general(&live("general", false)));
+        assert!(live_entry_not_general(&live("adult", false)));
+        assert!(live_entry_not_general(&live("general", true)));
+        assert!(live_entry_not_general(&live("adult", true)));
+        // An open vocabulary: an unknown landing value is not general either.
+        assert!(live_entry_not_general(&live("explicit", false)));
+    }
+
+    const INDEX_JSON: &str = r#"[
+      {"subject_id":"a","version":1,"locator":"freenet:A/","class":{"landing":"general","has_adult_sections":false}},
+      {"subject_id":"b","version":2,"locator":"freenet:B/","class":{"landing":"adult","has_adult_sections":false}},
+      {"subject_id":"c","version":5,"locator":"freenet:C/","class":{"landing":"general","has_adult_sections":true}},
+      {"subject_id":"d","version":1,"locator":"freenet:D/"}
+    ]"#;
+
+    #[test]
+    fn the_listing_names_exactly_the_not_general_entries() {
+        let live = parse_live_index(INDEX_JSON.as_bytes()).unwrap();
+        let hits = not_general_entries(&live);
+        let ids: Vec<&str> = hits.iter().map(|e| e.subject_id.as_str()).collect();
+        assert_eq!(
+            ids,
+            ["b", "c"],
+            "unclassified `d` and general `a` are not listed"
+        );
+        assert_eq!(
+            not_general_listing(&hits),
+            "b\tv2\tfreenet:B/\tlanding_not_general=true\thas_adult_sections=false\n\
+             c\tv5\tfreenet:C/\tlanding_not_general=false\thas_adult_sections=true\n"
+        );
+    }
+
+    fn scratch(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("atlas-{name}-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// The tombstone tool defaults to a dry run: it must never reach `atlasctl`.
+    /// The binary named here does not exist, so any attempt to run it fails.
+    #[test]
+    fn tombstone_defaults_to_a_dry_run_and_never_runs_atlasctl() {
+        let dir = scratch("dry");
+        let idx = dir.join("show.json");
+        fs::write(&idx, INDEX_JSON).unwrap();
+        let cli = Cli::parse_from([
+            "atlas-crawler",
+            "--not-general-tombstone",
+            "--atlasctl",
+            "/nonexistent/atlasctl",
+            "--index-json",
+            idx.to_str().unwrap(),
+        ]);
+        assert!(!cli.apply);
+        run_not_general(&cli).expect("a dry run succeeds without running atlasctl");
+        // The real step needs the live index, never a saved file.
+        let cli = Cli::parse_from([
+            "atlas-crawler",
+            "--not-general-tombstone",
+            "--apply",
+            "--atlasctl",
+            "/nonexistent/atlasctl",
+            "--index-json",
+            idx.to_str().unwrap(),
+        ]);
+        assert!(run_not_general(&cli).is_err());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_removal_cap_is_ten_or_a_fifth_unless_raised() {
+        assert_eq!(removal_cap(20, None), 10);
+        assert_eq!(removal_cap(100, None), 20);
+        assert_eq!(removal_cap(100, Some(55)), 55);
+        assert_eq!(removal_cap(100, Some(3)), 3);
+    }
+
+    #[test]
+    fn twelve_candidates_in_twelve_entries_exceed_the_default_cap() {
+        // 12 not-general entries in an index of 12: over the cap of 10. The
+        // atlasctl binary does not exist, so any removal attempt would be an error
+        // of a different kind; the cap message must be the one reported.
+        let rows: Vec<String> = (0..12)
+            .map(|i| {
+                format!(
+                    r#"{{"subject_id":"s{i}","version":1,"locator":"freenet:L{i}/","class":{{"landing":"adult","has_adult_sections":false}}}}"#
+                )
+            })
+            .collect();
+        let dir = scratch("cap");
+        let idx = dir.join("show.json");
+        fs::write(&idx, format!("[{}]", rows.join(","))).unwrap();
+        // --apply cannot be given with --index-json, so exercise the cap on the
+        // pure function and the dry-run note on the real path.
+        assert!(
+            not_general_entries(&parse_live_index(&fs::read(&idx).unwrap()).unwrap()).len()
+                > removal_cap(12, None)
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn apply_and_index_json_error_outside_their_modes() {
+        let bad = |args: &[&str]| {
+            Cli::try_parse_from(
+                ["atlas-crawler", "--sources", "s.txt"]
+                    .into_iter()
+                    .chain(args.iter().copied()),
+            )
+            .is_err()
+        };
+        assert!(bad(&["--apply"]));
+        assert!(bad(&["--index-json", "x.json"]));
+        assert!(bad(&["--not-general-report", "--apply"]));
+        assert!(bad(&["--max-removals", "3"]));
+        assert!(bad(&["--rejudge-below-classifier", "5", "--limit", "5"]));
+        assert!(!bad(&[
+            "--not-general-tombstone",
+            "--apply",
+            "--max-removals",
+            "3"
+        ]));
+        assert!(!bad(&["--not-general-report", "--index-json", "x.json"]));
+    }
+
+    /// A live-flag decision is made before the sweep fetches, spends budget or
+    /// calls the model.
+    #[test]
+    fn recheck_decides_live_flags_before_fetch_budget_and_model() {
+        let src = include_str!("main.rs");
+        let production = src.split("\nmod tests").next().unwrap();
+        let at = production.find("fn run_recheck_pass(").unwrap();
+        let body = &production[at..];
+        let flags = body.find("if live_entry_not_general(e) {").unwrap();
+        for later in ["get_page_enumerating(", "budget.try_take(", "describe_llm("] {
+            assert!(
+                flags < body.find(later).unwrap(),
+                "{later} precedes the live-flag check"
+            );
+        }
+        assert!(LIVE_FLAGS_REASON.starts_with("would now be refused on recheck: not-suitable"));
+        assert!(LIVE_FLAGS_REASON.contains("not by the model"));
+    }
+
+    #[test]
+    fn the_log_rewrite_maps_the_old_outcome_and_keeps_everything_else() {
+        let body = "1\tindexed\tfreenet:A/\tvolatility=static\n\
+                    2\trefused-illegal\tfreenet:B/\tlanding=adult adult_sections=true illegal=true\n\
+                    3\trefused-redistribution\tfreenet:C/\tlanding=general illegal=false\n\
+                    4\tflagged-on-recheck\tfreenet:D/\twould now be refused on recheck: refused-illegal — illegal=true\n\
+                    5\tflagged-on-recheck\tfreenet:E/\twould now be refused on recheck: refused-redistribution — x\n\
+                    6\trefused-illegal\tfreenet:F/\t";
+        let (new, n) = rewrite_decision_lines(body);
+        assert_eq!(n, 3);
+        assert_eq!(
+            new,
+            "1\tindexed\tfreenet:A/\tvolatility=static\n\
+             2\tnot-suitable\tfreenet:B/\t\n\
+             3\trefused-redistribution\tfreenet:C/\tlanding=general illegal=false\n\
+             4\tflagged-on-recheck\tfreenet:D/\twould now be refused on recheck: not-suitable\n\
+             5\tflagged-on-recheck\tfreenet:E/\twould now be refused on recheck: refused-redistribution — x\n\
+             6\tnot-suitable\tfreenet:F/\t"
+        );
+        assert!(!new.contains("refused-illegal"));
+        // Running it again changes nothing.
+        assert_eq!(rewrite_decision_lines(&new), (new.clone(), 0));
+    }
+
+    #[test]
+    fn the_log_rewrite_is_a_dry_run_unless_applied() {
+        let dir = scratch("rw");
+        let path = dir.join("decisions.txt");
+        let body = "2\trefused-illegal\tfreenet:B/\twhy\n";
+        fs::write(&path, body).unwrap();
+        run_rewrite_decision_log(&path, false, &|| true).unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), body, "dry run wrote");
+        assert!(
+            run_rewrite_decision_log(&path, true, &|| true).is_err(),
+            "an active crawler service blocks the real rewrite"
+        );
+        assert_eq!(fs::read_to_string(&path).unwrap(), body);
+        run_rewrite_decision_log(&path, true, &|| false).unwrap();
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            "2\tnot-suitable\tfreenet:B/\t\n"
+        );
+        let _ = fs::remove_dir_all(&dir);
     }
 
     /// The chrome-vs-content mismatch: `visible` is measured from `page.text`
@@ -11415,7 +11870,7 @@ mod tests {
         let bad = PathBuf::from("/proc/atlas-crawler-nonexistent/decisions.txt");
         let mut log = DecisionLog::open(&bad);
         assert!(
-            !log.record("freenet:x/", Outcome::RefusedIllegal, "why", 1),
+            !log.record("freenet:x/", Outcome::NotSuitable, "why", 1),
             "an unwritable log must not report success — a refusal with no record \
              is exactly the opacity this file exists to remove"
         );
@@ -11479,7 +11934,10 @@ mod tests {
             2,
             "only `open` (to count) and `trim` (to shorten) may read this file"
         );
-        // And nothing outside the impl touches the file behind its back.
+        // And nothing outside the impl touches the file behind its back. The two
+        // maintenance commands (`run_not_general`, `run_rewrite_decision_log`) read
+        // it as `log_path` / `path` on purpose, for an operator who reviews the
+        // output; no crawl path reaches them.
         let all = strip_comments(production);
         for banned in [
             "read_to_string(decisions_path",
@@ -11549,24 +12007,14 @@ mod tests {
     // --- self-scaling re-verification ---
 
     #[test]
-    fn recheck_tier_is_high_drift_for_app_and_adult_entries() {
+    fn recheck_tier_is_high_drift_for_app_entries() {
         assert_eq!(
-            RecheckTier::of("app:delta/AWPjDQdKey", false, false),
+            RecheckTier::of("app:delta/AWPjDQdKey"),
             RecheckTier::HighDrift,
             "an app-hosted locator can republish anything behind the same handle"
         );
         assert_eq!(
-            RecheckTier::of(&format!("freenet:{RIVER}/"), true, false),
-            RecheckTier::HighDrift,
-            "an adult landing page is the most consequential category to leave stale"
-        );
-        assert_eq!(
-            RecheckTier::of(&format!("freenet:{RIVER}/"), false, true),
-            RecheckTier::HighDrift,
-            "gated adult sections deeper in are just as consequential to catch"
-        );
-        assert_eq!(
-            RecheckTier::of(&format!("freenet:{RIVER}/"), false, false),
+            RecheckTier::of(&format!("freenet:{RIVER}/")),
             RecheckTier::Standard
         );
     }
